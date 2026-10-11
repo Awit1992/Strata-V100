@@ -1,0 +1,39 @@
+{
+  "upstream_commit": "7695859aa13afb248bdb4d36f9b2e95707db079d",
+  "fork_base": "29c4fd78621dacec19caa549cfb7f90889692bcd",
+  "baseline_binary_sha256": "c69620515a895acc4b9c8fe00d98196ea35ecb89234ba163268a93b6e54f6e08",
+  "final_smoke_binary_sha256": "d91203bd1baa81657fb4e1f2c30026af16686e7829fa9484780eb6fee5030a36",
+  "ctest": {
+    "selected": 135,
+    "passed": 132,
+    "skipped": [
+      "prefill_fused_moe_test",
+      "prefill_fused_iq_test",
+      "expert_multi_test"
+    ],
+    "excluded": {
+      "ple_parity": "Known missing Q2_0 fixture from previous sync"
+    }
+  },
+  "route_resident_parity": {
+    "cases": 240,
+    "cases_with_swaps": 205,
+    "swaps": 2004,
+    "id_counter_mismatches": 0,
+    "weight_ulp_limit": 8
+  },
+  "single_gpu_delayed_overlap": {
+    "requests": 4,
+    "output_tokens_per_request": 64,
+    "overlapped_windows": 117,
+    "total_gate_wait_ms": 536.38
+  },
+  "callback_failure_smoke": {
+    "injected_failures": 643,
+    "requests": 4,
+    "output_tokens_per_request": 64,
+    "overlapped_windows": 117,
+    "total_gate_wait_ms": 0.09,
+    "matching_previous_smoke_output_hashes": 4
+  }
+}

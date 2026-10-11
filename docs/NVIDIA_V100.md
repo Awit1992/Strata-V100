@@ -143,3 +143,22 @@ The engine retains a disk-restored root in the bounded RAM cache.
 The unrelated small-chat and live-continuation cases do not improve
 in this sample. Do not treat this result as a general throughput gain.
 See the [agentic latency measurements](../benchmarks/v100-iq3_s-prefill-wmma.md#agentic-short-turn-latency-2026-10-10).
+
+## Selected v0.1.43 performance changes
+
+The [release review](../improvements/RELEASE-v0.1.43-V100.md) lists the selected
+ports and the changes that do not apply to Volta.
+
+- `STRATA_ROUTE_RESIDENT=1` selects resident-biased routing. Its route swap now
+  uses one warp per token. The option remains off by default.
+- Linux CUDA can overlap adaptive expert copies with the next decode window.
+  Layer splits remain excluded. Use `STRATA_ADAPT_OVERLAP=0` to turn it off.
+  Resident RAM sources require `STRATA_ADAPT_OVERLAP_RESIDENT=1`.
+- The automatic route tail skip stays off at 90% expert-cache residency or
+  more. `STRATA_TAIL_SKIP_MAX_CACHED` changes this limit. An explicit
+  `STRATA_ROUTE_TAIL_SKIP` takes precedence.
+- Linux CUDA uses the measured PCIe share for the canonical Q2_0 pack.
+  Native packs already used a measured share.
+
+These controls do not establish a speed gain for every V100 configuration.
+See the [verification report](../benchmarks/v100-upstream-v0.1.43-2026-10-11.md).

@@ -753,6 +753,94 @@ void test_rotating_source(bool rotate, bool pin) {
     require(!src.has_resident(0, 0) && !src.exchange_rotation(), "reopen retained residency");
 }
 
+// 0.1.43 (STRATA_ADAPT_OVERLAP): soft_commit_exchanges makes a staged `out` look to the planner as after the commit
+// (pinned, aliased into its exchange buffer) while `in`'s place stays where the copy still reads it; the real commit
+// ends it.  One GPU, no model.
+void test_soft_commit_exchange(bool rotate, bool pin) {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+#if defined(_WIN32)
+    _putenv_s("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0");
+#else
+    setenv("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0", 1);
+#endif
+    TempDirectory dir;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, 5, err), err);
+    const size_t bytes = (size_t)BLOB;
+    std::vector<std::vector<uint8_t>> truth(5, std::vector<uint8_t>(bytes));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        for (size_t e = 0; e < truth.size(); ++e) {
+            for (size_t i = 0; i < bytes; ++i) truth[e][i] = (uint8_t)((i * 131u + e * 37u) ^ (i >> 8));
+            out.write((const char*)truth[e].data(), (std::streamsize)bytes);
+        }
+        require((bool)out, "fixture write failed");
+    }
+    FileExpertSource src;
+    ExpertCache cache;
+    require(src.open(dir.path.string(), 1, 5, err), err);
+    require(cache.open(2, 1, 5, BLOB, err), err);
+    for (int e : {2, 3}) {
+        const int slot = cache.admit(0, e);
+        require(slot >= 0 && cache.fill_slot_blocking(slot, truth[e].data(), err), err);
+    }
+    const std::vector<std::pair<int32_t, int32_t>> rank{{0,0},{0,1},{0,2},{0,3},{0,4}};
+    require(src.pin_cache_complement(cache, err, pin, {}, -1, 0, 2 * bytes, &rank), err);
+    require(src.reserve_exchanges(2, err), err);
+    std::vector<uint8_t> actual(bytes);
+    uint8_t* eviction[2]{};
+    for (int q = 0; q < 2; ++q) {
+        eviction[q] = src.exchange_buffer(q);
+        require(eviction[q] != nullptr &&
+                    cudaMemcpy(eviction[q], cache.device_slot(q), bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
+                "D2H eviction failed");
+        require(src.stage_exchange(0, q, 2 + q, q), "stage rejected");
+    }
+    // the soft commit is possible only with page-locked, non-rotating exchange buffers
+    const bool possible = !rotate && pin;
+    if (!possible) {
+        require(!src.soft_commit_exchanges(), "the soft commit was accepted where the buffers cannot carry it");
+        require(src.has_resident(0, 0) && src.has_resident(0, 1), "a refused soft commit disturbed in's place");
+        require(src.blob(0, 2) == eviction[0] && src.blob(0, 3) == eviction[1],
+                "a refused soft commit moved a staged out");
+        src.close();
+        return;
+    }
+    // before: `out` is not the planner's; `in` is, and it is still the copy's own place
+    for (int q = 0; q < 2; ++q) {
+        require(!src.pinned(0, 2 + q) && src.device_alias(0, 2 + q) == nullptr,
+                "a staged out looked resident before the soft commit");
+        require(src.pinned(0, q) && src.device_alias(0, q) != nullptr, "the staged in stopped being resident");
+        require(src.has_resident(0, q), "the staged in left the copy");
+        require(src.blob(0, 2 + q) == eviction[q], "the staged out is not read from its exchange buffer");
+    }
+    // the soft commit: each `out` looks committed (judged by `in`'s place, aliased into its exchange buffer) while
+    // `in`'s place stays untouched (the copy still reads it from RAM)
+    require(src.soft_commit_exchanges(), "the soft commit was refused");
+    for (int q = 0; q < 2; ++q) {
+        require(src.pinned(0, 2 + q), "a soft-committed out is not pinned");
+        require(src.device_alias(0, 2 + q) != nullptr, "a soft-committed out has no device alias");
+        require(cudaMemcpy(actual.data(), src.device_alias(0, 2 + q), bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                    actual == truth[2 + q], "the soft-committed out's alias is not its exchange buffer");
+        require(src.pinned(0, q) && src.has_resident(0, q), "the soft commit moved in's place");
+        require(src.blob(0, 2 + q) == eviction[q], "the soft commit dropped the exchange buffer");
+    }
+    require(src.soft_commit_exchanges(), "a repeated soft commit was refused");
+    // the real commit ends the soft view: `out` takes `in`'s place, `in` is gone, `out`'s alias is the complement now
+    require(src.commit_exchanges() == 2, "commit count wrong");
+    for (int q = 0; q < 2; ++q) {
+        require(!src.pinned(0, q) && !src.has_resident(0, q), "the committed in is still resident");
+        require(src.pinned(0, 2 + q) && src.device_alias(0, 2 + q) != nullptr, "the committed out is not pinned");
+        require(cudaMemcpy(actual.data(), src.device_alias(0, 2 + q), bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                    actual == truth[2 + q], "the committed out's alias is wrong");
+        require(src.blob(0, 2 + q) != nullptr && !std::memcmp(src.blob(0, 2 + q), truth[2 + q].data(), bytes),
+                "the committed out's bytes are wrong");
+    }
+    require(src.soft_commit_exchanges(), "the soft commit after a commit was refused (nothing staged)");
+    src.close();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -775,6 +863,11 @@ int main(int argc, char** argv) {
             test_rotating_source(false, true);
             test_rotating_source(true, true);
             test_rotating_source(true, false);
+        }
+        if (argc == 2 && std::string(argv[1]) == "--soft-commit-gpu") {
+            test_soft_commit_exchange(false, true);   // the ordering invariant
+            test_soft_commit_exchange(false, false);  // pageable exchange buffers: refused
+            test_soft_commit_exchange(true, true);    // rotation: refused
         }
         std::cout << "file_expert_source_test: PASS\n";
         return 0;
