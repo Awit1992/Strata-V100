@@ -1130,8 +1130,8 @@ so a Monitor-tab panel and a Grafana panel read the same value: `strata:live_sta
 `strata:live_prefill_tok_s_mean`, `strata:live_prompt_read`, `strata:engine_max_context`,
 `strata:totals_prompt_seconds_total` / `strata:totals_decode_seconds_total`, `strata:last_hit_rate` and
 `strata:last_decode_tok_s` (the last request's), and the hardware - `strata:gpu_util`, `strata:gpu_mem_used_bytes`,
-`strata:gpu_mem_total_bytes`, `strata:gpu_temp_celsius`, `strata:gpu_power_watts` (one sample per card, label
-`gpu`), `strata:cpu`, `strata:ram_used_bytes`, `strata:ram_total_bytes`. A value the server does not have (no GPU
+`strata:gpu_mem_total_bytes`, `strata:gpu_temp_celsius`, `strata:gpu_power_watts` and `strata:gpu_energy_wh` (the
+card's energy used since its driver loaded; one sample per card, label `gpu`), `strata:cpu`, `strata:ram_used_bytes`, `strata:ram_total_bytes`. A value the server does not have (no GPU
 telemetry, an older engine) has no sample rather than a zero.
 
 Ready to use, in `docs/monitoring/`: `prometheus.yml` (a scrape config, the API key as a bearer token),

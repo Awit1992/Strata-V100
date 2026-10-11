@@ -11,6 +11,8 @@ const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000
 // a context size: 32768 -> "32K" (powers of two), else like kfmt
 const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
 const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memory: binary GB, as Windows shows it
+// a card's energy used: Wh, in kWh once it is worth it (a V100 at 45 W reaches 1 kWh in a day)
+const wh = (v) => (v == null ? "–" : v >= 1000 ? `${fmt(v / 1000, 2)} kWh` : `${fmt(v, v < 10 ? 1 : 0)} Wh`);
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
@@ -229,12 +231,14 @@ function gpuCards(hw, h, st) {
   const block = (label, value, note, path, bar, tone) => `<div class="gpu-block">
     <div class="gpu-block__top"><span>${esc(label)}</span><span><b>${value}</b>${note ? ` <em>${esc(note)}</em>` : ""}</span></div>
     ${bar == null ? "" : `<div class="st-progress"${tone ? ` data-tone="${tone}"` : ""}><div class="st-progress__bar" style="width:${Math.max(0, Math.min(100, bar)).toFixed(1)}%"></div></div>`}
-    ${sparkSvg("gpu-spark", path, tone)}
+    ${path ? sparkSvg("gpu-spark", path, tone) : ""}
   </div>`;
   return cards.map((g) => {
     const i = g.index;
     const memPct = g.mem_used != null && g.mem_total ? (100 * g.mem_used) / g.mem_total : null;
     const pwPct = g.power != null && g.power_limit ? (100 * g.power) / g.power_limit : null;
+    // the card's own counter: it runs from driver load, so it survives a reload and is not the page's total
+    const since = g.energy_wh != null ? "since driver load" : "";
     const gen = g.pcie_gen_max || g.pcie_gen;
     const link = gen ? `Gen${gen}${g.pcie_width ? ` x${g.pcie_width}` : ""}${g.pcie_gen && g.pcie_gen < gen ? ` · idle Gen${g.pcie_gen}` : ""}` : "–";
     const mb = (v) => (v == null ? "–" : `${fmt(v, v < 10 ? 1 : 0)} MB/s`);
@@ -248,6 +252,7 @@ function gpuCards(hw, h, st) {
               sparkPaths(h[`gpu${i}_temp`], 90), g.temp == null ? null : Math.min(100, g.temp), "warn")}
       ${block("Power", g.power == null ? "–" : `${fmt(g.power)} W`, g.power_limit ? `of ${fmt(g.power_limit)} W` : "",
               sparkPaths(h[`gpu${i}_power`], g.power_limit), pwPct, null)}
+      ${block("Energy", wh(g.energy_wh), since, null, null, null)}
       <div class="gpu-pcie"><span>PCIe <b>${esc(link)}</b></span>
         <span>rx <b>${mb(g.pcie_rx_mb)}</b> · tx <b>${mb(g.pcie_tx_mb)}</b></span></div>
     </div>`;
