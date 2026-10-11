@@ -147,12 +147,14 @@ def strata(m: dict, out: list, lab: str):
            last.get("decode_tok_s"))
     gpus = hw.get("gpus") or ([{"index": 0, "util": hw.get("gpu_util"), "mem_used": hw.get("gpu_mem_used"),
                                 "mem_total": hw.get("gpu_mem_total"), "temp": hw.get("gpu_temp"),
-                                "power": hw.get("gpu_power")}] if hw.get("gpu_util") is not None else [])
+                                "power": hw.get("gpu_power"), "energy_wh": hw.get("gpu_energy_wh")}]
+                                if hw.get("gpu_util") is not None else [])
     for name, key, help_ in (("gpu_util", "util", "GPU busy, percent (hardware.gpu_util)."),
                              ("gpu_mem_used_bytes", "mem_used", "GPU memory in use (hardware.gpu_mem_used)."),
                              ("gpu_mem_total_bytes", "mem_total", "GPU memory (hardware.gpu_mem_total)."),
                              ("gpu_temp_celsius", "temp", "GPU temperature (hardware.gpu_temp)."),
-                             ("gpu_power_watts", "power", "GPU power draw (hardware.gpu_power).")):
+                             ("gpu_power_watts", "power", "GPU power draw (hardware.gpu_power)."),
+                             ("gpu_energy_wh", "energy_wh", "GPU energy used, Wh (hardware.gpu_energy_wh).")):
         for g in gpus:                                   # a family's samples together, one per card
             metric(name, "gauge", help_, g.get(key), f',gpu="{g.get("index")}"')
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))

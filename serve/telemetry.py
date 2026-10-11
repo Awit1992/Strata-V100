@@ -2,8 +2,8 @@
 
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
-  pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.  With the AMD backend (#301): the
-  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power.
+  pip package is needed: load, VRAM, temperature, power, the energy counter, PCIe link and throughput.  With the AMD
+  backend (#301): the amdgpu driver's Linux sysfs files - load, VRAM, temperature, power and energy.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -21,6 +21,26 @@ import time
 HISTORY = 180
 
 
+class _EnergyCounter:
+    """The running total of a hardware energy counter: NVML's `nvmlDeviceGetTotalEnergyConsumption` counts millijoules
+    and the amdgpu driver's `energy1_input` microjoules, both in a 32-bit value that wraps - a V100 idling at 45 W
+    reaches 2**32 mJ in about 26 hours - so each delta is taken modulo 2**32, which adds the wrap back.  The first
+    reading seeds the total rather than starting at 0: the counter itself began when the driver loaded, and "what this
+    card has used" is the figure the Monitor wants, not only what the server happened to see.  A driver or GPU reset
+    clears the hardware counter, which cannot be told from a wrap; the engine restarts with the driver anyway."""
+
+    def __init__(self):
+        self.prev = self.total = None
+
+    def add(self, raw):
+        """The total so far, in the counter's own unit; None while nothing has been read."""
+        if raw is None:
+            return None
+        self.total = raw if self.prev is None else self.total + (raw - self.prev) % (1 << 32)
+        self.prev = raw
+        return self.total
+
+
 # ------------------------------------------------------------------------------------------------ NVML
 class _Nvml:
     class Util(ctypes.Structure):
@@ -31,6 +51,7 @@ class _Nvml:
 
     def __init__(self, index=0):
         self.lib = self.dev = None
+        self.energy = _EnergyCounter()
         names = ["nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
                                           "NVIDIA Corporation", "NVSMI", "nvml.dll")] if os.name == "nt" \
             else ["libnvidia-ml.so.1", "libnvidia-ml.so"]
@@ -94,6 +115,8 @@ class _Nvml:
         out["power"] = mw / 1000.0 if mw is not None else None
         lim = self._uint("nvmlDeviceGetEnforcedPowerLimit")
         out["power_limit"] = lim / 1000.0 if lim is not None else None
+        mj = self.energy.add(self._uint("nvmlDeviceGetTotalEnergyConsumption"))
+        out["energy_wh"] = mj / 3.6e6 if mj is not None else None                    # mJ -> Wh
         out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle (power saving)
         out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")
         out["pcie_width"] = self._uint("nvmlDeviceGetCurrPcieLinkWidth")
@@ -141,6 +164,7 @@ class _Amd:
     def __init__(self, index=0, sysfs=None):
         self.dev = amd_device_dir(index, sysfs)
         self.hwmon = None
+        self.energy = _EnergyCounter()
         if self.dev:
             try:
                 hw = sorted(os.listdir(os.path.join(self.dev, "hwmon")))
@@ -242,6 +266,8 @@ class _Amd:
             out["power"] = p / 1e6 if p is not None else None
             cap = self._int(os.path.join(self.hwmon, "power1_cap"))
             out["power_limit"] = cap / 1e6 if cap is not None else None
+            uj = self.energy.add(self._int(os.path.join(self.hwmon, "energy1_input")))
+            out["energy_wh"] = uj / 3.6e9 if uj is not None else None                # uJ -> Wh
         out.update(self.link())
         return out
 
@@ -332,7 +358,7 @@ class Telemetry:
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
-        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
+        energy, PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
         cards, numbered as HIP numbers them, read from sysfs (#301)."""
         self.extra = extra
         self.lock = threading.Lock()
@@ -388,7 +414,7 @@ class Telemetry:
             if len(reads) > 1:
                 def vals(k):
                     return [r[k] for _, r in reads if r.get(k) is not None]
-                for k in ("mem_used", "mem_total", "power", "power_limit", "pcie_rx_mb", "pcie_tx_mb"):
+                for k in ("mem_used", "mem_total", "power", "power_limit", "energy_wh", "pcie_rx_mb", "pcie_tx_mb"):
                     v = vals(k)
                     g[k] = sum(v) if v else None
                 u = vals("util")
@@ -397,8 +423,9 @@ class Telemetry:
                 g["temp"] = max(t) if t else None
             s["gpus"] = [{"index": i, "util": r.get("util"), "mem_used": r.get("mem_used"),
                           "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power"),
-                          "power_limit": r.get("power_limit"), "pcie_gen": r.get("pcie_gen"),
-                          "pcie_gen_max": r.get("pcie_gen_max"), "pcie_width": r.get("pcie_width"),
+                          "power_limit": r.get("power_limit"), "energy_wh": r.get("energy_wh"),
+                          "pcie_gen": r.get("pcie_gen"), "pcie_gen_max": r.get("pcie_gen_max"),
+                          "pcie_width": r.get("pcie_width"),
                           "pcie_rx_mb": r.get("pcie_rx_mb"), "pcie_tx_mb": r.get("pcie_tx_mb")}
                          for i, r in reads]
             s.update({f"gpu_{k}": v for k, v in g.items()})
