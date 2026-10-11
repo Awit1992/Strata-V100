@@ -1,0 +1,26 @@
+{
+  "method": "captured graphs; 48 layers; 20 alternating passes; 40% resident experts; margin 4; IDs restored before every pass",
+  "results": [
+    {
+      "tokens": 1,
+      "serial_us_per_layer": 114.69,
+      "warp_us_per_layer": 16.17,
+      "speedup": 7.09,
+      "swaps": 4
+    },
+    {
+      "tokens": 2,
+      "serial_us_per_layer": 202.37,
+      "warp_us_per_layer": 21.38,
+      "speedup": 9.47,
+      "swaps": 11
+    },
+    {
+      "tokens": 8,
+      "serial_us_per_layer": 308.2,
+      "warp_us_per_layer": 28.63,
+      "speedup": 10.77,
+      "swaps": 46
+    }
+  ]
+}

@@ -268,6 +268,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(split_rules_test PRIVATE include)
   add_test(NAME split_rules_test COMMAND split_rules_test)
 
+  # the route tail skip's residency gate and the canonical pack's PCIe calibration (0.1.43): header-only rule, no GPU
+  add_executable(decode_defaults_test tests/program/decode_defaults_test.cpp)
+  target_include_directories(decode_defaults_test PRIVATE include)
+  add_test(NAME decode_defaults_test COMMAND decode_defaults_test)
+
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)
@@ -901,6 +906,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(fused_gr_bench src/kernels/fused_gr_bench.cpp)
   target_include_directories(fused_gr_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(fused_gr_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  # STRATA_ROUTE_RESIDENT's swap, serial vs warp: the bench holds the pre-port serial kernel (so it is compiled as
+  # CUDA, the one device-code file among the .cpp benches) and times the two forms on the same input in one run.
+  # The chain modes above call the plain top-10 on a fully resident table, so they never reach the swap; this does.
+  if(STRATA_ENABLE_CUDA)
+    add_executable(router_chain_bench src/kernels/router_chain_bench.cpp)
+    set_source_files_properties(src/kernels/router_chain_bench.cpp PROPERTIES LANGUAGE CUDA)
+    target_include_directories(router_chain_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(router_chain_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  endif()
   add_executable(gr_parity src/kernels/gr_parity.cpp)
   target_include_directories(gr_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(gr_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
@@ -956,6 +970,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(route_window_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(route_window_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME route_window_parity COMMAND route_window_parity)
+
+  # STRATA_ROUTE_RESIDENT's swap: the warp-per-token kernel against a scalar reference of the same semantics,
+  # bitwise on the ids, the weights and the four counters (GPU, synthetic, no model)
+  if(STRATA_ENABLE_CUDA)
+    add_executable(route_resident_parity src/kernels/route_resident_parity.cu)
+    target_include_directories(route_resident_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(route_resident_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME route_resident_parity COMMAND route_resident_parity)
+    set_tests_properties(route_resident_parity PROPERTIES TIMEOUT 120)
+  endif()
 
   add_executable(router_top10_parity src/kernels/router_top10_parity.cpp)
   target_include_directories(router_top10_parity PRIVATE ${_strata_gpu_include_directories})
