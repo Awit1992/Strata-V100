@@ -139,6 +139,9 @@ public:
     ConversationDiskStatus seed(const std::string& name, ConversationDiskRecord&& record,
                                 std::string base_name, uint64_t base_tokens, std::string& error);
 
+    // Moves a complete L2 victim to one self-contained L3 record. No payload is copied.
+    ConversationDiskStatus spill(SavedConversation&& image, bool root, std::string& error);
+
     // Appends one panel to an existing chain: the delta record covers [the chain's current
     // coverage .. its ids length later).  Returns miss when the chain is gone (the caller then
     // seeds it again).  Consumes the record in all cases except `invalid`.

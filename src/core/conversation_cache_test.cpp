@@ -68,6 +68,45 @@ void test_root_priority() {
         check(cache.put(image({7, 7, 7})), "a third image against a slot cap evicts the chat, not the root");
         check(cache.best(std::vector<int64_t>{1, 2, 9}, {}, true).tokens == 2, "the pinned root outlives the slot cap");
     }
+    {
+        ConversationCache cache(one * 8, 2);
+        check(cache.put(image({1, 2}), 0, true), "first root parks");
+        check(cache.put(image({3, 4}), 0, true), "second root fills the slot cap");
+        check(cache.put(image({5, 6})), "a conversation displaces a root when all slots hold roots");
+        check(!cache.has({1, 2}, {}, true) && cache.has({3, 4}, {}, true),
+              "slot pressure evicts the oldest root");
+        const auto match_a = cache.best(std::vector<int32_t>{5, 6, 9}, {}, true);
+        check(match_a.tokens == 2, "the first switch finds the conversation in RAM");
+        auto a = cache.take(match_a.index);
+        check(cache.put(image({7, 8}), a.bytes()), "the other conversation parks during the exchange");
+        const auto match_b = cache.best(std::vector<int32_t>{7, 8, 9}, {}, true);
+        check(match_b.tokens == 2, "the next switch finds the other conversation in RAM");
+        auto b = cache.take(match_b.index);
+        check(cache.put(std::move(a), b.bytes()), "the first conversation parks on the return switch");
+        check(cache.best(std::vector<int32_t>{5, 6, 9}, {}, true).tokens == 2,
+              "the return switch finds the first conversation in RAM");
+    }
+    {
+        ConversationCache cache(one * 2, 8);
+        check(cache.put(image({1, 2}), 0, true), "first root fits the byte budget");
+        check(cache.put(image({3, 4}), 0, true), "second root fills the byte budget");
+        check(cache.put(image({5, 6})), "byte pressure can evict a root");
+        check(!cache.has({1, 2}, {}, true) && cache.has({3, 4}, {}, true) &&
+              cache.has({5, 6}, {}, true) && cache.bytes() <= one * 2,
+              "oldest root leaves and the byte budget remains bounded");
+    }
+    {
+        ConversationCache cache(one * 16, 2);
+        auto protected_image = image_with_checkpoint({1, 2, 3}, {1, 2});
+        protected_image.checkpoints.back().pinned = true;
+        check(cache.put(std::move(protected_image)), "explicit checkpoint pin parks");
+        check(cache.put(image({3, 4}), 0, true), "root parks beside the checkpoint pin");
+        check(cache.put(image({5, 6})), "root fallback preserves an explicit checkpoint pin");
+        check(cache.has({1, 2, 3}, {}, true) && !cache.has({3, 4}, {}, true),
+              "only the root is evicted");
+        check(cache.evict_oldest() && !cache.evict_oldest(),
+              "explicit checkpoint pin remains protected when no victim is available");
+    }
 }
 }
 

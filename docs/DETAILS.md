@@ -171,9 +171,8 @@ performance guarantee follows. The final measurements are still pending.
   skipped. The default placement is unchanged: a pool no larger than the physical
   core count, which is five workers and the host thread on the measured six-core
   CPU. On Windows the extras stay unpinned, as before.
-- **L3 background-writer affinity.** The two asynchronous NVMe park writers, the
-  conversation delta park and the L3 root-prefix park, restore the allowed CPUs
-  at the start of the writer thread. A new thread inherits the serving thread's
+- **L3 background-writer affinity.** The asynchronous direct L3 fallback writer
+  restores the allowed CPUs at the start of its thread. A new thread inherits the serving thread's
   pin, which the session loop holds to the reserved host core (the first physical
   core, logical processor 0), so before this change each writer ran on one
   logical processor. The pool captures the allowed CPUs at construction, before
@@ -1559,7 +1558,7 @@ retention for diagnostic comparisons. RAM-tier snapshots are not persisted acros
 **Conversation cache on disk (opt-in, L3).** The conversation state has three tiers. Tier 1
 (L1) is the live session in GPU memory; it always exists. Tier 2 (L2) is the optional
 host-RAM cache above (`--conversation-cache-mib`). Tier 3 (L3) is the optional disk store
-below. The tiers are independent; each one is optional except L1.
+below. L2 and L3 are optional. L1 always exists.
 
 Add `--conversation-cache-disk strata-conversations --conversation-cache-disk-gib 25` to the
 engine arguments. The engine then keeps parked conversations as files in the
@@ -1568,6 +1567,16 @@ positive GiB budget are required together. The store is off by default, it needs
 and it works with `--conversation-cache-mib 0`. Both the disk and RAM caches
 support `--layer-split`. The engine creates the directory when it is absent. A store that cannot be
 created stops startup with an error.
+
+The engine first parks an outgoing conversation in L2. A successful L2 admission
+does not write a copy to L3. If the L2 byte budget, slot limit, or physical RAM
+floor requires eviction, the engine moves the selected snapshot to L3.
+The spill uses the existing host buffers. It does not copy the payload or read
+the snapshot from the GPU again. Each spill creates a complete disk record.
+If L2 is disabled or cannot admit a conversation, the engine parks it directly
+in L3. The same rule applies to shared root prefixes.
+L2-only entries do not survive a service restart. Only entries already in L3
+can be restored after a restart.
 
 Two optional flags tune the store. `--conversation-cache-disk-slots N` caps the number of
 records (default 0 = no cap). `--conversation-cache-disk-min-free-mib N` keeps that many MiB
@@ -1594,20 +1603,26 @@ A later RAM restore keeps the pinned root available for another chat.
 Only token and image identity metadata is copied into the active session.
 The cached K/V buffers remain separate from active reuse buffers.
 
-When both tiers park an outgoing conversation, L3 can derive its new tail from
-the L2 image. This avoids a second GPU read-back. The disk writer still owns its
-payload. A lookup, a store change, or another park waits for the pending writer
-before it accesses the store. A continuation that already has the full useful
-resident prefix does not wait for a disk lookup that cannot improve reuse.
+A direct L3 fallback captures the outgoing state before the GPU session changes.
+Its disk write can run in the background. A lookup, a store change, or another
+park waits for that writer before it accesses the store. L2 eviction spills
+finish before the victim buffers are released. A continuation with the full
+useful resident prefix does not wait for a disk lookup that cannot improve reuse.
 
 **The shared system prompt (captured once).** When a fresh chat's prompt is read from token 0, the engine
 checkpoints the end of the system prompt (the first turn boundary) if that is `--prompt-cache-root` tokens
-or more. Each enabled tier then captures that prefix once - when it does not hold it yet - as a
-system-prompt (root) image. The root outlives the conversations that share it: the RAM cache and the disk
+or more. The engine captures that prefix once in L2, or in L3 when L2 is unavailable.
+It stores the prefix as a system-prompt (root) image. The root outlives the conversations that share it: the RAM cache and the disk
 LRU evict it only after every unpinned record, and an equal-length match prefers the root because restoring
 it reads the shared prefix alone instead of the conversation record that contains it. The bytes of one
 system prompt are written once, not once per chat. Options: `--conversation-cache-keep-root` and
 `--conversation-cache-disk-keep-root` (both default on).
+
+The RAM cache removes ordinary conversations before root images. If only roots remain,
+it removes the oldest root to make room within the byte budget or slot limit.
+Old roots cannot occupy all slots and prevent a new conversation from entering L2.
+An explicit shared-prefix checkpoint pin remains protected from this eviction.
+The physical RAM admission check and free-memory floor remain active.
 
 One record holds one conversation and one image per `--layer-split` stage. A two-card run
 parks and resumes as one unit, and every stage must hold the same token and image chain. A

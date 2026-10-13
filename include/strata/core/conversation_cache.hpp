@@ -202,6 +202,12 @@ public:
 
     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
         : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
+    // Spill only capacity victims. Superseded entries and active restores do not leave for L3.
+    using EvictionHandler = void (*)(SavedConversation&&, bool root, void*) noexcept;
+    void on_eviction(EvictionHandler handler, void* context) {
+        eviction_handler_ = handler;
+        eviction_context_ = context;
+    }
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
@@ -284,15 +290,14 @@ public:
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
-            // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
+            // Evict ordinary conversations first, then roots. Explicit checkpoint pins stay protected.
             if (!evict_oldest()) return false;
         }
         return true;
     }
 
-    // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
-    // the parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
+    // Evict the oldest ordinary conversation, or the oldest root if no ordinary victim remains.
+    // The parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
     // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
     // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
@@ -300,8 +305,13 @@ public:
     bool evict_oldest() {
         auto victim = std::find_if(entries_.begin(), entries_.end(),
                                    [](const Entry& e) { return !e.pinned && !e.image.pinned(); });
+        if (victim == entries_.end())
+            victim = std::find_if(entries_.begin(), entries_.end(),
+                                  [](const Entry& e) { return e.pinned && !e.image.pinned(); });
         if (victim == entries_.end()) return false;
         bytes_ -= victim->image.bytes();
+        if (eviction_handler_)
+            eviction_handler_(std::move(victim->image), victim->pinned, eviction_context_);
         entries_.erase(victim);
         ++evictions_;
         return true;
@@ -363,6 +373,8 @@ private:
     };
     std::deque<Entry> entries_; // least recently active first
     ConversationKvReuse reuse_;
+    EvictionHandler eviction_handler_ = nullptr;
+    void* eviction_context_ = nullptr;
 };
 
 } // namespace strata::core
