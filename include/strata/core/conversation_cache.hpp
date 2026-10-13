@@ -284,15 +284,14 @@ public:
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
-            // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
+            // Evict ordinary conversations first, then roots. Explicit checkpoint pins stay protected.
             if (!evict_oldest()) return false;
         }
         return true;
     }
 
-    // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
-    // the parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
+    // Evict the oldest ordinary conversation, or the oldest root if no ordinary victim remains.
+    // The parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
     // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
     // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
@@ -300,6 +299,9 @@ public:
     bool evict_oldest() {
         auto victim = std::find_if(entries_.begin(), entries_.end(),
                                    [](const Entry& e) { return !e.pinned && !e.image.pinned(); });
+        if (victim == entries_.end())
+            victim = std::find_if(entries_.begin(), entries_.end(),
+                                  [](const Entry& e) { return e.pinned && !e.image.pinned(); });
         if (victim == entries_.end()) return false;
         bytes_ -= victim->image.bytes();
         entries_.erase(victim);

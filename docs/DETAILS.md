@@ -1609,6 +1609,12 @@ it reads the shared prefix alone instead of the conversation record that contain
 system prompt are written once, not once per chat. Options: `--conversation-cache-keep-root` and
 `--conversation-cache-disk-keep-root` (both default on).
 
+The RAM cache removes ordinary conversations before root images. If only roots remain,
+it removes the oldest root to make room within the byte budget or slot limit.
+Old roots cannot occupy all slots and prevent a new conversation from entering L2.
+An explicit shared-prefix checkpoint pin remains protected from this eviction.
+The physical RAM admission check and free-memory floor remain active.
+
 One record holds one conversation and one image per `--layer-split` stage. A two-card run
 parks and resumes as one unit, and every stage must hold the same token and image chain. A
 record carries a compatibility key that covers the engine version, the model and MTP sources,

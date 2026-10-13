@@ -8676,7 +8676,7 @@ int main(int argc, char** argv) {
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
             if (!conversations.make_room(estimate, held)) {
-                std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB cannot fit byte budget or protected slots)\n",
                              estimate >> 20);
                 return true;
             }
