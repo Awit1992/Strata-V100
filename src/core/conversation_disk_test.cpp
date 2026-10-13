@@ -190,6 +190,61 @@ std::filesystem::path scratch_dir(const char* tag) {
     return dir;
 }
 
+void test_l2_first_spill() {
+    const auto dir = scratch_dir("l2-spill");
+    ConversationDiskStore store;
+    std::string error;
+    check(store.open(options_for(dir, ConversationDiskIdentity::from_string("l2-spill"), 1ull << 30), error) ==
+              ConversationDiskStatus::ok, "spill store opens");
+    ConversationCache cache(1 << 20, 2);
+    cache.on_eviction([](SavedConversation&& image, bool root, void* context) noexcept {
+        std::string error;
+        check(static_cast<ConversationDiskStore*>(context)->spill(std::move(image), root, error) ==
+                  ConversationDiskStatus::ok, "capacity victim spills to disk");
+    }, &store);
+    auto first = full_image(8, 41);
+    first.stage_images.push_back(full_image(8, 42));
+    const auto root_name = conversation_disk_prefix_name(first.live.ids, {}, true);
+    auto second = full_image(8, 51);
+    second.live.ids[0] = 901;
+    check(cache.put(std::move(first), 0, true) && cache.put(std::move(second), 0, true),
+          "roots fill L2 before any disk spill");
+    check(store.records() == 0 && std::filesystem::is_empty(dir),
+          "resident L2 entries create no disk records");
+    auto active = full_image(8, 61);
+    active.live.ids[0] = 902;
+    const auto active_ids = active.live.ids;
+    check(cache.put(std::move(active)), "latest conversation enters a root-filled L2");
+    check(store.records() == 1 && store.has(root_name),
+          "only the evicted oldest root enters L3");
+    ConversationDiskRecord back;
+    check(store.get(root_name, back, error) == ConversationDiskStatus::ok &&
+              back.stages.size() == 2 &&
+              back.stages[0].live.ids == full_image(8, 41).live.ids &&
+              same_stage(back.stages[0], full_image(8, 41)) &&
+              same_stage(back.stages[1], full_image(8, 42)),
+          "spilled root restores both stages and exact payloads");
+    auto prompt = active_ids;
+    prompt.push_back(999);
+    auto a = cache.take(cache.best(prompt, {}, true).index);
+    auto other = full_image(8, 71);
+    other.live.ids[0] = 903;
+    auto other_prompt = other.live.ids;
+    other_prompt.push_back(999);
+    check(cache.put(std::move(other), a.bytes()), "second conversation parks during a RAM exchange");
+    auto b = cache.take(cache.best(other_prompt, {}, true).index);
+    check(cache.put(std::move(a), b.bytes()) && cache.best(prompt, {}, true).tokens == 8,
+          "alternating conversations continue to restore from L2");
+    check(store.records() == 1, "RAM exchanges do not write through to disk");
+    check(cache.evict_oldest(), "physical RAM pressure spills an ordinary victim");
+    const auto conversation_name = conversation_disk_name(active_ids, {}, true);
+    check(store.has(conversation_name) && store.get(conversation_name, back, error) ==
+              ConversationDiskStatus::ok && back.stages[0].live.ids == active_ids &&
+              same_stage(back.stages[0], full_image(8, 61)),
+          "ordinary spill preserves the full conversation payload");
+    std::filesystem::remove_all(dir);
+}
+
 void test_basic_chain() {
     std::filesystem::path dir = scratch_dir("chain");
     ConversationDiskStore store;
@@ -675,6 +730,7 @@ void test_delta_checkpoint_below_base() {
 } // namespace
 
 int main() {
+    test_l2_first_spill();
     test_basic_chain();
     test_root_base();
     test_torn_tail();

@@ -883,6 +883,21 @@ std::vector<ConversationCheckpoint> chain_points(const std::vector<int32_t>& ful
     return points;
 }
 
+ConversationDiskStatus ConversationDiskStore::spill(SavedConversation&& image, bool root, std::string& error) {
+    if (!enabled()) return ConversationDiskStatus::disabled;
+    const std::string name = root
+        ? conversation_disk_prefix_name(image.live.ids, image.live.imgs, image.cvec)
+        : conversation_disk_name(image.live.ids, image.live.imgs, image.cvec);
+    if (root && has(name)) return ConversationDiskStatus::ok;
+    ConversationDiskRecord record;
+    record.stages.reserve(image.stage_images.size() + 1);
+    auto parts = std::move(image.stage_images);
+    image.stage_images.clear();
+    record.stages.push_back(std::move(image));
+    for (auto& part : parts) record.stages.push_back(std::move(part));
+    return seed(name, std::move(record), {}, 0, error);
+}
+
 ConversationDiskStatus ConversationDiskStore::seed(const std::string& name, ConversationDiskRecord&& record,
                                                    std::string base_name, uint64_t base_tokens,
                                                    std::string& error) {

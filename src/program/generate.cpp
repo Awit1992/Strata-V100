@@ -652,7 +652,7 @@ struct Options {
     int64_t conversation_cache_min_free_mib = 2560;
     /// --serve: the L3 disk tier for parked conversations (conversation_disk.hpp).  Both the directory and a
     /// positive GiB budget are required together; the tier is off unless both are given.  It works with
-    /// --conversation-cache-mib 0 and with --layer-split (the RAM tier does not).
+    /// --conversation-cache-mib 0 and with --layer-split.
     std::string conversation_cache_disk;              // the store root directory
     int64_t conversation_cache_disk_gib = 0;          // the file budget in GiB (> 0)
     int conversation_cache_disk_slots = 0;            // the record cap (0 = no cap)
@@ -8292,8 +8292,8 @@ int main(int argc, char** argv) {
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
         // ---- the L3 disk tier (conversation_disk.hpp): the same parked conversations, one record per
         // conversation, one image per layer-split stage, kept in files across process restarts.  The store is
-        // CPU only; the capture and restore here are the CUDA side.  It is independent of the RAM cache, so it
-        // works with --conversation-cache-mib 0 and with --layer-split (which the RAM cache refuses).
+        // CPU only; the capture and restore here are the CUDA side. L2 spills capacity victims here.
+        // Direct L3 parking remains available when L2 is disabled or cannot admit a snapshot.
         strata::core::ConversationDiskStore disk;
         if (!o.conversation_cache_disk.empty()) {
             strata::core::ConversationDiskOptions disk_options;
@@ -8325,7 +8325,6 @@ int main(int argc, char** argv) {
             double write_ms = 0.0;
             size_t tokens = 0;
             size_t snapshot_bytes = 0;
-            bool root = false;              // a shared system-prompt prefix record, not a conversation park
             int64_t delta_tokens = 0;       // the park's new tokens (a seed: its whole slice)
         };
         std::optional<std::future<DiskWriteResult>> pending_disk_write;
@@ -8344,9 +8343,8 @@ int main(int argc, char** argv) {
                              (unsigned long long) disk.bytes());
                 return;
             }
-            std::fprintf(stderr, "strata serve: conversation disk: %s %zu tokens (+%lld) in %.1f ms; records=%zu "
+            std::fprintf(stderr, "strata serve: conversation disk: parked %zu tokens (+%lld) in %.1f ms; records=%zu "
                          "bytes=%llu evictions=%llu corruptions=%llu snapshot_bytes=%zu\n",
-                         result.root ? "root parked" : "parked",
                          result.tokens, (long long) result.delta_tokens,
                          result.capture_ms + result.write_ms, disk.records(),
                          (unsigned long long) disk.bytes(), (unsigned long long) disk.evictions(),
@@ -8361,10 +8359,8 @@ int main(int argc, char** argv) {
         auto stage_device = [&](size_t i) -> int { return i == 0 ? 0 : stages[i - 1]->dev; };
         // Capture must finish before the session is overwritten. The file write then runs while the next request
         // uses the GPUs. A lookup or a later park joins the one pending write before it touches the store index.
-        auto park_disk = [&](const strata::core::SavedConversation* captured = nullptr) {
+        auto park_disk = [&]() {
             if (!disk_enabled || !live_ok || live.empty()) return;
-            // RAM images omit the draft when MTP is disabled for this session; the disk schema does not.
-            if (captured && mtp_on != use_mtp) captured = nullptr;
             finish_disk_write();
             const size_t upto = live.size();
             if (upto == 0) return;
@@ -8424,8 +8420,8 @@ int main(int argc, char** argv) {
             // base ("an invalid checkpoint in the delta"), and a rejected park re-captures the whole
             // [base, upto) K/V on every request - the observed steady-state TTFT spike on chats that
             // share the 'p' root chain and keep an early checkpoint under it.
-            if (!captured) for (const ConvCheckpoint& c : checks) {
-                if (c.ids.size() <= (int64_t) cover) continue;      // already merged or in the base chain
+            for (const ConvCheckpoint& c : checks) {
+                if (c.ids.size() <= cover) continue;                // already merged or in the base chain
                 if (c.ids.size() > live.size()) return;             // an incomplete part set
                 if (!stages.empty() && c.stage_parts.size() != stages.size()) return;   // an incomplete part set
                 for (size_t i = 0; i < disk_stage_count; ++i) {
@@ -8453,12 +8449,9 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(stage_device(i));
                 const strata::core::ConversationView view{live, live_imgs, stage_checks[i], cvec_cached};
                 strata::core::SessionState& session = stage_session(i);
-                const bool ok = captured
-                    ? strata::core::conversation_disk_delta_from_snapshot(record.stages[i],
-                          i == 0 ? *captured : captured->stage_images[i - 1],
-                          (int64_t) cover, owns_draft(i), derr)
-                    : strata::core::conversation_disk_delta_save(record.stages[i], view, session, g,
-                          owns_draft(i) ? &mtp.kv_state() : nullptr, (int64_t) cover, derr);
+                const bool ok = strata::core::conversation_disk_delta_save(
+                    record.stages[i], view, session, g,
+                    owns_draft(i) ? &mtp.kv_state() : nullptr, (int64_t) cover, derr);
                 if (!ok) {
                     std::fprintf(stderr, "strata serve: conversation disk: skip parking (%s)\n", derr.c_str());
                     return;
@@ -8580,12 +8573,44 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
+        // L2 victims already own complete host snapshots. Move them to L3 without a GPU capture.
+        // Complete seeds avoid replaying a history of repeated hot-conversation parks.
+        auto spill_saved = [&](strata::core::SavedConversation&& image, bool root) noexcept {
+            if (!disk_enabled || (root && !o.conversation_cache_disk_keep_root)) return;
+            const auto t0 = Clock::now();
+            try {
+                finish_disk_write();
+                const size_t tokens = image.live.ids.size();
+                const size_t snapshot_bytes = image.bytes();
+                std::string derr;
+                const auto status = disk.spill(std::move(image), root, derr);
+                if (status != strata::core::ConversationDiskStatus::ok) {
+                    std::fprintf(stderr, "strata serve: conversation disk: write failed in %.1f ms (%s); source=l2-spill\n",
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), derr.c_str());
+                    return;
+                }
+                std::fprintf(stderr, "strata serve: conversation disk: %s %zu tokens (+%zu) in %.1f ms; "
+                                     "records=%zu bytes=%llu evictions=%llu corruptions=%llu snapshot_bytes=%zu source=l2-spill\n",
+                             root ? "root parked" : "parked", tokens, tokens,
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             disk.records(), (unsigned long long) disk.bytes(),
+                             (unsigned long long) disk.evictions(), (unsigned long long) disk.corruptions(), snapshot_bytes);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata serve: conversation disk: write failed in %.1f ms (%s); source=l2-spill\n",
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), e.what());
+            }
+        };
+        if (disk_enabled)
+            conversations.on_eviction(
+                [](strata::core::SavedConversation&& image, bool root, void* context) noexcept {
+                    (*static_cast<decltype(spill_saved)*>(context))(std::move(image), root);
+                }, &spill_saved);
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
-        auto park_disk_safe = [&](const strata::core::SavedConversation* captured) {
+        auto park_disk_safe = [&]() {
             if (!disk_enabled || !live_ok || live.empty()) return;
             try {
-                park_disk(captured);
+                park_disk();
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation disk: skip parking (transient host allocation failed)\n");
             } catch (const std::system_error& e) {
@@ -8593,7 +8618,7 @@ int main(int argc, char** argv) {
                              e.what());
             }
         };
-        auto park_current_body = [&](size_t held, bool& disk_attempted) -> bool {
+        auto park_current_body = [&](size_t held, bool& park_handled) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             // --conversation-cache-min-tokens: a short conversation is not worth one of the slots.  Parking is a
             // switch-time decision, so a client's small side requests would otherwise park themselves and, once the
@@ -8730,17 +8755,22 @@ int main(int argc, char** argv) {
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
-                disk_attempted = true;
-                park_disk_safe(&image);
+                // A successful L2 admission does not write through to L3.
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
+                    park_handled = true;
+                    spill_saved(std::move(image), false);
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
+                park_handled = true;
+                if (!stored) {
+                    spill_saved(std::move(image), false);
+                }
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -8755,13 +8785,13 @@ int main(int argc, char** argv) {
         // #752: the whole park (the checkpoint split included) is under one try, so a host OOM skips parking instead of
         // ending the server
         auto park_current = [&](size_t held) -> bool {
-            bool disk_attempted = false;
+            bool park_handled = false;
             bool ok = true;
-            try { ok = park_current_body(held, disk_attempted); }
+            try { ok = park_current_body(held, park_handled); }
             catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
             }
-            if (ok && !disk_attempted) park_disk_safe(nullptr);
+            if (ok && !park_handled) park_disk_safe();
             return ok;
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
@@ -8871,12 +8901,7 @@ int main(int argc, char** argv) {
             }
             return true;
         };
-        // The shared system-prompt prefix record: when a fresh chat's read has just checkpointed its root
-        // boundary (the end of the system prompt), capture that prefix ONCE and give it priority in each
-        // enabled tier.  A later new chat with the same system prompt restores this small image instead of
-        // the longer conversation record that contains it.  Skipped when the prefix is already in every tier
-        // that wants it: the bytes are identical for every chat of the same system prompt, so a repeat
-        // would only rewrite them.  Never fatal: a skipped capture costs a read, not a wrong answer.
+        // Capture a shared root once in L2. L3 receives it only on eviction or failed L2 admission.
         auto park_root = [&](int64_t L) {
             if (L < 1) return;
             const bool l2_want = conversations.enabled() && o.conversation_cache_keep_root;
@@ -8885,97 +8910,65 @@ int main(int argc, char** argv) {
             std::vector<int32_t> prefix((size_t) L);
             for (int64_t i = 0; i < L; ++i) prefix[(size_t) i] = (int32_t) cur[(size_t) i];
             const std::vector<ImgKey> prefix_imgs = imgs_below(req_imgs, L);
-            const std::string pname = strata::core::conversation_disk_prefix_name(prefix, prefix_imgs, cvec_cached);
-            finish_disk_write();   // one in-flight disk write at a time; this joins the previous one
-            const bool l2_have = conversations.has(prefix, prefix_imgs, cvec_cached);
-            const bool l3_have = disk.has(pname);
-            if ((!l2_want || l2_have) && (!l3_want || l3_have)) return;
+            if (l2_want && conversations.has(prefix, prefix_imgs, cvec_cached)) return;
+            if (!l2_want) {
+                finish_disk_write();
+                const auto name = strata::core::conversation_disk_prefix_name(prefix, prefix_imgs, cvec_cached);
+                if (disk.has(name)) return;
+            }
             const auto t0 = Clock::now();
             std::string derr;
             try {
-                strata::core::ConversationDiskRecord record;
-                record.stages.resize(disk_stage_count);
-                bool ok = true;
-                for (size_t i = 0; ok && i < record.stages.size(); ++i) {
+                const strata::core::ConversationView view{prefix, prefix_imgs, {}, cvec_cached};
+                size_t estimate = 0;
+                for (size_t i = 0; i < disk_stage_count; ++i) {
                     const strata::core::OnDevice on(stage_device(i));
-                    const strata::core::ConversationView view{prefix, prefix_imgs, {}, cvec_cached};
-                    strata::core::SessionState& session = stage_session(i);
-                    ok = owns_draft(i)
-                        ? strata::core::conversation_snapshot_save(record.stages[i], view, session, g, mtp.kv_state(), derr)
-                        : strata::core::conversation_stage_save(record.stages[i], view, session, g, derr);
-                }
-                for (size_t i = 0; ok && i < record.stages.size(); ++i) {
-                    const strata::core::OnDevice on(stage_device(i));
-                    strata::core::SessionState& session = stage_session(i);
-                    const bool valid = owns_draft(i)
-                        ? strata::core::conversation_snapshot_validate(record.stages[i], session, g, mtp.kv_state(), derr)
-                        : strata::core::conversation_stage_validate(record.stages[i], session, g, derr);
-                    if (!valid) {
+                    size_t part_bytes = 0;
+                    if (!strata::core::conversation_snapshot_bytes(view, stage_session(i), g,
+                            owns_draft(i) ? &mtp.kv_state() : nullptr, part_bytes, derr)) {
                         std::fprintf(stderr, "strata serve: conversation cache: skip root parking (%s)\n", derr.c_str());
                         return;
                     }
+                    estimate += part_bytes;
                 }
-                const size_t ram_bytes = record.bytes();
-                const size_t tokens = (size_t) L;
-                if (l3_want) {
-                    pending_disk_write.emplace(std::async(std::launch::async,
-                        [&disk, record = std::move(record), tokens, ram_bytes, pname,
-                         aff = pool.submission_affinity()]() mutable {
-                            // A new thread inherits the GPU driver's single-core pin (pool.hpp); restore the pool's
-                            // original allowed CPUs so the file write is not restricted to that one core.
-                            strata::kernels::cpu::restore_thread_affinity(aff);
-                            DiskWriteResult result;
-                            result.root = true;
-                            result.tokens = tokens;
-                            result.snapshot_bytes = ram_bytes;
-                            result.delta_tokens = (int64_t) tokens;
-                            const auto write_at = Clock::now();
-                            try {
-                                result.status = disk.seed(pname, std::move(record), std::string(), 0, result.error);
-                            } catch (const std::exception& e) {
-                                result.status = strata::core::ConversationDiskStatus::failed;
-                                result.error = e.what();
-                            } catch (...) {
-                                result.status = strata::core::ConversationDiskStatus::failed;
-                                result.error = "unknown exception";
-                            }
-                            result.write_ms = std::chrono::duration<double, std::milli>(Clock::now() - write_at).count();
-                            return result;
-                        }));
+                const bool room = l2_want && conversations.make_room(estimate);
+                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                auto admit = [&] {
+                    return strata::core::conversation_memory_admit(
+                        strata::core::available_host_bytes(), estimate, floor);
+                };
+                while (!admit() && conversations.evict_oldest()) {}
+                if (!admit()) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip root parking (physical RAM admission)\n");
+                    return;
                 }
-                if (l2_want) {
-                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
-                    if (!strata::core::conversation_memory_admit(strata::core::available_host_bytes(),
-                            ram_bytes, floor)) {
-                        std::fprintf(stderr, "strata serve: conversation cache: skip root parking (physical RAM admission)\n");
-                        return;
-                    }
-                    strata::core::SavedConversation image;
-                    const strata::core::ConversationView view{prefix, prefix_imgs, {}, cvec_cached};
-                    const strata::core::QsaState* main_draft = stages.empty() ? &mtp.kv_state()
-                                              : (owns_draft(0) ? &mtp.kv_state() : nullptr);
-                    if (!strata::core::conversation_snapshot_save(image, view, ss, g, main_draft, derr)) {
+                strata::core::SavedConversation image;
+                if (!strata::core::conversation_snapshot_save(image, view, ss, g,
+                        owns_draft(0) ? &mtp.kv_state() : nullptr, derr)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip root parking (%s)\n", derr.c_str());
+                    return;
+                }
+                image.stage_images.reserve(stages.size());
+                for (size_t i = 1; i < disk_stage_count; ++i) {
+                    const strata::core::OnDevice on(stage_device(i));
+                    strata::core::SavedConversation part;
+                    if (!strata::core::conversation_snapshot_save(part, view, stage_session(i), g,
+                            owns_draft(i) ? &mtp.kv_state() : nullptr, derr)) {
                         std::fprintf(stderr, "strata serve: conversation cache: skip root parking (%s)\n", derr.c_str());
                         return;
                     }
-                    for (size_t k = 0; k < stages.size(); ++k) {
-                        auto& st = stages[k];
-                        const strata::core::OnDevice on(st->dev);
-                        if (cudaDeviceSynchronize() != cudaSuccess) { derr = "stage sync failed"; return; }
-                        const strata::core::QsaState* sd = owns_draft(k + 1) ? &mtp.kv_state() : nullptr;
-                        strata::core::SavedConversation part;
-                        if (!strata::core::conversation_snapshot_save(part, view, st->ss, g, sd, derr)) {
-                            std::fprintf(stderr, "strata serve: conversation cache: skip root parking (%s)\n", derr.c_str());
-                            return;
-                        }
-                        image.stage_images.push_back(std::move(part));
-                    }
-                    const bool stored = conversations.put(std::move(image), 0, true);
-                    std::fprintf(stderr, "strata serve: conversation cache: %s root %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu\n",
-                                 stored ? "parked" : "skipped", tokens,
-                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                                 conversations.size(), conversations.bytes(), conversations.evictions(), ram_bytes);
+                    image.stage_images.push_back(std::move(part));
                 }
+                const size_t snapshot_bytes = image.bytes();
+                const bool stored = room && strata::core::conversation_memory_admit(
+                    strata::core::available_host_bytes(), 0, floor) &&
+                    conversations.put(std::move(image), 0, true);
+                if (!stored && l3_want) spill_saved(std::move(image), true);
+                std::fprintf(stderr, "strata serve: conversation cache: %s root %zu tokens in %.1f ms; "
+                                     "parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu\n",
+                             stored ? "parked" : "skipped", (size_t) L,
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes);
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: root capture allocation failed; skip\n");
             }

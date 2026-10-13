@@ -202,6 +202,12 @@ public:
 
     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
         : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
+    // Spill only capacity victims. Superseded entries and active restores do not leave for L3.
+    using EvictionHandler = void (*)(SavedConversation&&, bool root, void*) noexcept;
+    void on_eviction(EvictionHandler handler, void* context) {
+        eviction_handler_ = handler;
+        eviction_context_ = context;
+    }
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
@@ -304,6 +310,8 @@ public:
                                   [](const Entry& e) { return e.pinned && !e.image.pinned(); });
         if (victim == entries_.end()) return false;
         bytes_ -= victim->image.bytes();
+        if (eviction_handler_)
+            eviction_handler_(std::move(victim->image), victim->pinned, eviction_context_);
         entries_.erase(victim);
         ++evictions_;
         return true;
@@ -365,6 +373,8 @@ private:
     };
     std::deque<Entry> entries_; // least recently active first
     ConversationKvReuse reuse_;
+    EvictionHandler eviction_handler_ = nullptr;
+    void* eviction_context_ = nullptr;
 };
 
 } // namespace strata::core

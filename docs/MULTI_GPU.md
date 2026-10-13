@@ -145,9 +145,8 @@ core's sibling comes last, so an additional worker shares the host's physical
 core only after every worker sibling is taken. The default placement is
 unchanged.
 
-**L3 background-writer affinity.** The two asynchronous NVMe park writers, the
-conversation delta park and the L3 root-prefix park, restore the allowed CPUs at
-the start of the writer thread, because a new thread inherits the serving
+**L3 background-writer affinity.** The asynchronous direct L3 fallback writer restores
+the allowed CPUs at the start of its thread. A new thread inherits the serving
 thread's pin to the reserved host core (the first physical core, logical
 processor 0). The pool captures the allowed CPUs at construction, before that
 pin; each writer, created later on the pinned thread, captures a copy and
@@ -294,9 +293,12 @@ The draft K/V stays with the last stage. A later RAM restore keeps
 the pinned root for another chat. The RAM budget, slot limit, and
 physical-RAM floor still apply.
 
-When both tiers park a conversation, the disk delta can use the existing
-RAM snapshot instead of another GPU read-back. Each disk payload keeps
-its own storage. Store accesses still wait for the pending writer.
+An outgoing conversation first enters L2. A successful L2 park does not write to disk.
+When L2 needs room, the engine moves an eviction victim's complete stage images
+to L3 without a second GPU read-back or a payload copy. It spills roots only after
+ordinary conversations. Explicit shared-prefix checkpoint pins remain protected.
+Direct L3 parking remains available if L2 is disabled or cannot admit the snapshot.
+An L2-only snapshot does not survive a service restart.
 The measured [dual-V100 shared-root study](../benchmarks/v100-iq3_s-prefill-wmma.md#agentic-short-turn-latency-2026-10-10)
 reports the gains and the cases that do not improve.
 
