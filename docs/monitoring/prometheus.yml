@@ -1,5 +1,5 @@
-# Scrape a Strata server's GET /metrics (Prometheus text, vLLM's names; docs/DETAILS.md).
-# Prometheus asks for text/plain, so it gets the text format; the Monitor tab keeps the JSON.
+# Scrape the cached Prometheus snapshot. See docs/monitoring/METRICS.md.
+# Prometheus selects text/plain. The web Monitor keeps the JSON response.
 scrape_configs:
   - job_name: strata
     metrics_path: /metrics

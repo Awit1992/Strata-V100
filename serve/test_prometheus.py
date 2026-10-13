@@ -21,6 +21,14 @@ from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def wait_snapshot(svc, since=0):
+    deadline = time.monotonic() + 5
+    while (svc.metrics_snapshot.updated or 0) <= since:
+        if time.monotonic() >= deadline:
+            raise AssertionError("background metrics collection did not finish")
+        time.sleep(0.01)
+
+
 def parse(text):
     """{(name, labels): value} for every sample line; checks each family has HELP and TYPE first."""
     out, typed = {}, set()
@@ -31,11 +39,12 @@ def parse(text):
             continue
         if line.startswith("#") or not line:
             continue
-        m = re.fullmatch(r'([a-z0-9_:]+)\{([^}]*)\} (\S+)', line)
+        m = re.fullmatch(r'([a-z0-9_:]+)(?:\{([^}]*)\})? (\S+)', line)
         assert m, f"not a sample line: {line!r}"
         name, labels, value = m.groups()
         family = re.sub(r"_(bucket|sum|count)$", "", name)
         assert name in typed or family in typed, f"{name} has no # TYPE"
+        assert (name, labels) not in out, f"duplicate series: {name} {labels}"
         out[(name, labels)] = float(value)
     return out
 
@@ -122,6 +131,7 @@ class Endpoint(unittest.TestCase):
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as r:
             usage = json.loads(r.read())["usage"]
+        wait_snapshot(self.svc, time.time())
         ctype, text = self.get("/metrics", "text/plain")
         self.assertTrue(ctype.startswith("text/plain"))
         got = {k[0]: v for k, v in parse(text).items()}
@@ -134,6 +144,39 @@ class Endpoint(unittest.TestCase):
         ctype, _ = self.get("/metrics?format=prometheus", "*/*")
         self.assertTrue(ctype.startswith("text/plain"))
 
+    def test_scrapes_do_not_wait_for_collection(self):
+        from unittest.mock import patch
+        from concurrent.futures import ThreadPoolExecutor
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        original = self.svc.metrics
+
+        def slow_collection():
+            entered.set()
+            release.wait(10)
+            try:
+                return original()
+            finally:
+                finished.set()
+
+        wait_snapshot(self.svc)
+        with patch.object(self.svc, "metrics", side_effect=slow_collection) as collect:
+            try:
+                self.assertTrue(entered.wait(5))
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    responses = list(pool.map(lambda _: self.get("/metrics", "text/plain"), range(32)))
+                for content_type, text in responses:
+                    self.assertTrue(content_type.startswith("text/plain"))
+                    self.assertIn("vllm:generation_tokens_total", {k[0] for k in parse(text)})
+                self.assertEqual(collect.call_count, 1)
+                body = json.dumps({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 32}).encode()
+                req = urllib.request.Request(self.base + "/v1/chat/completions", data=body,
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    self.assertEqual(json.loads(response.read())["choices"][0]["finish_reason"], "stop")
+            finally:
+                release.set()
+                self.assertTrue(finished.wait(5))
+
 
 class BatchEngine(MockEngine):
     """--batch as the server sees it: several requests generate at once, none waits for the control lines."""
@@ -143,7 +186,7 @@ class BatchEngine(MockEngine):
 class Batched(unittest.TestCase):
     def test_every_concurrent_request_is_counted(self):
         tok = ByteTokenizer()
-        svc = Service(BatchEngine(tok, "</think>\n\n" + "y" * 40, max_context=4096, delay_s=0.02), tok,
+        svc = Service(BatchEngine(tok, "</think>\n\n" + "y" * 40, max_context=4096, delay_s=0.04), tok,
                       ChatTemplate(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -159,11 +202,12 @@ class Batched(unittest.TestCase):
 
             threads = [threading.Thread(target=ask) for _ in range(3)]
             [t.start() for t in threads]
-            time.sleep(0.4)                              # the three are generating
+            wait_snapshot(svc, time.time())               # observe the next background collection
             req = urllib.request.Request(base + "/metrics", headers={"Accept": "text/plain"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 during = {k[0]: v for k, v in parse(r.read().decode()).items()}
             [t.join() for t in threads]
+            wait_snapshot(svc, time.time())
             with urllib.request.urlopen(req, timeout=30) as r:
                 after = {k[0]: v for k, v in parse(r.read().decode()).items()}
         finally:
