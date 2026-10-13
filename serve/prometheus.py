@@ -6,6 +6,49 @@ What vLLM has no name for is the JSON's own facts under `strata:`, named after t
 strata:live_tok_s, totals.decode_ms -> strata:totals_decode_seconds_total, hardware.gpu_util -> strata:gpu_util), so
 the two formats say the same thing and a panel can be moved from the Monitor tab to Grafana by its key."""
 import threading
+import logging
+import math
+import re
+import time
+
+
+class Snapshot:
+    """Collect and encode once per second, independently of HTTP readers."""
+
+    def __init__(self, service):
+        self.service = service
+        self.body = None
+        self.updated = None
+        self.errors = 0
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._loop, name="strata-metrics", daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while not self.stop.is_set():
+            try:
+                m = self.service.metrics()
+                text = render(m, self.service.latencies.snapshot())
+                now = time.time()
+                text += ("# HELP strata:metrics_snapshot_timestamp_seconds Last successful collection time.\n"
+                         "# TYPE strata:metrics_snapshot_timestamp_seconds gauge\n"
+                         f"strata:metrics_snapshot_timestamp_seconds {now}\n"
+                         "# HELP strata:metrics_collection_errors_total Failed background collections.\n"
+                         "# TYPE strata:metrics_collection_errors_total counter\n"
+                         f"strata:metrics_collection_errors_total {self.errors}\n")
+                self.body = text.encode("utf-8")
+                self.updated = now
+            except Exception:
+                self.errors += 1
+                logging.getLogger(__name__).exception("Metrics collection failed")
+            self.stop.wait(1.0)
+
+    def close(self):
+        self.stop.set()
+
+
+def _escape(value):
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 # vLLM's buckets for the request latencies (seconds)
 BUCKETS = (0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0,
@@ -62,7 +105,7 @@ def _num(v, default=0):
 
 def render(m: dict, lat: dict) -> str:
     """The text for one scrape.  `m` is Service.metrics(), `lat` Latencies.snapshot()."""
-    model = str((m.get("engine") or {}).get("model") or "strata").replace("\\", "\\\\").replace('"', '\\"')
+    model = _escape((m.get("engine") or {}).get("model") or "strata")
     lab = f'model_name="{model}"'
     live, totals = m.get("live") or {}, m.get("totals") or {}
     out = []
@@ -160,3 +203,59 @@ def strata(m: dict, out: list, lab: str):
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
     metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
     metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))
+
+    # Export numeric facts only. Never expose prompts, request IDs, paths, or arbitrary string labels.
+    # Gauges are deliberate for engine/cache snapshots: their values can fall after an engine restart.
+    def facts(prefix, values, counters=(), labels=""):
+        for key, value in values.items():
+            if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", key):
+                continue
+            if isinstance(value, bool):
+                value = int(value)
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
+                continue
+            scale = 1
+            name = key
+            for suffix, replacement, factor in (("_ms", "_seconds", 0.001),
+                                                  ("_mib", "_bytes", 2 ** 20),
+                                                  ("_gib", "_bytes", 2 ** 30),
+                                                  ("_mb", "_bytes_per_second", 2 ** 20),
+                                                  ("_wh", "_joules", 3600)):
+                if name.endswith(suffix):
+                    name = name[:-len(suffix)] + replacement
+                    scale = factor
+                    break
+            kind = "counter" if key in counters else "gauge"
+            if kind == "counter" and not name.endswith("_total"):
+                name += "_total"
+            metric(prefix + name, kind, f"Numeric snapshot field {prefix}{key}.", value * scale, labels)
+
+    facts("engine_", {k: v for k, v in eng.items() if k != "max_context"})
+    facts("live_", {k: v for k, v in live.items()
+                    if k not in ("tok_s", "prefill_tok_s_mean", "prompt_read")})
+    facts("totals_", {k: v for k, v in totals.items() if k not in ("prompt_ms", "decode_ms", "since")},
+          counters=tuple(k for k in totals if k not in ("since",)))
+    metric("start_time_seconds", "gauge", "Start time of request accounting.", totals.get("since"))
+    facts("last_", {k: v for k, v in last.items() if k not in ("hit_rate", "decode_tok_s")})
+    facts("conversation_cache_", m.get("conversation_cache") or {})
+    facts("l3_", m.get("l3") or {})
+    facts("hardware_", {k: v for k, v in hw.items() if not k.startswith("gpu_")
+                       and k not in ("cpu", "ram_used", "ram_total")})
+    facts("hardware_", m.get("hardware_static") or {})
+    metric("cpu_utilization_ratio", "gauge", "Host CPU utilization, 1 means fully busy.",
+           hw["cpu"] / 100 if isinstance(hw.get("cpu"), (int, float)) else None)
+    for g in gpus:
+        labels = f',gpu="{_escape(g.get("index"))}"'
+        facts("gpu_", {k: v for k, v in g.items() if k in
+                      ("power_limit", "pcie_gen", "pcie_gen_max", "pcie_width", "pcie_rx_mb", "pcie_tx_mb")},
+              labels=labels)
+        metric("gpu_utilization_ratio", "gauge", "GPU utilization, 1 means fully busy.",
+               g["util"] / 100 if isinstance(g.get("util"), (int, float)) else None, labels)
+        metric("gpu_energy_joules", "gauge", "GPU energy since telemetry start; resets with sampler.",
+               g["energy_wh"] * 3600 if isinstance(g.get("energy_wh"), (int, float)) else None, labels)
+    for slot in live.get("slots") or []:
+        facts("slot_", {k: v for k, v in slot.items() if k != "slot"},
+              labels=f',slot="{_escape(slot.get("slot"))}"')
+    for replica in live.get("replicas") or []:
+        facts("replica_", {k: v for k, v in replica.items() if k != "replica"},
+              labels=f',replica="{_escape(replica.get("replica"))}"')

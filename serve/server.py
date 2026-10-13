@@ -5433,7 +5433,10 @@ def make_handler(svc: Service):
                 from serve import prometheus
                 if prometheus.wants_prometheus(self.headers.get("Accept", ""), urlsplit(self.path).query):
                     if self._authorized():   # a scraper: the text format, vLLM's names (serve/prometheus.py)
-                        body = prometheus.render(svc.metrics(), svc.latencies.snapshot()).encode()
+                        body = svc.metrics_snapshot.body
+                        if body is None:
+                            self._json(503, {"error": {"message": "metrics snapshot is not ready"}})
+                            return
                         self.send_response(200)
                         self.send_header("Content-Type", prometheus.CONTENT_TYPE)
                         self.send_header("Content-Length", str(len(body)))
@@ -6190,6 +6193,9 @@ class Server(ThreadingHTTPServer):
         tel = getattr(getattr(self, "svc", None), "telemetry", None)
         if tel is not None and hasattr(tel, "close"):
             tel.close()
+        snapshot = getattr(getattr(self, "svc", None), "metrics_snapshot", None)
+        if snapshot is not None:
+            snapshot.close()
         super().server_close()
 
 
@@ -6440,6 +6446,8 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
     httpd.svc = svc
+    from serve.prometheus import Snapshot
+    svc.metrics_snapshot = Snapshot(svc)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 
