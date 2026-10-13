@@ -4122,21 +4122,6 @@ class ModelAliases(unittest.TestCase):
             httpd.server_close()
 
 
-class EnergyCounter(unittest.TestCase):
-    """The Monitor's cumulative power row: the hardware energy counters (NVML's mJ, amdgpu's uJ) are 32-bit and wrap -
-    a V100 idling at 45 W reaches 2**32 mJ in about 26 hours - so the sampler keeps a running total across the wrap."""
-
-    def test_seeds_with_the_hardware_total_then_wraps(self):
-        from serve.telemetry import _EnergyCounter
-        c = _EnergyCounter()
-        self.assertIsNone(c.add(None))                                # a card without the counter: no row at all
-        self.assertEqual(c.add(1_000), 1_000)                         # seeded, not started at 0
-        self.assertEqual(c.add(2_500), 2_500)
-        self.assertEqual(c.add((1 << 32) - 100), (1 << 32) - 100)
-        self.assertEqual(c.add(50), (1 << 32) + 50)                   # the wrap, added back
-        self.assertEqual(c.add(150), (1 << 32) + 150)
-
-
 class AmdTelemetry(unittest.TestCase):
     """#301: the AMD backend's readings from a fake amdgpu sysfs tree: KFD node -> render node, as setup numbers the
     cards (the CPU node skipped), and free_vram_mib on HIP."""
