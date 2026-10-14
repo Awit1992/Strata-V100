@@ -14,6 +14,8 @@ The short-read code in `src/program/generate.cpp` describes a fixed batched-pref
 
 Use the existing agent-turn benchmark. Record new prompt tokens, reused tokens, prompt milliseconds, prompt tokens per second, decode tokens per second, and HTTP elapsed time. Compare the same turn across arms. Separate the first cold turn from later reused turns. Do not calculate effective prefill throughput from total context tokens when most tokens are reused.
 
+The direct harness [`bench/run_v100_prefill.py`](../bench/run_v100_prefill.py) has the same shape with `--chain`: one prefix turn, then one turn per exact diff, with the prompt cache on and a private cache store. It reports the engine's own `reused` and `prompt_read` counts for each turn. Use it when the HTTP layer is not under test.
+
 Use fresh conversation storage for each arm. Keep the model, layer split, ring size, generation settings, and request order fixed. Alternate arm order across rounds. Do not use production conversation storage. Keep diagnostic timing off in scored runs.
 
 ## Experiment order

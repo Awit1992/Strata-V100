@@ -149,17 +149,4 @@ void round_f16(const float* x, float* y, int64_t n, void* stream);
 /// Expert blob -> FP16 (Q2_0 values are exact in FP16).
 void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 
-// ---- indirect WMMA expert weight tables (the CUDA Volta prompt experts)
-/// The most experts one indirect weight table covers (a grouped WMMA launch's group; MMQ_GROUP in the prompt path).
-constexpr int kExpertPtrTableMax = 16;
-#if !defined(STRATA_USE_HIP)
-/// Builds the device pointer table `strata::kernels::gemm_iq_f16_grouped` reads when its `indirect_weights`
-/// argument is true: dst_gu[i] / dst_dn[i] = expert i's gate/up and down weights (the expert's own blob, in
-/// the group's order), for i < n <= kExpertPtrTableMax.  Entries past n are left as they were - the launch's
-/// expert count bounds its grid, so it never reads them.  The pointers travel in the kernel's arguments BY
-/// VALUE, so the asynchronous launch copies them: the caller's arrays need not outlive this call.
-void expert_ptr_table(const void* const* gu, const void* const* dn, int n, const void** dst_gu,
-                      const void** dst_dn, void* stream);
-#endif
-
 }  // namespace strata::prefill

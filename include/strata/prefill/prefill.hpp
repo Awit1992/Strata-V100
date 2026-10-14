@@ -199,8 +199,11 @@ public:
     /// stream_all_min() tokens - an agent's tool output - hands it the non-resident experts routed by at most MAXT of
     /// its tokens, fewest first, up to a share of the experts it would stream (`auto`: measured, where both sides end
     /// together). The CPU reads them from RAM (the arena, the page-locked copy, or the mapped experts.bin's pages)
-    /// while the rest come over PCIe; their rows go to Dm's tail, as a peer's do. Not bit-identical to the GPU's rows
-    /// (the CPU's own activation format). Unset (default) or null: every expert on the GPU. Only for a pool no other
+    /// while the rest come over PCIe; their rows go to Dm's tail, as a peer's do. Only the activation rows those
+    /// experts read cross the link: the layer deduplicates them into a compact order, gathers them on the device and
+    /// downloads them on the copy's own stream, beside the layer's expert GEMMs. A layer that sends no expert to the
+    /// CPU copies nothing. Not bit-identical to the GPU's rows (the CPU's own activation format). Unset (default) or
+    /// null: every expert on the GPU. Only for a pool no other
     /// thread runs meanwhile (no batch slots); on a layer split every stage may have it and use it for its own chunk,
     /// because the pool serializes the batches itself. Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);

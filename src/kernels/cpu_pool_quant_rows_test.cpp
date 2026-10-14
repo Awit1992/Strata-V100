@@ -14,6 +14,9 @@
 //      whole allocation is compared, so a skipped row, a padding byte or a write past `n_rows` shows up as a
 //      difference rather than as a plausible value.
 //   3. THE MASK SHAPES THE ENGINE ACTUALLY SEES: dense, empty, the last row only, and every 31st row.
+//   4. THE COMPACT FEED THE PREFILL STAGE SENDS.  The stage deduplicates the rows its CPU experts read, gathers
+//      them on the device and passes the compact buffer with an all-ones mask, so each token's row must land on
+//      exactly the bytes the sparse feed left in that token's own destination.
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -40,11 +43,20 @@ struct Fixture {
     std::vector<char> need;                 // kMaxRows
     std::vector<cpu::ActQ> actq, ref_actq;  // kMaxRows + 1 (one guard row)
     std::vector<uint8_t> nact, ref_nact;    // (kMaxRows + 1) * kNativeActBytes (one guard row)
+    // The compact feed's own buffers: the needed rows in ascending token order, the all-ones mask, the token ->
+    // compact row map, and the compact destinations.
+    std::vector<float> cx;                  // kMaxRows * kN
+    std::vector<char> cneed;                // kMaxRows
+    std::vector<int32_t> pos;               // kMaxRows: token -> compact row, or -1
+    std::vector<cpu::ActQ> cactq;           // kMaxRows + 1 (one guard row)
+    std::vector<uint8_t> cnact;             // (kMaxRows + 1) * kNativeActBytes (one guard row)
 
     Fixture()
         : x((size_t) kMaxRows * kN), need(kMaxRows), actq(kMaxRows + 1), ref_actq(kMaxRows + 1),
           nact((size_t) (kMaxRows + 1) * cpu::kNativeActBytes),
-          ref_nact((size_t) (kMaxRows + 1) * cpu::kNativeActBytes) {
+          ref_nact((size_t) (kMaxRows + 1) * cpu::kNativeActBytes),
+          cx((size_t) kMaxRows * kN), cneed(kMaxRows), pos(kMaxRows), cactq(kMaxRows + 1),
+          cnact((size_t) (kMaxRows + 1) * cpu::kNativeActBytes) {
         for (int t = 0; t < kMaxRows; ++t)
             for (int j = 0; j < kN; ++j) {
                 const float v = (float) ((t * 19 + j * 31) % 257 - 128) * 0.015625f;
@@ -123,6 +135,51 @@ int main() {
                                          in_batch ? (fx.need[row] ? "need" : "skip") : "past batch",
                                          at % row_bytes, got[at], want[at]);
                         }
+                        // 4. The compact feed the prefill stage sends: the needed rows in ascending token order,
+                        // an all-ones mask, destinations indexed by the compact row.  Each token's row must land
+                        // on exactly the bytes the sparse feed left in that token's own destination.
+                        int64_t n_need = 0;
+                        for (int t = 0; t < rows; ++t) {
+                            if (fx.need[(size_t) t] == 0) { fx.pos[(size_t) t] = -1; continue; }
+                            fx.pos[(size_t) t] = (int32_t) n_need;
+                            std::memcpy(fx.cx.data() + (size_t) n_need * kN, fx.x.data() + (size_t) t * kN,
+                                        (size_t) kN * sizeof(float));
+                            fx.cneed[(size_t) n_need] = 1;
+                            ++n_need;
+                        }
+                        std::memset(fx.cactq.data(), kSentinel, fx.cactq.size() * sizeof(cpu::ActQ));
+                        std::memset(fx.cnact.data(), kSentinel, fx.cnact.size());
+                        const cpu::ExpertPool::ActRows compact{fx.cx.data(), fx.cneed.data(), n_need, kN,
+                                                               q2 ? fx.cactq.data() : nullptr,
+                                                               q2 ? nullptr : fx.cnact.data()};
+                        pool.quant_act_rows(f, compact);
+                        const size_t crow_bytes = q2 ? sizeof(cpu::ActQ) : cpu::kNativeActBytes;
+                        const uint8_t* cbuf = q2 ? (const uint8_t*) fx.cactq.data() : fx.cnact.data();
+                        for (int t = 0; t < rows; ++t) {
+                            if (fx.need[(size_t) t] == 0) continue;
+                            const size_t c = (size_t) fx.pos[(size_t) t];
+                            const uint8_t* a = q2 ? (const uint8_t*) &fx.actq[(size_t) t]
+                                                  : fx.nact.data() + (size_t) t * crow_bytes;
+                            const size_t at = first_diff(a, cbuf + c * crow_bytes, crow_bytes);
+                            if (at != crow_bytes) {
+                                ++failures;
+                                std::fprintf(stderr,
+                                             "compact feed mismatch: host=%d workers=%d gu=%d rows=%d pattern=%d "
+                                             "(%s path) token %d -> compact row %zu, byte %zu: sparse 0x%02x compact 0x%02x\n",
+                                             host, workers, gu, rows, pattern, q2 ? "Q2_0" : "native", t, c, at,
+                                             a[at], cbuf[c * crow_bytes + at]);
+                            }
+                        }
+                        // ... and it writes nothing past its own rows (the guard row included)
+                        const size_t cbytes = q2 ? fx.cactq.size() * sizeof(cpu::ActQ) : fx.cnact.size();
+                        for (size_t i = (size_t) n_need * crow_bytes; i < cbytes; ++i)
+                            if (cbuf[i] != kSentinel) {
+                                ++failures;
+                                std::fprintf(stderr, "compact feed wrote past its rows: host=%d workers=%d gu=%d "
+                                                     "rows=%d pattern=%d byte %zu\n",
+                                             host, workers, gu, rows, pattern, i);
+                                break;
+                            }
                         ++cases;
                     }
                 }
@@ -130,12 +187,12 @@ int main() {
         }
 
     if (failures) {
-        std::printf("cpu_pool_quant_rows_test: %d of %d cases differ from the serial reference\n", failures, cases);
+        std::printf("cpu_pool_quant_rows_test: %d of %d cases differ from the reference\n", failures, cases);
         return 1;
     }
     std::printf("cpu_pool_quant_rows_test: %d cases byte-exact (native/Q2_0, 257/17/1/0 rows, dense/empty/last/"
-                "sparse masks, host on/off, 1/4 workers); skipped rows, native padding and the guard row "
-                "untouched\n",
+                "sparse masks, host on/off, 1/4 workers); skipped rows, native padding and the guard row untouched; "
+                "the compact feed lands each token's row on the sparse feed's bytes\n",
                 cases);
     return 0;
 }

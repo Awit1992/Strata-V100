@@ -7,9 +7,11 @@
 // dq_dispatch: 1280 rows of 2560) and the down product (IQ4_NL and Q2_0: 2560 rows of 640).  A group of experts with
 // 0, 1, 63, 64, 65, 200 and 300 rows (one past the 256-row chunk), the rows placed past a nonzero first bound,
 // input and output row strides wider than the matrices, and - for the second run of each type - a sparse `ids`
-// gather and an indirect weight table in reverse expert order. Every output row outside the bounds and every
-// column past n_out must remain at its sentinel. Results must be finite. The FP32 tensor-core sums use another
-// order than the double reference: max |got - ref| <= 2e-5 * (max |ref| of the matrix) + 1e-6.
+// gather and the by-value weight table the prompt path hands the grouped launches (`gu` in reverse expert order,
+// `dn` in forward order, so a launch that reads the wrong half of the table mismatches instead of passing).
+// Every output row outside the bounds and every column past n_out must remain at its sentinel. Results must be
+// finite. The FP32 tensor-core sums use another order than the double reference: max |got - ref| <= 2e-5 *
+// (max |ref| of the matrix) + 1e-6.
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -71,7 +73,7 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     return w;
 }
 
-int run(int ty, int n_out, int K, std::mt19937& rng, bool use_ids) {
+int run(int ty, int n_out, int K, std::mt19937& rng, bool use_ids, bool down) {
     const std::vector<int> rows = {0, 1, 63, 64, 65, 200, 300};
     const int E = (int) rows.size(), base = 5;
     std::vector<int32_t> bounds(E + 1);
@@ -105,13 +107,15 @@ int run(int ty, int n_out, int K, std::mt19937& rng, bool use_ids) {
     ck(cudaMemcpy(dy, yh.data(), yh.size() * 4, cudaMemcpyHostToDevice), "y");
     ck(cudaMalloc(&dq, (size_t) E * n_out * K * 2), "dq");
     const int maxr = *std::max_element(rows.begin(), rows.end());
-    const void** dptr = nullptr;
-    std::vector<const void*> ptrs(E);
-    for (int e = 0; e < E; ++e) ptrs[e] = dw + (E - 1 - e) * eb;
-    ck(cudaMalloc(&dptr, ptrs.size() * sizeof(void*)), "weight pointers");
-    ck(cudaMemcpy(dptr, ptrs.data(), ptrs.size() * sizeof(void*), cudaMemcpyHostToDevice), "weight pointers");
-    if (!k::gemm_iq_f16_grouped(ty, use_ids ? static_cast<const void*>(dptr) : dw, eb, n_out, K, dx, ldx,
-                                db, E, maxr, dy, ldy, nullptr, use_ids ? dids : nullptr, use_ids)) {
+    // The indirect pass: the by-value table the prompt path hands the grouped launches.  `gu` is the reverse
+    // expert order (the existing check that the table, not the group's own order, selects the weights) and `dn`
+    // the forward one, so a launch that reads the wrong half of the table mismatches instead of passing.
+    k::GroupedWeightTable tbl{};
+    tbl.n = E;
+    for (int e = 0; e < E; ++e) { tbl.gu[e] = dw + (E - 1 - e) * eb; tbl.dn[e] = dw + e * eb; }
+    if (!k::gemm_iq_f16_grouped(ty, use_ids ? nullptr : dw, eb, n_out, K, dx, ldx,
+                                db, E, maxr, dy, ldy, nullptr, use_ids ? dids : nullptr,
+                                use_ids ? &tbl : nullptr, down)) {
         std::printf("%-8s %5d x %4d: not launched\n", name_of(ty), n_out, K);
         return 1;
     }
@@ -131,7 +135,7 @@ int run(int ty, int n_out, int K, std::mt19937& rng, bool use_ids) {
             const __half* xr = &x[(size_t) (use_ids ? ids[(size_t) r] : r) * ldx];
             for (int n = 0; n < n_out; ++n) {
                 double s = 0;
-                const int we = use_ids ? E - 1 - e : e;
+                const int we = use_ids ? (down ? e : E - 1 - e) : e;
                 const uint16_t* wr = &q[((size_t) we * n_out + n) * K];
                 for (int kk = 0; kk < K; ++kk) {
                     const __half h = __half_raw{wr[kk]};
@@ -144,8 +148,8 @@ int run(int ty, int n_out, int K, std::mt19937& rng, bool use_ids) {
         }
     const bool ok = worst <= 2e-5 * scale + 1e-6 && bad == 0;
     std::printf("%-8s %5d x %4d, %d rows in %d experts%s: max |err| %.3g of max |ref| %.3g, %d stray %s\n", name_of(ty),
-                n_out, K, total - base, E, use_ids ? " (ids)" : "", worst, scale, bad, ok ? "ok" : "FAIL");
-    cudaFree(dw); cudaFree(dx); cudaFree(db); cudaFree(dids); cudaFree(dptr); cudaFree(dy); cudaFree(dq);
+                n_out, K, total - base, E, use_ids ? (down ? " (ids, down)" : " (ids)") : "", worst, scale, bad, ok ? "ok" : "FAIL");
+    cudaFree(dw); cudaFree(dx); cudaFree(db); cudaFree(dids); cudaFree(dy); cudaFree(dq);
     return ok ? 0 : 1;
 }
 
@@ -159,12 +163,13 @@ int main() {
     std::mt19937 rng(70);
     int fails = 0;
     for (int ty : {18, 21, 22, 23, 16, 29}) {
-        fails += run(ty, 1280, 2560, rng, false);
-        fails += run(ty, 1280, 2560, rng, true);
+        fails += run(ty, 1280, 2560, rng, false, false);
+        fails += run(ty, 1280, 2560, rng, true, false);
     }
     for (int ty : {20, 42}) {
-        fails += run(ty, 2560, 640, rng, false);
-        fails += run(ty, 2560, 640, rng, true);
+        fails += run(ty, 2560, 640, rng, false, false);
+        fails += run(ty, 2560, 640, rng, true, false);
+        fails += run(ty, 2560, 640, rng, true, true);   // the prompt path's down launch: the table's dn half
     }
     std::printf("pf_wmma_parity: %d failures\n", fails);
     return fails ? 1 : 0;

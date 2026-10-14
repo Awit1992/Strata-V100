@@ -3758,13 +3758,13 @@ __host__ __device__ constexpr size_t gemm_iq_f16_grouped_smem(int wk, int xk = W
 // Each weight superblock is decoded once per chunk into shared memory; activations use a BM x 128 tile.
 // Eight warps use 32 x 32 m-tiles and FP32 accumulators for four m-tiles.
 // DEC selects the decoder: 0 dq_dispatch (256 values), 1 Q2_0 (64 values), 2 IQ4_NL (32 values).
-// Optional ids gather input rows. With indirect weights, W is a device array of expert pointers;
-// otherwise experts are contiguous with expert_bytes stride.
+// Optional ids gather input rows.  With a weight table (wsrc 1 = gate/up, 2 = down) expert e's matrix is the
+// table's device pointer; otherwise experts are contiguous with expert_bytes stride.
 template<int WK, int DEC, int TY = 0, int XK = WG_XK, int MT = WG_MT>
 __global__ void __launch_bounds__(WG_THREADS, DEC == 1 ? 2 : 1) gemm_iq_f16_grouped_kernel(
         int ty, const uint8_t* __restrict__ W, size_t expert_bytes, size_t row_bytes, int K,
         const __half* __restrict__ X, int ldx, const int32_t* __restrict__ bounds, const int32_t* __restrict__ ids,
-        int ch_per_e, float* __restrict__ Y, int ldy, int indirect) {
+        int ch_per_e, float* __restrict__ Y, int ldy, int wsrc, GroupedWeightTable tbl) {
     static_assert(gemm_iq_f16_grouped_smem(WK, XK) >= (size_t) WG_BM * (WG_BN + 4) * sizeof(float));
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     using namespace nvcuda;
@@ -3778,8 +3778,8 @@ __global__ void __launch_bounds__(WG_THREADS, DEC == 1 ? 2 : 1) gemm_iq_f16_grou
     const int crow = min(MT * WG_BM, r1 - c0);
     const int nmt = (crow + WG_BM - 1) / WG_BM;
     const int n0 = blockIdx.x * WG_BN;
-    const uint8_t* we = indirect ? reinterpret_cast<const uint8_t* const*>(W)[e]
-                                 : W + (size_t) e * expert_bytes;
+    const uint8_t* we = wsrc == 0 ? W + (size_t) e * expert_bytes
+                                  : (const uint8_t*) (wsrc == 1 ? tbl.gu[e] : tbl.dn[e]);
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const int wm = warp >> 2, wn = warp & 3;                     // rows wm*32, cols wn*32 of an m-tile
     __shared__ uint64_t codebook[TY == 22 ? 1024 : TY == 21 ? 256 : TY == 18 ? 128 : 2];
@@ -3959,8 +3959,9 @@ unsigned gemm_iq_f16_grouped_caps(int dev) {
 
 bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, int K, const void* X, int ldx,
                          const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream,
-                         const int32_t* ids, bool indirect_weights) {
+                         const int32_t* ids, const GroupedWeightTable* indirect, bool down) {
     if (n_out <= 0 || K <= 0 || n_out % WG_BN != 0 || n_experts <= 0 || max_rows <= 0) return false;
+    if (indirect != nullptr && n_experts > indirect->n) return false;   // the table must cover the whole launch
     if (ldx < K || ldx % 8 != 0 || ldy < n_out || ldy % 4 != 0) return false;   // uint4 loads / float4 stores
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
@@ -3976,35 +3977,36 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
     cudaStream_t s = (cudaStream_t) stream;
     const uint8_t* w = (const uint8_t*) W;
     const __half* x = (const __half*) X;
-    const int ind = indirect_weights ? 1 : 0;
+    const int wsrc = indirect == nullptr ? 0 : (down ? 2 : 1);
+    const GroupedWeightTable tbl = indirect != nullptr ? *indirect : GroupedWeightTable{};
     if (dec == 0 && ty == 18)
         gemm_iq_f16_grouped_kernel<256, 0, 18><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(256), s>>>(
-            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, ind);
+            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
     else if (dec == 0 && ty == 21)
         gemm_iq_f16_grouped_kernel<256, 0, 21><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(256), s>>>(
-            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, ind);
+            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
     else if (dec == 0 && ty == 22)
         gemm_iq_f16_grouped_kernel<256, 0, 22><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(256), s>>>(
-            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, ind);
+            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
     else if (dec == 0 && ty == 23)
         gemm_iq_f16_grouped_kernel<256, 0, 23><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(256), s>>>(
-            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, ind);
+            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
     else if (dec == 0)
         gemm_iq_f16_grouped_kernel<256, 0><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(256), s>>>(
-            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, ind);
+            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
     else if (dec == 1)
         gemm_iq_f16_grouped_kernel<128, 1, 0, 64, 2><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(128, 64), s>>>(
-            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, ind);
+            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
     else
         gemm_iq_f16_grouped_kernel<128, 2><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(128), s>>>(
-            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, ind);
+            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
     return cudaGetLastError() == cudaSuccess;
 }
 }  // namespace strata::kernels
 #else
 namespace strata::kernels {
 bool gemm_iq_f16_grouped(int, const void*, size_t, int, int, const void*, int, const int32_t*, int, int, float*, int, void*,
-                         const int32_t*, bool) {
+                         const int32_t*, const GroupedWeightTable*, bool) {
     return false;
 }
 }  // namespace strata::kernels

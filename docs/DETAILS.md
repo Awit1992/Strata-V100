@@ -396,6 +396,21 @@ Repeat the sweep with [`bench/run_v100_prefill.py`](../bench/run_v100_prefill.py
 targets `2048,4096,8192,16384,32768`, `--repeats 3`, `--seed 20261003`,
 `--max-new 1`, and the same cooldown gate before every request.
 
+The same harness measures a chain of agent turns with `--chain`. It reads one prefix prompt. Then it
+sends one turn for each `--chain-diffs` value (default `0,1,32,64,128,256,512,1024,2048`). Each turn
+adds that exact number of tokens. Thus every prompt is a prefix of the next one. The engine's prompt
+cache stays on, and `--chain-cache-every` sets its checkpoint interval (default: a quarter of the
+prefix). A conversation disk store that the config names goes to a private directory under `--out`.
+The harness drops `--expert-profile-save`. The first diff is 0. That turn sends the same prompt again.
+Each row records the requested diff, the tokens the engine reused (`reused`), and the tokens it read
+(`prompt_read`). The engine resumes at most one token short of the prompt, so the two counts differ.
+Do not report the requested diff as a read count. Add an arm's own knobs with `--xargs`, `--env`,
+`--short-read N`, or `--pipeline-windows N`. Every request sends `pin=n-2` by default: the engine
+ignores `pin >= n-1`, so the next turn re-reads the last two tokens instead of the tokens above its
+newest periodic checkpoint. `--no-chain-pin-tail` turns the pin off and shows that gap. Example:
+`python bench/run_v100_prefill.py --chain --arm-label chain-baseline --exe /tmp/engine --out /tmp/chain`.
+Compare two chained runs with `--compare`.
+
 Long-context baseline for comparison (engine 0.1.20, models on the portable SSD, before the fast path):
 | Prompt size | Exact tokens | Prompt time | Prompt speed | Output speed | Expert-cache hit rate | Total request |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -2259,6 +2274,14 @@ token KL against off: mean 0.006, max 0.026 nats over 22 prompts; about half of 
 read the same either way. `auto` picks the share from wall-clock timings, so the same request can be split
 differently - and answer differently - from one run to the next (a resumed conversation's re-read differed in 31 of
 1,536 teacher-forced argmax tokens, #1684); a fixed share repeats, `0` gives the exact bytes of a run without it.
+
+**Compact CPU activation download.** A sharing layer downloads only the rows its CPU experts read. The layer used to copy its whole activation
+tensor (T x N floats) to the host on the compute stream, before the layer's host sync, whether or not any expert went
+to the CPU. At 2,048 tokens that copy is about 21 MB a layer, and 48 of them queue in front of the sync. The layer now
+collects the token rows its CPU experts read, gathers them on the device and copies the compact result on its own
+stream, beside the expert GEMMs. A layer that sends no expert to the CPU copies nothing. Every buffer of the share is
+now taken for the share the layer has, not for the chunk's worst case. The CPU quantizes the same FP32 row bytes.
+Automatic sharing still depends on timings. Identical model answers are not guaranteed.
 
 Prompt time, medians of 10 interleaved pairs (off / auto, ms, `--expert-cache 1500`):
 
