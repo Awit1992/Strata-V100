@@ -26,5 +26,6 @@ This directory is the contributor-facing index for Strata benchmark results acro
 3. Add a Markdown summary in this directory named `<accelerator>-<quant>-<date>.md` and put raw output in `bench/results/<date>-<short-hardware-name>/`.
 4. Include enough system information to explain performance: GPU model and count, VRAM, CPU, RAM, storage, operating system, CUDA/driver versions, Strata commit, and thermal or power limits.
 5. Link the new result from the table above.
+6. For a per-turn agentic comparison, use [`tools/agent_turns_bench.py`](../tools/agent_turns_bench.py) with `--workload agentic`. Report the measured values of each turn (`added`, `prompt_n`, `cache_n`, `request_ms`). Do not report a requested size as a measured value.
 
-Do not include API keys, usernames, home-directory paths, hostnames, private IP addresses, or other machine-specific identifiers. Results should distinguish measured values from estimates and mention throttling, warm caches, or other conditions that can materially affect comparisons.
+Do not include API keys, usernames, home-directory paths, hostnames, private IP addresses, or other machine-specific identifiers. Results should distinguish measured values from estimates and mention throttling, warm caches, or other conditions that can materially affect comparisons. Write the report in ASD-STE100 Simplified Technical English: short sentences, one instruction or fact in each, active voice, and one term for one thing throughout.

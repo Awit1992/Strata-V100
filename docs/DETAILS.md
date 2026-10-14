@@ -1254,6 +1254,8 @@ print(r.choices[0].message.content)
   `--prefill auto` (8192 tokens), a 42,131 token prompt read in 15 s sent six of them. A prompt shorter than one chunk
   sends nothing, and that is on purpose: its only line arrives once the prompt is read, because the last tokens go
   through the verify windows rather than the batched path, so it stops up to `--short-read` tokens short of the end.
+  The server drops a PP that close to the end, and reads `--short-read` the way the engine does (the last one in the
+  args wins, a negative is 0), so the dropped line follows the configured threshold.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
   Zed's llama.cpp provider reads `/props` and offers tools from `chat_template_caps`. Its generic OpenAI-compatible
   provider does not: add `"capabilities": {"tools": true, "chat_completions": true}` on that model in Zed's settings.

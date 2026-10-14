@@ -786,6 +786,7 @@ class StrataEngine:
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
+        self.short_read = short_read_of(args)   # --short-read: how far short of the prompt the batched PP path stops
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.prefill_only = False        # the engine takes a decode-free prefill (GEN 0; INFO prefill_only=1)
         self.last = {}
@@ -4847,20 +4848,34 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
-# The engine's last PP line stops short of the prompt: up to `--short-read` tokens (generate.cpp's `short_read`, 64 by
-# default) are read through the verify windows instead of the batched path, so the batched path never reports the whole
-# prompt.  A PP that close to the end says the prompt is read.  It matters because a prompt shorter than one `--prefill`
-# chunk sends exactly one PP, that one: a client would see a bar that appears already full.  Such a line is dropped, and
-# the answer's first token ends the progress for the client anyway.
-PP_DONE_TAIL = 64
+# The engine's last PP line stops short of the prompt: up to `--short-read` tokens (generate.cpp's `short_read`) are read
+# through the verify windows instead of the batched path, so the batched path never reports the whole prompt.  A PP that
+# close to the end says the prompt is read.  It matters because a prompt shorter than one `--prefill` chunk sends exactly
+# one PP, that one: a client would see a bar that appears already full.  Such a line is dropped, and the answer's first
+# token ends the progress for the client anyway.
+PP_DONE_TAIL = 64        # the engine's own default for --short-read, and what an engine that names none has
+
+
+def short_read_of(args: list) -> int:
+    """The engine's effective --short-read, parsed as generate.cpp parses it (`std::max(0LL, std::atoll(next(...)))`):
+    the LAST one wins (a config may repeat the flag) and a negative is clamped to 0 (0 = off: the whole prompt is
+    batched).  Like atoll, a value is read up to its first non-digit - "128junk" is 128, "abc" is 0.  PP_DONE_TAIL when
+    the args do not name it, so a mock or an engine older than the flag keeps the default tail."""
+    tail = PP_DONE_TAIL
+    for i, a in enumerate(args[:-1]):
+        if a == "--short-read":
+            m = re.match(r"\s*[-+]?\d+", str(args[i + 1]))     # atoll: leading space, sign, then decimal digits
+            tail = max(0, int(m.group())) if m else 0
+    return tail
 
 
 def prompt_progress(svc: Service):
     """The last PP line as llama.cpp's `prompt_progress`, so a client written for llama.cpp reads both servers: the
     same four fields, `time_ms` elapsed since prompt reading started, and `processed` counting from token 0 so that a
     client takes the reused prefix out with `cache` (llama.cpp's rule: the timed progress is
-    `(processed-cache)/(total-cache)`).  None when there is nothing to say: no PP yet, or the line that says the prompt
-    is read.  An engine too old to print RESUME gives `cache` 0, which only makes a reused prefix count as work."""
+    `(processed-cache)/(total-cache)`).  None when there is nothing to say: no PP yet, or a line within the engine's
+    `--short-read` of the end (that line says the prompt is read).  An engine too old to print RESUME gives `cache` 0,
+    which only makes a reused prefix count as work."""
     engine = svc.engine
     if getattr(engine, "batch", 0):      # --batch: the engine's progress is one global line, not this request's
         return None
@@ -4868,7 +4883,8 @@ def prompt_progress(svc: Service):
     if not progress:
         return None
     read, total = progress
-    if total <= 0 or total - read <= PP_DONE_TAIL:
+    tail = getattr(engine, "short_read", PP_DONE_TAIL)   # the configured --short-read: how far short the batched path stops
+    if total <= 0 or total - read <= tail:
         return None
     return {"total": int(total), "cache": int(getattr(engine, "reused", 0) or 0), "processed": int(read),
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
