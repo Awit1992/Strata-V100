@@ -1,0 +1,11 @@
+{
+  "baseline": [
+    "strata prefill timing: CUDA0 layers [0,16), 2047 tokens, GPU timeline 964 ms, wall 994 ms, host staging 8 ms, cumulative CPU experts 350 (share 0.84): embed+steps 2 (0.2%) hc read 82 (8.5%) gdn 45 (4.7%) qsa proj 23 (2.4%) qsa indexer 0 (0.0%) qsa select 1 (0.1%) qsa attn 24 (2.5%) router+shared 14 (1.5%) host grouping 172 (17.8%) gather 6 (0.6%) wait copy 12 (1.3%) dequant 155 (16.1%) gemm gate/up 235 (24.4%) gemm down 90 (9.3%) combine 49 (5.1%) ple 3 (0.4%) gdn conv+gates 4 (0.5%) gdn recurrence 24 (2.5%) gdn out proj 23 (2.4%)",
+    "strata prefill timing: CUDA1 layers [16,48), 2047 tokens, GPU timeline 1393 ms, wall 1468 ms, host staging 45 ms, cumulative CPU experts 3561 (share 0.51): embed+steps 6 (0.5%) hc read 61 (4.4%) gdn 89 (6.4%) qsa proj 48 (3.4%) qsa indexer 0 (0.0%) qsa select 2 (0.1%) qsa attn 47 (3.4%) router+shared 25 (1.8%) host grouping 114 (8.2%) gather 9 (0.7%) wait copy 267 (19.1%) dequant 93 (6.7%) gemm gate/up 350 (25.1%) gemm down 140 (10.1%) combine 38 (2.8%) gdn conv+gates 9 (0.6%) gdn recurrence 47 (3.3%) gdn out proj 47 (3.4%)"
+  ],
+  "candidate": [
+    "strata prefill timing: CUDA0 layers [0,16), 2047 tokens, GPU timeline 861 ms, wall 889 ms, host staging 10 ms, cumulative CPU experts 350 (share 0.84): embed+steps 2 (0.2%) hc read 69 (8.0%) gdn 45 (5.2%) qsa proj 22 (2.6%) qsa indexer 0 (0.0%) qsa select 1 (0.1%) qsa attn 23 (2.7%) router+shared 13 (1.6%) host grouping 40 (4.7%) gather 7 (0.8%) wait copy 12 (1.4%) dequant 156 (18.1%) gemm gate/up 227 (26.4%) gemm down 85 (9.9%) combine 104 (12.0%) ple 3 (0.4%) gdn conv+gates 4 (0.5%) gdn recurrence 24 (2.7%) gdn out proj 23 (2.7%)",
+    "strata prefill timing: CUDA1 layers [16,48), 2047 tokens, GPU timeline 1343 ms, wall 1417 ms, host staging 48 ms, cumulative CPU experts 3576 (share 0.53): embed+steps 6 (0.5%) hc read 61 (4.5%) gdn 90 (6.7%) qsa proj 48 (3.6%) qsa indexer 0 (0.0%) qsa select 2 (0.2%) qsa attn 47 (3.5%) router+shared 25 (1.9%) host grouping 58 (4.3%) gather 22 (1.6%) wait copy 273 (20.3%) dequant 93 (6.9%) gemm gate/up 349 (25.9%) gemm down 130 (9.7%) combine 37 (2.8%) gdn conv+gates 9 (0.6%) gdn recurrence 46 (3.5%) gdn out proj 47 (3.5%)"
+  ],
+  "limit": "Diagnostic phase timings, not scored clean-arm throughput."
+}

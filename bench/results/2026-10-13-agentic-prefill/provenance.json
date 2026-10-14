@@ -1,0 +1,52 @@
+{
+  "candidate_source_commit": "a64694e3",
+  "baseline_source_commit": "bfa4b1d64ad8c3c8419b660a047b7a7c8d114b0c",
+  "baseline_engine_sha256": "873a123114c8457e7f1a97196a458a15ffb16615319ba324e23ea95ce89ea870",
+  "candidate_engine_sha256": "f9a59dc86dcaf8add771f1cdc87d381556f7a54b0d9bb9e36727058dcd4f3b1f",
+  "scored_environment": {
+    "STRATA_ARENA_LOCK": "0",
+    "STRATA_WATCHDOG_S": "300",
+    "STRATA_PREFILL_CPU_SHARE": "auto",
+    "STRATA_PREFILL_STREAM_MIN": "3072",
+    "STRATA_EMB_REUSE_ACCOUNT": "1",
+    "STRATA_SM70_TABLE": "1",
+    "STRATA_PF_WMMA": "1",
+    "STRATA_PF_SKIP_UNROUTED": "1",
+    "STRATA_KV_GROW": "1",
+    "STRATA_ROUTE_RESIDENT": "1",
+    "STRATA_SPLIT_RING": "192",
+    "STRATA_EXPERT_PAIR": "1"
+  },
+  "cold_seed": 20261013,
+  "chain_seed": 20261013,
+  "notes": [
+    "Cold sweeps used the unchanged legacy cold harness.",
+    "Exact-chain sweeps used the updated harness with boundary pins.",
+    "Checkout commit fields describe collection context, not necessarily engine source.",
+    "The candidate binary was built from the source subsequently committed as a64694e3.",
+    "No production request text or credentials are included."
+  ],
+  "fixed_share_control": {
+    "STRATA_PREFILL_CPU_SHARE": "0.25",
+    "max_new": 1,
+    "rounds": 1,
+    "purpose": "Next-token correctness smoke, not a quality or decode throughput benchmark."
+  },
+  "http_workload": {
+    "prefix_target": 8192,
+    "additions": [
+      8,
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2048
+    ],
+    "turns": 14,
+    "rounds": 2,
+    "max_new": 64,
+    "seed": 1234,
+    "note": "HTTP workloads were collected in separate sessions without the direct harness thermal gate; no precise thermal-equivalence claim."
+  }
+}

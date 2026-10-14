@@ -55,4 +55,10 @@ A two-arm HTTP smoke used the mock engine, one prefix, and four additions per ar
 
 A direct lazy-engine smoke checked a configured 256-token short-read tail. Progress at the tail boundary was omitted. Progress one token outside the boundary was retained. No model process was started.
 
-The production service was not stopped or restarted. No GPU speed result is claimed. The branch changes measurement and progress accounting; it does not select new runtime defaults or install a kernel.
+The initial verification did not stop or restart the production service. The operator then authorized a GPU test window. The branch now includes compact CPU activation downloads and a grouped Volta launch change. The engine was built and tested in the isolated worktree. It was not installed over the production engine.
+
+The [GPU report](../benchmarks/v100-agentic-prefill-2026-10-13.md) records the 0–2K prompt-difference comparison and the cold sweep through 32K. The candidate reduced median 2K cold-prefill latency by 6.2 percent. In the pinned chained test, differences of 256–2,048 tokens improved by approximately 3–4 percent. The smallest turns did not improve consistently. Automatic sharing changed generated sequences. One decode bucket regressed materially, so no guaranteed whole-request speedup is claimed.
+
+The 512-token stage-owned buffer trial improved some short turns, but its 2K eligibility limit regressed the 1K case. This setting was rejected as a general recommendation. No production defaults changed.
+
+The candidate completed the real HTTP agent workload. Median prefill latency improved by approximately 4.1 percent near 570 new tokens, 5.6 percent near 1K, and 6.8 percent near 2K. The original production service was restored. Health reported the model loaded. An authenticated chat request returned `READY`. The installed binary and production settings remain unchanged.
