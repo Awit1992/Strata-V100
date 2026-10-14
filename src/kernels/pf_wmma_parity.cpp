@@ -7,7 +7,8 @@
 // Every gate/up format the fork's native packs hand it (IQ3_XXS, IQ3_S, IQ2_S, IQ4_XS, and IQ2_XXS / IQ1_M through
 // dq_dispatch: 1280 rows of 2560) and the down product (IQ4_NL and Q2_0: 2560 rows of 640).
 // The wide group has 0, 1, 63, 64, 65, 127, 128, 129, 200, 255, 256, 257 and 300 rows per expert.
-// A separate short group stops at 128 rows and exercises the IQ3_S and IQ4_NL short-row specialization.
+// A separate short group stops at 128 rows and exercises the short-row specialization of the gate/up formats most of
+// the pack's experts use - IQ3_XXS and IQ2_S - as well as IQ3_S, and the IQ4_NL down product.
 // Both groups start past a nonzero first bound and use input and output row strides wider than the matrices.
 // Each type also uses a sparse `ids` gather and the by-value weight table the prompt path hands to the launch (`gu` in
 // reverse expert order, `dn` in forward order, so a launch that reads the wrong half of the table mismatches
@@ -15,13 +16,13 @@
 // Results must be finite. The FP32 tensor-core sums use another order than the double reference: max |got - ref|
 // <= 2e-5 * (max |ref| of the matrix) + 1e-6.
 //
-// --bench: the model's shapes (IQ3_S gate/up 1280 x 2560, IQ4_NL down 2560 x 640), 64 experts of 2, 64, 128 and 256
-// rows each - a short group, a moderate one, the short-row dispatch limit, and a wide group.  Everything but
-// the launch (the weights, the dequantization, the double reference) runs before the timed windows, and the launch
-// is timed as a captured graph of 8 launches over 7 windows, the median per launch (native_grouped_parity's window
-// convention: the host-side launch overhead is amortized, not measured).  Every shape is validated first - three
-// rows of every expert against the double reference, every written output finite, every guard row and column at its
-// sentinel - and a shape that fails is reported and not timed.  The bench assumes an idle GPU.
+// --bench: the model's shapes (IQ3_XXS, IQ3_S and IQ2_S gate/up 1280 x 2560, IQ4_NL down 2560 x 640), 64 experts of 2,
+// 64, 128 and 256 rows each - a short group, a moderate one, the short-row dispatch limit, and a wide group.
+// Everything but the launch (the weights, the dequantization, the double reference) runs before the timed windows, and
+// the launch is timed as a captured graph of 8 launches over 7 windows, the median per launch (native_grouped_parity's
+// window convention: the host-side launch overhead is amortized, not measured).  Every shape is validated first -
+// three rows of every expert against the double reference, every written output finite, every guard row and column at
+// its sentinel - and a shape that fails is reported and not timed.  The bench assumes an idle GPU.
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -167,7 +168,7 @@ int run(int ty, int n_out, int K, std::mt19937& rng, bool use_ids, bool down, bo
 }
 
 // ------------------------------------------------------------------------------------------------------ --bench
-// The model's two expert shapes, a fixed group of experts each, timed with the launch alone inside the windows.
+// The model's expert shapes, a fixed group of experts each, timed with the launch alone inside the windows.
 constexpr int kBenchExperts = 64;   // experts in the group (the launch's block count grows with it; the by-value
                                     // table is not used, the direct W + e * expert_bytes path is)
 constexpr int kBenchRows[] = {2, 64, 128, 256};   // rows per expert: a decode-sized few, a moderate one, exactly
@@ -220,7 +221,7 @@ int bench_shape(const BenchShape& c, std::mt19937& rng, cudaStream_t s, cudaEven
         // the direct path: contiguous weights, no ids gather, no by-value table (down is then unused)
         if (!k::gemm_iq_f16_grouped(c.ty, dw, eb, c.n_out, c.K, dx, ldx, db, E, rows, dy, ldy, s, nullptr, nullptr,
                                     false)) {
-            std::printf("%-13s %5d x %4d, %d rows: not launched\n", c.what, c.n_out, c.K, rows);
+            std::printf("%-15s %5d x %4d, %d rows: not launched\n", c.what, c.n_out, c.K, rows);
             ++fails;
             continue;
         }
@@ -252,7 +253,7 @@ int bench_shape(const BenchShape& c, std::mt19937& rng, cudaStream_t s, cudaEven
             }
         }
         if (!(bad == 0 && worst <= 2e-5 * scale + 1e-6)) {
-            std::printf("%-13s %5d x %4d, %2d experts x %3d rows = %5d routed: max |err| %.3g of max |ref| %.3g, "
+            std::printf("%-15s %5d x %4d, %2d experts x %3d rows = %5d routed: max |err| %.3g of max |ref| %.3g, "
                         "%d stray: FAIL, not timed\n", c.what, c.n_out, c.K, E, rows, total, worst, scale, bad);
             ++fails;
             continue;
@@ -278,7 +279,7 @@ int bench_shape(const BenchShape& c, std::mt19937& rng, cudaStream_t s, cudaEven
             ms.push_back(el / kBenchRep);
         }
         ck(cudaGraphExecDestroy(ge), "graph");
-        std::printf("%-13s %5d x %4d, %2d experts x %3d rows = %5d routed: %8.3f ms/launch (median of %d x %d, "
+        std::printf("%-15s %5d x %4d, %2d experts x %3d rows = %5d routed: %8.3f ms/launch (median of %d x %d, "
                     "max |err| %.3g of max |ref| %.3g)\n", c.what, c.n_out, c.K, E, rows, total, median(ms),
                     kBenchWindows, kBenchRep, worst, scale);
     }
@@ -295,7 +296,8 @@ int bench(std::mt19937& rng) {
     cudaEvent_t e0, e1;
     ck(cudaEventCreate(&e0), "event");
     ck(cudaEventCreate(&e1), "event");
-    const BenchShape shapes[] = {{21, 1280, 2560, "IQ3_S gate/up"}, {20, 2560, 640, "IQ4_NL down"}};
+    const BenchShape shapes[] = {{18, 1280, 2560, "IQ3_XXS gate/up"}, {21, 1280, 2560, "IQ3_S gate/up"},
+                                 {22, 1280, 2560, "IQ2_S gate/up"}, {20, 2560, 640, "IQ4_NL down"}};
     int fails = 0;
     for (const auto& c : shapes) fails += bench_shape(c, rng, s, e0, e1);
     cudaEventDestroy(e0);
@@ -330,6 +332,11 @@ int main(int argc, char** argv) {
         fails += run(ty, 2560, 640, rng, false, false);
         fails += run(ty, 2560, 640, rng, true, false);
         fails += run(ty, 2560, 640, rng, true, true);   // the prompt path's down launch: the table's dn half
+    }
+    // the gate/up formats most of the pack's experts use, over the same short-row bounds (direct and ids/table gu)
+    for (int ty : {18, 22}) {
+        fails += run(ty, 1280, 2560, rng, false, false, true);
+        fails += run(ty, 1280, 2560, rng, true, false, true);
     }
     fails += run(21, 1280, 2560, rng, false, false, true);
     fails += run(21, 1280, 2560, rng, true, false, true);

@@ -12012,10 +12012,10 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
-            // Non-last stages can refill their loans while the last stage finishes the final segment.
-            // Earlier checkpoint segments must retain their scratch buffers. Serial/blocking refill
-            // controls and the last stage keep the normal post-run refill. Default: native Q2_0 on
-            // a Volta-only split; STRATA_PREFILL_REFILL_OVERLAP overrides it.
+            // Non-last stages can refill before the loan is returned: at prompt completion or before a
+            // window segment. Keep the loan if the next segment still reads batched scratch. Serial/blocking
+            // refill and the last stage keep the normal post-run refill. Default: native Q2_0 or
+            // Volta WMMA format pairs on a Volta-only split; the environment flag overrides it.
             int64_t early_refill_pos = -1;   // the position the hook may act on; -1: not this segment
             sp.on_stage_complete = nullptr;
             for (size_t i = 0; i < stages.size(); ++i) stages[i]->sp.on_stage_complete = nullptr;
@@ -12024,8 +12024,12 @@ int main(int argc, char** argv) {
                     return std::atoi(v) != 0;
                 const auto& layout = strata::kernels::cpu::expert_layout();
                 if (!multi_gpu || !layout.native || layout.fmt.empty()) return false;
-                for (const auto& f : layout.fmt)
-                    if (f.gu_type != 42 || f.d_type != 42) return false;
+                for (const auto& f : layout.fmt) {
+                    const bool q2 = f.gu_type == 42 && f.d_type == 42;
+                    const bool iq = (f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22 || f.gu_type == 23) &&
+                                    (f.d_type == 20 || f.d_type == 42);
+                    if (!q2 && !iq) return false;
+                }
                 auto volta = [](int dev) {
                     int major = 0, minor = 0;
                     if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
@@ -12041,7 +12045,8 @@ int main(int argc, char** argv) {
                 for (const auto& st : stages) if (!volta(st->dev)) return false;
                 return true;
             }();
-            if (refill_overlap && multi_gpu && !refill_serial && !refill_blocking()) {
+            const bool can_refill_early = refill_overlap && multi_gpu && !refill_serial && !refill_blocking();
+            if (can_refill_early) {
                 auto refill_hook = [&](size_t idx) {
                     return [&, idx](int64_t done, std::string& e) -> bool {
                         if (early_refill_pos < 0 || done != early_refill_pos) return true;
@@ -12284,13 +12289,20 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-                // STRATA_PREFILL_REFILL_OVERLAP: only the final batched segment (the one that reaches the last
-                // prompt position) may queue a non-last stage's loan refill from the hook.  A window segment does
-                // not run the batched path at all, and an earlier segment (a root/turn checkpoint) is followed by
-                // chunks that still read the buffers its stage lent - so the hook must not act there.  The flag is
-                // re-armed for every segment and cleared right after the run, so a later segment or the next
-                // request can never match this done position.
-                early_refill_pos = (!win && to == n - 1) ? to : -1;
+                // A window returns every loan before it reads. Queue non-last stage copies while the
+                // current batched segment finishes on the later GPUs, but never before another batched
+                // segment that can reuse the same scratch. Checkpoint cuts may leave a short header
+                // window, so prompt completion is not the only safe loan-return boundary.
+                early_refill_pos = -1;
+                if (can_refill_early && !win) {
+                    bool returns_loan = to == n - 1;
+                    if (!returns_loan) {
+                        const auto next = std::find_if(cuts.begin(), cuts.end(),
+                                                       [to](int64_t p) { return p > to; });
+                        returns_loan = next != cuts.end() && windows_ok(to, *next);
+                    }
+                    if (returns_loan) early_refill_pos = to;
+                }
                 const auto tsp = Clock::now();
                 pp_exact = false;   // a batched or pipelined part is in flight: a cancel may leave the state past pp_reached
                 const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);

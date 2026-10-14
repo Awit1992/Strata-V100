@@ -2283,6 +2283,35 @@ stream, beside the expert GEMMs. A layer that sends no expert to the CPU copies 
 now taken for the share the layer has, not for the chunk's worst case. The CPU quantizes the same FP32 row bytes.
 Automatic sharing still depends on timings. Identical model answers are not guaranteed.
 
+**Short-row Volta expert GEMM.** With `STRATA_PF_WMMA=1`, IQ3_XXS, IQ3_S, and IQ2_S gate/up
+and IQ4_NL down use a compact tile when the largest expert in the group has at most 128 rows.
+The tile uses 128-value weight chunks and two 64-row output tiles. IQ3_XXS, IQ3_S, and IQ4_NL
+use 64-value activation chunks and 44,032 bytes of dynamic shared memory. Static shared storage
+adds 1,024, 2,048, and 16 bytes respectively. IQ2_S uses 32-value activation chunks and 39,936
+bytes of dynamic shared memory. Its codebook adds 8,192 bytes. Each total fits the shared-memory
+budget for two blocks on one V100 SM. The short kernels have a 128-register limit per thread.
+Larger groups keep the original 256-row output tile to avoid extra weight decoding. Q2_0 and
+the other quantized formats keep their existing tile selection.
+
+Use `pf_wmma_parity` to check short and wide groups, sparse input-row indices, indirect weights,
+and output guards. Use `pf_wmma_parity --bench` on an idle GPU to measure validated IQ3_XXS,
+IQ3_S, IQ2_S, and IQ4_NL shapes. This mode measures eight launches in a CUDA graph and reports
+the median of seven CUDA-event windows. It excludes request setup, weight transfer, and token generation.
+
+**Early loan refill on split V100s.** Native packs with Volta WMMA format pairs can now use
+the existing early refill path by default. All stages must use Volta GPUs. A layer can use
+IQ3_XXS, IQ3_S, IQ2_S, or IQ4_XS gate/up with IQ4_NL or Q2_0 down. A Q2_0 gate/up and down
+pair is also supported. These pairs can differ between layers. An unsupported pair keeps the
+normal post-run refill path.
+Only a non-last stage can issue its refill early. Its compute streams must have finished a
+batched segment whose next segment returns the loan: either prompt completion or a short-read
+window. Checkpoint cuts before a short header window are eligible. A segment followed by another
+batched segment keeps its scratch loan. Explicit `STRATA_PREFILL_REFILL_OVERLAP=0`, serial refill,
+and blocking refill disable early refill.
+The last stage keeps the normal refill path. The refills copy the same expert-weight bytes.
+The stage also waits for KV-prefix prefetch DMA before it calls the refill hook. This prevents
+refill writes into a staging pool while a KV copy still uses that pool.
+
 Prompt time, medians of 10 interleaved pairs (off / auto, ms, `--expert-cache 1500`):
 
 | machine | 512 tokens | 1,000 tokens | 2K / 4K / 16K |

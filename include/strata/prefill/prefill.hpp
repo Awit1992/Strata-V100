@@ -153,14 +153,13 @@ public:
     std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
 
     /// STRATA_PREFILL_REFILL_OVERLAP: called at the very end of `run` - every chunk is done, the chunk-scoped
-    /// stager and issuer are joined, this stage's final residual has been read and BOTH of its streams (`m.cs`
-    /// and `m.copy`, the latter because it is what streams experts into the borrowed ring) are synchronized -
-    /// and before this stage waits for the next stage's last chunk.  A layer split's non-last stage uses it to
-    /// queue the refill of the cache slots it lent the prompt path while the next stage still computes; the
-    /// wait below is otherwise idle time with the loan outstanding.  `done` is the position this run reached
-    /// (pos0 + n); the caller acts only when that is the request's final prompt position, so an earlier segment
-    /// (a root/turn checkpoint) never refills a loan its own later chunks still read.  After the call no buffer
-    /// of this stage is read again.  Returning false fails the run, but only after the next stage's chunk has
+    /// stager and issuer are joined, this stage's final residual has been read, and its compute, expert-copy,
+    /// and pending KV-prefetch streams are synchronized. The call precedes this stage's wait for the next
+    /// stage's last chunk. A layer split's non-last stage can queue the refill of its borrowed cache slots
+    /// while the next stage still computes. `done` is the position this run reached (pos0 + n). The caller
+    /// acts only at prompt completion or before a window segment that returns the loan; it never refills
+    /// before another batched segment can reuse the same scratch. After the call no buffer of this stage
+    /// is read again by this run. Returning false fails the run, but only after the next stage's chunk has
     /// been waited for.
     std::function<bool(int64_t done, std::string& err)> on_stage_complete;
 

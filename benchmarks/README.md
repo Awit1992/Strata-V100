@@ -20,6 +20,7 @@ This directory is the contributor-facing index for Strata benchmark results acro
 | 2 × NVIDIA Tesla V100-SXM2-16GB, Gen3 x16 + x16 + Xeon E5-2696 v3 | Qwen3.8-Flash-Next | IQ3_S | 2K / 32K | [Image encoder's VRAM as expert-cache capacity, 2026-10-10](v100-sxm2-iq3_s-vision-vram-2026-10-10.md) |
 | 2 × NVIDIA Tesla V100-PCIE-16GB + Ryzen 5 3600 | Qwen3.8-Flash-Next | IQ3_S | 2K | [Selected v0.1.43 performance ports, 2026-10-11](v100-upstream-v0.1.43-2026-10-11.md) |
 | 2 × NVIDIA Tesla V100-PCIE-16GB | Qwen3.8-Flash-Next | IQ3_S | 0–2K differences / 2K–32K cold | [Agentic prefill runtime and kernel changes, 2026-10-13](v100-agentic-prefill-2026-10-13.md) |
+| 2 × NVIDIA Tesla V100-PCIE-16GB | Qwen3.8-Flash-Next | Mixed IQ3_XXS / IQ2_S / IQ3_S / IQ4_XS | 0–2K differences / 2K–32K cold | [Mixed-format kernels and safe early refill, 2026-10-14](v100-agentic-occupancy-2026-10-14.md) |
 
 ## Contributing results
 1. Run the existing [`bench/run_v100_bench.py`](../bench/run_v100_bench.py) runner for the published workload, or add the closest equivalent runner under `bench/`.

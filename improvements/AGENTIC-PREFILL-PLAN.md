@@ -62,3 +62,17 @@ The [GPU report](../benchmarks/v100-agentic-prefill-2026-10-13.md) records the 0
 The 512-token stage-owned buffer trial improved some short turns, but its 2K eligibility limit regressed the 1K case. This setting was rejected as a general recommendation. No production defaults changed.
 
 The candidate completed the real HTTP agent workload. Median prefill latency improved by approximately 4.1 percent near 570 new tokens, 5.6 percent near 1K, and 6.8 percent near 2K. The original production service was restored. Health reported the model loaded. An authenticated chat request returned `READY`. The installed binary and production settings remain unchanged.
+
+## Second-pass implementation
+
+The actual expert pack is mixed. Most gate/up layers use IQ3_XXS or IQ2_S, not IQ3_S. GPU 0 has no IQ3_S gate/up layer. The second pass therefore adds short-row kernels for IQ3_XXS and IQ2_S as well as IQ3_S and IQ4_NL. Larger groups retain the original tiles.
+
+Early refill now supports the actual mixed Volta format pairs. A batched segment can queue refill before a short header window returns its scratch loan. It cannot queue refill before another batched segment reuses that scratch. Pending KV-prefetch copies finish before the stage-complete callback.
+
+The final isolated build passed all four focused C++ checks. All twenty fixed-share requests matched the first-pass engine's complete sixteen-token outputs. The fixed-share decode median differed by approximately 0.5 percent. The [second-pass report](../benchmarks/v100-agentic-occupancy-2026-10-14.md) records the implementation, selected and rejected kernel shapes, and matched measurement controls.
+
+The final 180-request HTTP comparison used the installed, first-pass, and final engines. Route-tail skipping was disabled equally. Corresponding actual reads matched, and every request generated 64 tokens. Across fourteen short turns, the median per-turn prefill latency reduction was 15.52 percent against the installed engine. The whole-HTTP reduction was 8.18 percent against the installed engine and 6.95 percent against the first pass. Thirteen short turns improved; the 65-token turn did not.
+
+The matched pinned chain reduced prefill latency by 11–19 percent at differences of 128–2,048 tokens against the first pass. Smaller differences remained approximately unchanged. The cold sweep reduced median prefill latency by 10.28 percent at 2K and 4.93 percent at 32K. All direct-run cooldown gates passed. The streamed-KV on/off smoke matched complete outputs and exercised nonzero prefetch transfers with early refill.
+
+The original service was restored with its unchanged installed binary and settings. Health reported the model loaded. An authenticated chat request returned `READY`. The candidate was not installed. These measured gains do not establish identical outputs under automatic sharing or a universal decode improvement.

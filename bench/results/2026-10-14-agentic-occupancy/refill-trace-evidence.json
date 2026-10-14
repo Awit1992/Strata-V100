@@ -1,0 +1,52 @@
+{
+  "engine_sha256": "ef3142853e856a9282a3d0145daa830d557710e019fa11dbd4c27ecb78bb2a50",
+  "fixed_share": 0.25,
+  "complete_output_matches": 20,
+  "requests": 20,
+  "refill_before_batched_read_completion": [
+    [
+      "strata trace: refill start 1569 -1",
+      "strata trace: read 8190 tokens (batched) in 5383.3 ms"
+    ],
+    [
+      "strata trace: refill start 255 -1",
+      "strata trace: read 128 tokens (batched) in 1110.0 ms"
+    ],
+    [
+      "strata trace: refill start 255 -1",
+      "strata trace: read 256 tokens (batched) in 1328.9 ms"
+    ],
+    [
+      "strata trace: refill start 286 -1",
+      "strata trace: read 512 tokens (batched) in 1589.5 ms"
+    ],
+    [
+      "strata trace: refill start 349 -1",
+      "strata trace: read 1024 tokens (batched) in 1981.0 ms"
+    ],
+    [
+      "strata trace: refill start 474 -1",
+      "strata trace: read 2048 tokens (batched) in 2615.9 ms"
+    ],
+    [
+      "strata trace: refill start 255 -1",
+      "strata trace: read 128 tokens (batched) in 917.7 ms"
+    ],
+    [
+      "strata trace: refill start 255 -1",
+      "strata trace: read 256 tokens (batched) in 1177.8 ms"
+    ],
+    [
+      "strata trace: refill start 286 -1",
+      "strata trace: read 512 tokens (batched) in 1442.6 ms"
+    ],
+    [
+      "strata trace: refill start 349 -1",
+      "strata trace: read 1024 tokens (batched) in 1823.1 ms"
+    ],
+    [
+      "strata trace: refill start 474 -1",
+      "strata trace: read 2048 tokens (batched) in 2470.9 ms"
+    ]
+  ]
+}

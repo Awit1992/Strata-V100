@@ -4626,16 +4626,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         err = std::string("prefill: expert copy stream: ") + cudaGetErrorString(cst);
         return false;
     }
-    // STRATA_PREFILL_REFILL_OVERLAP: a layer split's non-last stage has read every chunk, joined its chunk-scoped
-    // stager and issuer, read its final residual and synchronized BOTH streams, so nothing of this stage touches
-    // the cache slots it lent the prompt path again - and no copy is in flight into them (`m.copy` is what streams
-    // experts into the borrowed ring, which is carved from the same lent slots).  The loan's refill can be queued
-    // NOW, before waiting for the next stage's last chunk, instead of after the wait.  The hook is told the
-    // position this run reached so the caller can require it to be the request's final one: an earlier checkpoint
-    // segment must not refill a loan its own later chunks still read. run() drains every downstream future
-    // before returning, including after a hook failure. run_impl() leaves the tail in flight so the direct
-    // successor can accept the next chunk without waiting for every later stage.
-    if (on_stage_complete && !on_stage_complete(pos0 + n, err)) return false;
     if (kv_prefetch) {
         if (const cudaError_t cst = cudaStreamSynchronize(m.kv_copy); cst != cudaSuccess) {
             err = std::string("prefill: KV prefetch stream: ") + cudaGetErrorString(cst);
@@ -4644,6 +4634,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata KV prefetch: %lld layer prefixes, single existing staging pool\n",
                      (long long) kv_prefetches);
     }
+    // STRATA_PREFILL_REFILL_OVERLAP: a layer split's non-last stage has read every chunk, joined its chunk-scoped
+    // stager and issuer, read its final residual and synchronized the compute, expert-copy and KV-prefetch
+    // streams. Nothing of this stage touches the lent cache slots again, including DMA into the expert ring
+    // or KV staging pool carved from them. The loan's refill can be queued
+    // NOW, before waiting for the next stage's last chunk, instead of after the wait.  The hook is told the
+    // position this run reached so the caller can require it to be the request's final one: an earlier checkpoint
+    // segment must not refill a loan its own later chunks still read. run() drains every downstream future
+    // before returning, including after a hook failure. run_impl() leaves the tail in flight so the direct
+    // successor can accept the next chunk without waiting for every later stage.
+    if (on_stage_complete && !on_stage_complete(pos0 + n, err)) return false;
     stats_.ms_total += ms_since(t_start);
     if (pt.on) {
         pt.fold();

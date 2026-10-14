@@ -1,0 +1,59 @@
+{
+  "layers": 48,
+  "gate_up_type_counts": {
+    "18": 17,
+    "22": 20,
+    "21": 10,
+    "23": 1
+  },
+  "gpu0_gate_up_type_counts": {
+    "18": 4,
+    "22": 12
+  },
+  "pairs": [
+    {
+      "gate_up_type": 18,
+      "down_type": 20,
+      "layers": 14
+    },
+    {
+      "gate_up_type": 18,
+      "down_type": 42,
+      "layers": 3
+    },
+    {
+      "gate_up_type": 21,
+      "down_type": 20,
+      "layers": 9
+    },
+    {
+      "gate_up_type": 21,
+      "down_type": 42,
+      "layers": 1
+    },
+    {
+      "gate_up_type": 22,
+      "down_type": 20,
+      "layers": 15
+    },
+    {
+      "gate_up_type": 22,
+      "down_type": 42,
+      "layers": 5
+    },
+    {
+      "gate_up_type": 23,
+      "down_type": 20,
+      "layers": 1
+    }
+  ],
+  "type_names": {
+    "18": "IQ3_XXS",
+    "20": "IQ4_NL",
+    "21": "IQ3_S",
+    "22": "IQ2_S",
+    "23": "IQ4_XS",
+    "42": "Q2_0"
+  },
+  "source": "native_experts.txt, pack metadata; not inferred from model filename"
+}

@@ -1,0 +1,55 @@
+{
+  "on_off_complete_outputs_match": [
+    true,
+    true
+  ],
+  "diagnostic_lines": {
+    "streamed-refill-on": [
+      "strata generate: KV streaming: 32768 of 524288 cells per QSA layer in VRAM, the K/V in 2.06 GiB of pinned RAM",
+      "strata serve: the prompt path borrows 1861 CUDA0 cache slots (3.26 GiB)",
+      "strata serve:   CUDA1 prompt path borrows 1652 of its 4785 slots (3.26 GiB)",
+      "strata KV prefetch: 0 layer prefixes, single existing staging pool",
+      "strata KV prefetch: 4 layer prefixes, single existing staging pool",
+      "strata trace: refill start 1861 -1",
+      "strata KV prefetch: 8 layer prefixes, single existing staging pool",
+      "strata trace: read 16383 tokens (batched) in 8910.4 ms",
+      "strata trace: refill start 1652 -1",
+      "strata trace: request refill: 3513 experts restored, 0 left lent in 272.6 ms",
+      "strata serve: KV streaming: 80.20% of 34916 block reads hit VRAM, 27.9 MiB read from RAM",
+      "strata KV prefetch: 0 layer prefixes, single existing staging pool",
+      "strata KV prefetch: 8 layer prefixes, single existing staging pool",
+      "strata KV prefetch: 8 layer prefixes, single existing staging pool",
+      "strata KV prefetch: 12 layer prefixes, single existing staging pool",
+      "strata trace: refill start 1861 -1",
+      "strata KV prefetch: 8 layer prefixes, single existing staging pool",
+      "strata trace: read 32767 tokens (batched) in 15573.7 ms",
+      "strata trace: refill start 1652 -1",
+      "strata trace: request refill: 3513 experts restored, 0 left lent in 272.5 ms",
+      "strata serve: KV streaming: 74.56% of 36972 block reads hit VRAM, 37.9 MiB read from RAM"
+    ],
+    "streamed-refill-off": [
+      "strata generate: KV streaming: 32768 of 524288 cells per QSA layer in VRAM, the K/V in 2.06 GiB of pinned RAM",
+      "strata serve: the prompt path borrows 1861 CUDA0 cache slots (3.26 GiB)",
+      "strata serve:   CUDA1 prompt path borrows 1652 of its 4785 slots (3.26 GiB)",
+      "strata KV prefetch: 0 layer prefixes, single existing staging pool",
+      "strata KV prefetch: 4 layer prefixes, single existing staging pool",
+      "strata KV prefetch: 8 layer prefixes, single existing staging pool",
+      "strata trace: read 16383 tokens (batched) in 8875.0 ms",
+      "strata trace: refill start 1861 -1",
+      "strata trace: refill start 1652 -1",
+      "strata trace: request refill: 3513 experts restored, 0 left lent in 1237.8 ms",
+      "strata serve: KV streaming: 80.20% of 34916 block reads hit VRAM, 27.9 MiB read from RAM",
+      "strata KV prefetch: 0 layer prefixes, single existing staging pool",
+      "strata KV prefetch: 8 layer prefixes, single existing staging pool",
+      "strata KV prefetch: 8 layer prefixes, single existing staging pool",
+      "strata KV prefetch: 12 layer prefixes, single existing staging pool",
+      "strata KV prefetch: 8 layer prefixes, single existing staging pool",
+      "strata trace: read 32767 tokens (batched) in 15613.7 ms",
+      "strata trace: refill start 1861 -1",
+      "strata trace: refill start 1652 -1",
+      "strata trace: request refill: 3513 experts restored, 0 left lent in 1237.8 ms",
+      "strata serve: KV streaming: 74.56% of 36972 block reads hit VRAM, 37.9 MiB read from RAM"
+    ]
+  },
+  "limit": "One request per size and arm. Trace enabled. Correctness and lifetime smoke, not a scored speed benchmark."
+}

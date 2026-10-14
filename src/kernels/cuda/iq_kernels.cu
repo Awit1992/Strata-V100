@@ -1778,6 +1778,67 @@ __device__ void dq_iq3_s_half(const void* vx, int64_t ibs, int h, int sub, dst_t
         }
     }
 }
+// The same 128-value half for IQ3_XXS: `h` and `sub` give the sub-block ib = 4*h + (sub & 3) and the value group
+// il = sub >> 2 exactly as dq_iq3_s_half, and the codebook, the four-bit gas scale (aux32 bits 28..31) and the
+// seven-bit sign group (bits 7*il .. 7*il + 6) are dq_iq3_xxs's own expressions.  Its grid1 holds y[0..3] and
+// grid2 y[4..7], so the half path splits the same way dq_iq3_s_half's does.
+template<typename dst_t>
+__device__ void dq_iq3_xxs_half(const void* vx, int64_t ibs, int h, int sub, dst_t* yy, const uint32_t* codebook = iq3xxs_grid) {
+    const block_iq3_xxs* x = (const block_iq3_xxs*) vx;
+    const int il = sub >> 2, ib4 = sub & 3, ib = 4 * h + ib4;
+    dst_t* y = yy + 32 * ib4 + 8 * il;
+    const uint8_t* q3 = x[ibs].qs + 8 * ib;
+    const uint16_t* gas = (const uint16_t*) (x[ibs].qs + QK_K / 4) + 2 * ib;
+    const uint32_t grid1 = codebook[q3[2 * il + 0]];
+    const uint32_t grid2 = codebook[q3[2 * il + 1]];
+    const uint32_t aux32 = gas[0] | (gas[1] << 16);
+    const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.5f;
+    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+    if constexpr (std::is_same_v<dst_t, __half>) {
+        // the eight values are contiguous and eight-aligned: four aligned half2 stores, not eight
+#pragma unroll
+        for (int j = 0; j < 4; j += 2) {
+            const float l0 = d * (float) (uint8_t) (grid1 >> (8 * j)) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+            const float l1 = d * (float) (uint8_t) (grid1 >> (8 * j + 8)) * (signs & kmask_iq2xs[j + 1] ? -1.f : 1.f);
+            const float h0 = d * (float) (uint8_t) (grid2 >> (8 * j)) * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+            const float h1 = d * (float) (uint8_t) (grid2 >> (8 * j + 8)) * (signs & kmask_iq2xs[j + 5] ? -1.f : 1.f);
+            *reinterpret_cast<__half2*>(y + j) = __floats2half2_rn(l0, l1);
+            *reinterpret_cast<__half2*>(y + j + 4) = __floats2half2_rn(h0, h1);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            y[j + 0] = cvt<dst_t>(d * (uint8_t) (grid1 >> (8 * j)) * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f));
+            y[j + 4] = cvt<dst_t>(d * (uint8_t) (grid2 >> (8 * j)) * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f));
+        }
+    }
+}
+// And the same 128-value half for IQ2_S: `h`, `sub`, `il`, `ib4` and the output mapping are dq_iq3_s_half's, while
+// the 1024-entry 64-bit grid, the nibble scale (bits 0..3 for il 0/1, 4..7 for il 2/3) and the sign byte at
+// qs[QK_K/8 + 4*ib + il] are dq_iq2_s's own expressions.  Its eight values are one contiguous group, so the half
+// path is four half2 stores with nothing split between two grids.
+template<typename dst_t>
+__device__ void dq_iq2_s_half(const void* vx, int64_t ibs, int h, int sub, dst_t* yy, const uint64_t* codebook = iq2s_grid) {
+    const block_iq2_s* x = (const block_iq2_s*) vx;
+    const int il = sub >> 2, ib4 = sub & 3, ib = 4 * h + ib4;
+    dst_t* y = yy + 32 * ib4 + 8 * il;
+    const uint64_t grid = codebook[x[ibs].qs[4 * ib + il] | ((x[ibs].qh[ib] << (8 - 2 * il)) & 0x300)];
+    const float d = (float) x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+    const uint8_t signs = x[ibs].qs[QK_K / 8 + 4 * ib + il];
+    if constexpr (std::is_same_v<dst_t, __half>) {
+        // the eight values are contiguous and eight-aligned: four aligned half2 stores, not eight
+#pragma unroll
+        for (int j = 0; j < 8; j += 2) {
+            const float l0 = d * (float) (uint8_t) (grid >> (8 * j)) * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+            const float l1 = d * (float) (uint8_t) (grid >> (8 * j + 8)) * (signs & kmask_iq2xs[j + 1] ? -1.f : 1.f);
+            *reinterpret_cast<__half2*>(y + j) = __floats2half2_rn(l0, l1);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            y[j] = cvt<dst_t>(d * (uint8_t) (grid >> (8 * j)) * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+    }
+}
 template<typename dst_t>
 __device__ void dq_iq1_m(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_iq1_m* x = (const block_iq1_m*) vx;
@@ -3796,11 +3857,11 @@ __host__ __device__ constexpr size_t gemm_iq_f16_grouped_smem(int wk, int xk = W
 // A block covers 128 weight rows of one expert and up to MT * WG_BM token rows.
 // Each weight chunk is decoded once into shared memory; activations use a BM x XK tile.
 // Eight warps use 32 x 32 m-tiles and FP32 accumulators for MT m-tiles.
-// DEC selects the decoder: 0 dq_dispatch (WK 256) or, for TY 21 at WK 128, dq_iq3_s_half, 1 Q2_0 (64 values),
-// 2 IQ4_NL (32 values).  Two tile shapes: the wide one (MT = WG_MT = 4, 256 token rows, one block per SM) and
-// the small one (MT = 2, 128 token rows, 43 KiB of weight tile plus the static codebook under 48 KiB, so two
-// blocks fit one V100 SM).  The launcher picks the shape from the launch's largest expert; both are exact and
-// differ only in how many token rows share one weight decode.
+// DEC selects the decoder: 0 dq_dispatch (WK 256) or, for TY 18/21/22 at WK 128, dq_iq3_xxs_half / dq_iq3_s_half /
+// dq_iq2_s_half, 1 Q2_0 (64 values), 2 IQ4_NL (32 values).  Two tile shapes: the wide one (MT = WG_MT = 4, 256 token
+// rows, one block per SM) and the small one (MT = 2, 128 token rows, 43 KiB of weight tile at XK 64 or 39 KiB at
+// XK 32, plus the static codebook under 48 KiB, so two blocks fit one V100 SM).  The launcher picks the shape from
+// the launch's largest expert; both are exact and differ only in how many token rows share one weight decode.
 // Optional ids gather input rows.  With a weight table (wsrc 1 = gate/up, 2 = down) expert e's matrix is the
 // table's device pointer; otherwise experts are contiguous with expert_bytes stride.
 template<int WK, int DEC, int TY = 0, int XK = WG_XK, int MT = WG_MT>
@@ -3810,7 +3871,8 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
         int ch_per_e, float* __restrict__ Y, int ldy, int wsrc, GroupedWeightTable tbl) {
     static_assert(gemm_iq_f16_grouped_smem(WK, XK) >= (size_t) WG_BM * (WG_BN + 4) * sizeof(float));
     static_assert(DEC != 2 || WK == 128, "IQ4_NL decodes one 128-value chunk per k0 step");
-    static_assert(MT != 2 || (WK == 128 && XK == 64), "the two-m-tile tiles are the 128-value chunks");
+    static_assert(MT != 2 || (WK == 128 && (XK == 64 || (TY == 22 && XK == 32))),
+                  "the two-m-tile tiles are the 128-value chunks; only IQ2_S's 8 KiB codebook needs XK 32");
     static_assert(MT != 2 || wg_codebook_words(TY) * sizeof(uint64_t) + gemm_iq_f16_grouped_smem(WK, XK) <= 48 * 1024,
                   "a small tile's static codebook and dynamic tiles must fit 48 KiB so two blocks fit one SM");
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
@@ -3873,14 +3935,19 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
     int it = 0;
     for (int k0 = 0; k0 < K; k0 += WK) {
         if constexpr (DEC == 0) {
-            if constexpr (TY == 21 && WK == 128) {
-                // The small tile: a WK-128 chunk is one 128-value half of an IQ3_S superblock, its sub-blocks
-                // ib = 4*kh .. 4*kh + 3 landing at columns 0 .. 127, sixteen lanes to a row and two rows
-                // per warp, so a lane decodes the same eight values per half as dq_iq3_s gives it per
-                // superblock.  The wide tile keeps dq_iq3_s itself, below.
+            if constexpr (WK == 128 && (TY == 18 || TY == 21 || TY == 22)) {
+                // The small tile: a WK-128 chunk is one 128-value half of an IQ3_XXS / IQ3_S / IQ2_S superblock,
+                // its sub-blocks ib = 4*kh .. 4*kh + 3 landing at columns 0 .. 127, sixteen lanes to a row and two
+                // rows per warp, so a lane decodes the same eight values per half as the 256-value decoders below
+                // give it per superblock.  The wide tile keeps those decoders.
                 const int kh = (k0 % 256) / 128, sub = lane & 15, rr = lane >> 4;
-                for (int r = 2 * warp + rr; r < WG_BN; r += 2 * (WG_THREADS / 32))
-                    dq_iq3_s_half(we + (size_t) (n0 + r) * row_bytes, k0 / 256, kh, sub, sw + r * LDW, grid32);
+                for (int r = 2 * warp + rr; r < WG_BN; r += 2 * (WG_THREADS / 32)) {
+                    const uint8_t* wr = we + (size_t) (n0 + r) * row_bytes;
+                    auto* out = sw + r * LDW;
+                    if constexpr (TY == 18) dq_iq3_xxs_half(wr, k0 / 256, kh, sub, out, grid32);
+                    else if constexpr (TY == 21) dq_iq3_s_half(wr, k0 / 256, kh, sub, out, grid32);
+                    else dq_iq2_s_half(wr, k0 / 256, kh, sub, out, codebook);
+                }
             } else {
                 for (int r = warp; r < WG_BN; r += WG_THREADS / 32) {
                     const auto* wr = we + (size_t) (n0 + r) * row_bytes;
@@ -3991,8 +4058,9 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
 // raise it on each card): cache, per device, which instantiations the attribute was accepted for.  A 128 x 264-half
 // weight tile is 83 KiB, past the 64 KiB a Turing card allows and within Volta's / Ampere's opt-in limit.  The bits:
 // 1 queried, 2 the WK-256 gate/up kernels, 4 the WK-128 Q2_0 kernel, 8 the wide WK-128 IQ4_NL kernel,
-// 16 the small IQ3_S tile, 32 the small IQ4_NL tile.  Each tile shape has its own bit: a device that refuses
-// one attribute must keep that shape on the MMQ path rather than launch a kernel whose tile was never attributed.
+// 16 the small IQ3_S tile, 32 the small IQ4_NL tile, 64 the small IQ3_XXS tile, 128 the small IQ2_S tile.  Each
+// tile shape has its own bit: a device that refuses one attribute must keep that shape on the MMQ path rather than
+// launch a kernel whose tile was never attributed.
 unsigned gemm_iq_f16_grouped_caps(int dev) {
     static thread_local unsigned per_dev[64];   // per-thread: two prefill objects may first touch one device at once
     if (dev < 0 || dev >= 64) return 0;
@@ -4009,9 +4077,11 @@ unsigned gemm_iq_f16_grouped_caps(int dev) {
             const bool d2 = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(128)) == cudaSuccess;
             const bool d21 = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, 0, 21, 64, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(128, 64)) == cudaSuccess;
             const bool d2s = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, 2, 0, 64, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(128, 64)) == cudaSuccess;
-            if (!gu || !g18 || !g21 || !g22 || !g23 || !d1 || !d2 || !d21 || !d2s) (void) cudaGetLastError();
+            const bool d18 = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, 0, 18, 64, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(128, 64)) == cudaSuccess;
+            const bool d22 = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, 0, 22, 32, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(128, 32)) == cudaSuccess;
+            if (!gu || !g18 || !g21 || !g22 || !g23 || !d1 || !d2 || !d21 || !d2s || !d18 || !d22) (void) cudaGetLastError();
             caps |= ((gu && g18 && g21 && g22 && g23) ? 2u : 0u) | (d1 ? 4u : 0u) | (d2 ? 8u : 0u) |
-                    (d21 ? 16u : 0u) | (d2s ? 32u : 0u);
+                    (d21 ? 16u : 0u) | (d2s ? 32u : 0u) | (d18 ? 64u : 0u) | (d22 ? 128u : 0u);
         }
         per_dev[dev] = caps;
     }
@@ -4027,16 +4097,17 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
     if (ldx < K || ldx % 8 != 0 || ldy < n_out || ldy % 4 != 0) return false;   // uint4 loads / float4 stores
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
-    // IQ3_S and IQ4_NL use 128-row tiles for short groups and 256-row tiles for wide groups.
-    // The weight chunk is 128 values for IQ4_NL and Q2_0, and 128 (short) or 256 (wide) for IQ3_S.
+    // The IQ gate/up formats and IQ4_NL use 128-row tiles for short groups and 256-row tiles for wide groups.
+    // The weight chunk is 128 values for IQ4_NL and Q2_0, and 128 (short) or 256 (wide) for IQ3_XXS / IQ3_S / IQ2_S.
     const int dec = ty == 42 ? 1 : ty == 20 ? 2 : 0;
     if (dec == 0 ? (K % 256 != 0 || !is_iq(ty)) : K % 128 != 0) return false;
     const unsigned caps = gemm_iq_f16_grouped_caps(dev);
     // The small tile decodes a weight chunk once per 128 token rows but hides the decode behind two blocks per
     // SM, which wins while the group's largest expert holds at most one chunk; past that the wide tile's half as
     // frequent weight decode pays for its single block.  Both tiles are exact: only the chunking differs.
-    const bool small = max_rows <= 2 * WG_BM && (dec == 2 || (dec == 0 && ty == 21));
-    const unsigned need = small ? (dec == 2 ? 32u : 16u) : dec == 0 ? 2u : dec == 1 ? 4u : 8u;
+    const bool small = max_rows <= 2 * WG_BM && (dec == 2 || (dec == 0 && (ty == 18 || ty == 21 || ty == 22)));
+    const unsigned need = small ? (dec == 2 ? 32u : ty == 22 ? 128u : ty == 18 ? 64u : 16u)
+                                : dec == 0 ? 2u : dec == 1 ? 4u : 8u;
     if (!(caps & need)) return false;
     const size_t row_bytes = iq_row_bytes(ty, K);
     const int mt = small || dec == 1 ? 2 : WG_MT;
@@ -4047,11 +4118,17 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
     const __half* x = (const __half*) X;
     const int wsrc = indirect == nullptr ? 0 : (down ? 2 : 1);
     const GroupedWeightTable tbl = indirect != nullptr ? *indirect : GroupedWeightTable{};
-    if (dec == 0 && ty == 18)
-        gemm_iq_f16_grouped_kernel<256, 0, 18><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(256), s>>>(
+    if (dec == 0 && small && ty == 18)
+        gemm_iq_f16_grouped_kernel<128, 0, 18, 64, 2><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(128, 64), s>>>(
             ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
-    else if (dec == 0 && ty == 21 && small)
+    else if (dec == 0 && small && ty == 21)
         gemm_iq_f16_grouped_kernel<128, 0, 21, 64, 2><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(128, 64), s>>>(
+            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
+    else if (dec == 0 && small && ty == 22)
+        gemm_iq_f16_grouped_kernel<128, 0, 22, 32, 2><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(128, 32), s>>>(
+            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
+    else if (dec == 0 && ty == 18)
+        gemm_iq_f16_grouped_kernel<256, 0, 18><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(256), s>>>(
             ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
     else if (dec == 0 && ty == 21)
         gemm_iq_f16_grouped_kernel<256, 0, 21><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(256), s>>>(

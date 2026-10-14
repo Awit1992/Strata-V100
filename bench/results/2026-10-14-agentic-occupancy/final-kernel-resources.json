@@ -1,0 +1,57 @@
+{
+  "engine_sha256": "ef3142853e856a9282a3d0145daa830d557710e019fa11dbd4c27ecb78bb2a50",
+  "source_hashes": {
+    "src/kernels/cuda/iq_kernels.cu": "27af389d364fad2b8528a0fe75b45ef1233ebfa8a595c93b8a8acc296e0a5297",
+    "src/kernels/pf_wmma_parity.cpp": "21376a6641c5d48be51f843a59fc34c7750fae27817a4f5d3680d9408bcf5620",
+    "src/prefill/prefill.cpp": "549fd55bf27c5b8a79b204b531c1fbddbed9ac50c24c7472a8e915341a98a71b",
+    "src/program/generate.cpp": "221cf921bb1fa44f5c899c937059074aa4bd72d305ec5ec41dac2ff02042254b",
+    "include/strata/prefill/prefill.hpp": "e83519d983fc39d665a1ae00389747e22b62c247a689fa6d9d2d5834c8304b66",
+    "include/strata/kernels/iq_kernels.hpp": "ff95cfc53143e1f6d92748d518a32d79459842ce7936532f3f0e0fbeb11e9707"
+  },
+  "kernels": [
+    {
+      "kernel": "void strata::kernels::(anonymous namespace)::gemm_iq_f16_grouped_kernel<128, 0, 22, 32, 2>(int, unsigned char const*, unsigned long, unsigned long, int, __half const*, int, int const*, int const*, int, float*, int, int, strata::kernels::GroupedWeightTable)",
+      "resource": "REG:128 STACK:8 SHARED:8192 LOCAL:0 CONSTANT[0]:712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "kernel": "void strata::kernels::(anonymous namespace)::gemm_iq_f16_grouped_kernel<128, 0, 18, 64, 2>(int, unsigned char const*, unsigned long, unsigned long, int, __half const*, int, int const*, int const*, int, float*, int, int, strata::kernels::GroupedWeightTable)",
+      "resource": "REG:128 STACK:16 SHARED:1024 LOCAL:0 CONSTANT[0]:712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "kernel": "void strata::kernels::(anonymous namespace)::gemm_iq_f16_grouped_kernel<128, 2, 0, 64, 2>(int, unsigned char const*, unsigned long, unsigned long, int, __half const*, int, int const*, int const*, int, float*, int, int, strata::kernels::GroupedWeightTable)",
+      "resource": "REG:128 STACK:16 SHARED:16 LOCAL:0 CONSTANT[0]:712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "kernel": "void strata::kernels::(anonymous namespace)::gemm_iq_f16_grouped_kernel<128, 0, 21, 64, 2>(int, unsigned char const*, unsigned long, unsigned long, int, __half const*, int, int const*, int const*, int, float*, int, int, strata::kernels::GroupedWeightTable)",
+      "resource": "REG:128 STACK:16 SHARED:2048 LOCAL:0 CONSTANT[0]:712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "kernel": "void strata::kernels::(anonymous namespace)::gemm_iq_f16_grouped_kernel<128, 2, 0, 128, 4>(int, unsigned char const*, unsigned long, unsigned long, int, __half const*, int, int const*, int const*, int, float*, int, int, strata::kernels::GroupedWeightTable)",
+      "resource": "REG:252 STACK:0 SHARED:16 LOCAL:0 CONSTANT[0]:712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "kernel": "void strata::kernels::(anonymous namespace)::gemm_iq_f16_grouped_kernel<128, 1, 0, 64, 2>(int, unsigned char const*, unsigned long, unsigned long, int, __half const*, int, int const*, int const*, int, float*, int, int, strata::kernels::GroupedWeightTable)",
+      "resource": "REG:128 STACK:16 SHARED:0 LOCAL:0 CONSTANT[0]:712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "kernel": "void strata::kernels::(anonymous namespace)::gemm_iq_f16_grouped_kernel<256, 0, 23, 128, 4>(int, unsigned char const*, unsigned long, unsigned long, int, __half const*, int, int const*, int const*, int, float*, int, int, strata::kernels::GroupedWeightTable)",
+      "resource": "REG:251 STACK:0 SHARED:16 LOCAL:0 CONSTANT[0]:712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "kernel": "void strata::kernels::(anonymous namespace)::gemm_iq_f16_grouped_kernel<256, 0, 22, 128, 4>(int, unsigned char const*, unsigned long, unsigned long, int, __half const*, int, int const*, int const*, int, float*, int, int, strata::kernels::GroupedWeightTable)",
+      "resource": "REG:251 STACK:0 SHARED:8192 LOCAL:0 CONSTANT[0]:712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "kernel": "void strata::kernels::(anonymous namespace)::gemm_iq_f16_grouped_kernel<256, 0, 21, 128, 4>(int, unsigned char const*, unsigned long, unsigned long, int, __half const*, int, int const*, int const*, int, float*, int, int, strata::kernels::GroupedWeightTable)",
+      "resource": "REG:251 STACK:0 SHARED:2048 LOCAL:0 CONSTANT[0]:712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "kernel": "void strata::kernels::(anonymous namespace)::gemm_iq_f16_grouped_kernel<256, 0, 18, 128, 4>(int, unsigned char const*, unsigned long, unsigned long, int, __half const*, int, int const*, int const*, int, float*, int, int, strata::kernels::GroupedWeightTable)",
+      "resource": "REG:251 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "kernel": "void strata::kernels::(anonymous namespace)::gemm_iq_f16_grouped_kernel<256, 0, 0, 128, 4>(int, unsigned char const*, unsigned long, unsigned long, int, __half const*, int, int const*, int const*, int, float*, int, int, strata::kernels::GroupedWeightTable)",
+      "resource": "REG:252 STACK:0 SHARED:0 LOCAL:0 CONSTANT[2]:116 CONSTANT[0]:712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    }
+  ]
+}
