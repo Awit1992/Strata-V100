@@ -13,9 +13,10 @@ pool; it does not allocate another KV buffer.
 ## Use and ordering
 
 Set `STRATA_KV_PREFETCH=1` before starting the engine. It is off by default.
-A release event protects the staging pool's last reader; a ready event orders
-the next attention consumer. Early returns drain pending copies before the caller
-can refill borrowed expert slots. Relayout and destruction also drain the stream.
+A release event protects the staging pool's last reader. A ready event orders
+the next attention consumer. Normal completion drains pending copies before the
+stage-complete hook can start expert-slot refill. Early returns also drain copies
+before the caller can refill borrowed slots. Relayout and destruction drain the stream.
 
 ## Validation environment
 

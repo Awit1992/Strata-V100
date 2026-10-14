@@ -1,30 +1,71 @@
-"""Decode A/B on coding-agent turns over this repository: arms restarted per round, per-turn ratios.
+"""A/B prefill latency, new tokens and reuse on coding-agent turns: per-turn numbers from the server's own clock.
 
-    python tools/agent_turns_bench.py strata-iq2_xs.json base: hcq8:STRATA_HC_Q8=2 [--rounds 2]
+    python tools/agent_turns_bench.py strata-iq3_s-arena.json base: cand:STRATA_HC_Q8=2 [--rounds 2]
+    python tools/agent_turns_bench.py strata-iq3_s-arena.json base: cand:STRATA_X=1 --workload agentic
+    python tools/agent_turns_bench.py strata-iq3_s-arena.json A: B: --engine mock   # a smoke run, no GPU
 
-The workload is five simulated coding-agent sessions over this repository's own files (README, serve/, setup.py, the
-expert cache, the hyper-connection kernels, the tokenizer): a system prompt, four tools, a task (three in English, two
-in French), then tool calls whose results are the real files, at most 2,000 lines per read as agents' read tools
-return them.  Every point right after a tool result is one turn the model continues - 23 turns from ~2.5K to ~100K
-tokens with the repository as of 0.1.41, consecutive turns sharing their prefix as in a real session.  Nothing
-personal and nothing downloaded: anyone with this checkout gets the same requests.
+Two workloads.  Both send the same requests to every arm and neither downloads anything:
+
+  repo (the default)  five simulated coding-agent sessions over this repository's own files (README, serve/,
+      setup.py, the expert cache, the hyper-connection kernels, the tokenizer): a system prompt, four tools, a
+      task (three in English, two in French), then tool calls whose results are the real files, at most 2,000
+      lines per read as agents' read tools return them.  Every point right after a tool result is one turn the
+      model continues - 23 turns from ~2.5K to ~100K tokens, consecutive turns sharing their prefix as in a
+      real session.
+
+  agentic  the short-turn shape of an agent at work: one long shared prefix (the system prompt, the task and
+      one large tool result, --prefix-tokens) and then --turns short turns, each adding one assistant line and
+      one tool result of about 64, 128, 256 or 512 tokens (--additions).  A fixed cost per request shows up
+      here as milliseconds per new token: the additions are small and the conversation cache holds the rest of
+      the prompt.
+
+Every turn's numbers come from the server's own `timings` (serve/server.py request_timings): `prompt_n` the
+new tokens read, `cache_n` the tokens the conversation cache already held, `prompt_ms` the time to read them,
+`prompt_per_token_ms` and `prompt_per_second` the prefill rate, `predicted_*` the decode.  The report gives,
+per turn and per arm, the tokens the turn added to its conversation, the new tokens the engine read, the reuse
+share, the prefill latency and its milliseconds per new token, the decode rate, and the whole HTTP call's
+milliseconds (`req ms`, measured by this tool; parking a conversation and restoring one are inside it, and the
+engine's own time is not).  It then gives the per-turn factor of every other arm against the first arm for
+prefill latency and for decode (>1 is better for both).
+
+A cold turn (the first turn of a session, `agentic.prefix` in the agentic workload: the whole prompt is new)
+is listed with the others but kept out of the medians of the short turns: one long cold read is not the
+per-turn cost of an agent at work.
+
+`--additions` and `--prefix-tokens` are TARGETS, not measurements.  The text is common English words and one
+word is about one token, and a turn also adds the assistant's line and the tool-call envelope (measured: about
+55 tokens with these four tools and this chat template).  The measured sizes are the report's own numbers:
+`added` is the whole turn's new tokens, and `new` and `reuse` are the engine's `prompt_n` and `cache_n`.
 
 Arms are given as ab_engine.py takes them (NAME:key=value,...; `exe` replaces the engine, `xargs` appends
-';'-separated engine arguments, any other key goes to the engine's environment).  The rounds mirror the arm order
-(A B, B A, ...), each arm on a fresh server.  Sampling is the agent's (temperature 1, top-p 0.95, top-k 20, a fixed
-seed), 256 new tokens per turn.  The result is the server's own decode tok/s per turn and, per arm, the median of the
-per-turn ratios to the first arm with the number of turns it won: a whole-session median hides which turns moved.
+';'-separated engine arguments, any other key goes to the engine's environment).  The rounds mirror the arm
+order (A B, B A, ...).  Each arm gets its own server and its own private directory for the engine log, the
+conversation-cache disk store and the expert profile: the disk store survives a restart and would otherwise
+restore another arm's parked conversation, which is the state an A/B must not share.  The generated config
+binds 127.0.0.1 and carries no API key, so the operator's secret is never copied out of the config file.  The
+server and the engine it starts are stopped after every arm (SIGTERM, then SIGKILL of the arm's own process
+group), and the private directory is removed at the end unless --workdir names one to keep.
+
+Every arm inherits this process's environment and adds its own key=value pairs to it.  Export the settings the
+live service uses (its EnvironmentFile, or the STRATA_* variables) before a measured run: an arm that misses
+one of them measures another configuration.
+
+Sampling is the agent's (temperature 1, top-p 0.95, top-k 20, a fixed seed), 256 new tokens per turn.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import random
+import shutil
+import signal
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -98,6 +139,34 @@ SESSIONS = [
       ("read_file", "chat.py", "Et le client en ligne de commande.")]),
 ]
 
+# ---------------------------------------------------------------- the agentic workload (synthetic, short turns)
+AGENTIC_SYSTEM = ("You are an autonomous coding agent working in the user's repository. Read the code before you change "
+                  "it, make small and correct edits, and keep the existing style. Never invent file contents.")
+
+AGENTIC_TASK = ("Find every place that reads the expert cache during decode, explain what each one needs from it, and "
+                "propose a smaller interface. Work step by step and report what you changed.")
+
+# Common English words.  One word is about one token, so a target of N words is about N tokens; the measured size is
+# the server's own prompt_n, which every report prints.
+AGENTIC_WORDS = ("the of and to in a is that for it with as was on be at by this from or an are not but they you all we "
+                 "can her has there their if one do into your which so then them would about will these when make like "
+                 "time just him know take people year good some could see other than now look only come its over think "
+                 "also back after use two how our work first well way even new want because any give day most us file "
+                 "line code call read write test build server engine cache token prompt context memory layer weight "
+                 "kernel batch queue thread lock buffer").split()
+
+# (what the assistant says, tool, argument).  The tool result is synthetic, so the argument is only prompt text.
+AGENTIC_STEPS = (
+    ("Let me read the first part of the search result.", "read_file", {"path": "src/core/expert_cache.cpp"}),
+    ("Now the callers of that function.", "grep", {"pattern": "expert_cache"}),
+    ("The declaration should say what the cache keeps.", "read_file", {"path": "include/strata/core/expert_cache.hpp"}),
+    ("Let me see how the tests drive it.", "read_file", {"path": "tools/conversation_cache_disk.py"}),
+)
+
+# What the report reads out of every row.
+METRIC_KEYS = ("new_tokens", "reused", "reuse_ratio", "prefill_ms", "ms_per_new_token", "prefill_tok_s", "decode_tok_s",
+               "request_ms")
+
 
 def tool_result(tool: str, arg: str) -> str:
     if tool == "read_file":
@@ -128,87 +197,379 @@ def turns() -> list[tuple[str, list[dict]]]:
     return out
 
 
+def synthetic_result(tokens: int, rng: random.Random) -> str:
+    """A synthetic tool result of about `tokens` tokens: common English words, one about one token each.
+
+    The size is an approximation.  The report prints the server's own `prompt_n` and `prompt_tokens` for every
+    turn, and those are the measured sizes."""
+    return " ".join(rng.choice(AGENTIC_WORDS) for _ in range(max(1, int(tokens))))
+
+
+def agentic_turns(prefix_tokens: int, additions: list[int], turns_n: int, seed: int) -> list[tuple[str, list[dict]]]:
+    """[(tag, messages)] for the short-turn workload: one long shared prefix, then `turns_n` short turns.
+
+    The prefix (system, task, one assistant call, one large tool result) is the same text in every turn, so the
+    conversation cache can hold it; each later turn adds one assistant line and one tool result of the next size
+    in `additions`, in order.  `seed` fixes the text, so two arms send byte-identical requests."""
+    rng = random.Random(seed)
+    text, tool, args = AGENTIC_STEPS[0]
+    msgs = [{"role": "system", "content": AGENTIC_SYSTEM}, {"role": "user", "content": AGENTIC_TASK},
+            {"role": "assistant", "content": text,
+             "tool_calls": [{"id": "call_agentic_prefix", "type": "function",
+                             "function": {"name": tool, "arguments": json.dumps(args)}}]},
+            {"role": "tool", "tool_call_id": "call_agentic_prefix", "content": synthetic_result(prefix_tokens, rng)}]
+    out = [("agentic.prefix", [dict(m) for m in msgs])]
+    for i in range(turns_n):
+        text, tool, args = AGENTIC_STEPS[(i + 1) % len(AGENTIC_STEPS)]
+        cid = f"call_agentic_{i}"
+        msgs.append({"role": "assistant", "content": text,
+                     "tool_calls": [{"id": cid, "type": "function",
+                                     "function": {"name": tool, "arguments": json.dumps(args)}}]})
+        msgs.append({"role": "tool", "tool_call_id": cid, "content": synthetic_result(additions[i % len(additions)], rng)})
+        out.append((f"agentic.{i}", [dict(m) for m in msgs]))
+    return out
+
+
+# ---------------------------------------------------------------- metrics (the server's own fields, plus the ratios it does not report)
+def turn_metrics(timings: dict | None, usage: dict | None, request_ms: float | None = None) -> dict:
+    """One turn's numbers, from the server's own fields: `timings` is llama.cpp's (serve/server.py
+    request_timings), `usage` is the OpenAI one, and `request_ms` is the caller's own wall clock around the
+    whole HTTP call.
+
+    new_tokens   what this request read (timings.prompt_n)
+    reused       what the conversation cache already held (timings.cache_n)
+    reuse_ratio  reused over the whole prompt (usage.prompt_tokens); None when the prompt is empty
+    prefill_ms   the time to read the new tokens; ms_per_new_token that time per new token (None when nothing
+                 was read: a fully reused turn has no prefill rate)
+    prefill_tok_s  new tokens per second; decode_ms, out_tokens, decode_tok_s  the generated part
+    total_ms     prefill plus decode, the engine's own time for the request
+    request_ms   the whole call, from the client: parking a conversation, restoring one, and the setup around
+                 the engine's own time are all in it, so a difference between the arms that total_ms does not
+                 show is a difference outside the engine
+
+    Every number the server does not give stays None (an engine without a clock, a request it cancelled)."""
+    t = timings if isinstance(timings, dict) else {}
+    u = usage if isinstance(usage, dict) else {}
+    prompt_tokens = u.get("prompt_tokens")
+    new_tokens, reused = t.get("prompt_n"), t.get("cache_n")
+    if reused is None and isinstance(u.get("prompt_tokens_details"), dict):
+        reused = u["prompt_tokens_details"].get("cached_tokens")
+    prefill_ms, decode_ms = t.get("prompt_ms"), t.get("predicted_ms")
+    out_tokens = t.get("predicted_n")
+    if out_tokens is None:
+        out_tokens = u.get("completion_tokens")
+    return {
+        "prompt_tokens": prompt_tokens, "new_tokens": new_tokens, "reused": reused,
+        "reuse_ratio": (reused / prompt_tokens) if reused is not None and prompt_tokens else None,
+        "prefill_ms": prefill_ms, "ms_per_new_token": t.get("prompt_per_token_ms"),
+        "prefill_tok_s": t.get("prompt_per_second"),
+        "decode_ms": decode_ms, "out_tokens": out_tokens, "decode_tok_s": t.get("predicted_per_second"),
+        "total_ms": None if prefill_ms is None or decode_ms is None else round(prefill_ms + decode_ms, 1),
+        "request_ms": request_ms,
+        "draft_n": t.get("draft_n"), "draft_n_accepted": t.get("draft_n_accepted"),
+    }
+
+
+def median_of(values) -> float | None:
+    """The median of the numbers that are not None (None when there are none)."""
+    v = [x for x in values if x is not None]
+    return statistics.median(v) if v else None
+
+
+def improvement(arm: float | None, first: float | None, lower_is_better: bool = False) -> float | None:
+    """The arm's factor against the first arm: above 1 is better, whichever way the metric runs.  For a latency
+    (`lower_is_better`) the factor is first/arm, so the shorter time wins.  None when either number is missing
+    or zero."""
+    if not arm or not first:
+        return None
+    return (first / arm) if lower_is_better else (arm / first)
+
+
+def _num(v) -> str:
+    return "n/a" if v is None else str(v)
+
+
+def _pct(v) -> str:
+    return "n/a" if v is None else f"{100 * v:.1f}%"
+
+
+def _factor(v) -> str:
+    return "n/a" if v is None else f"x{v:.2f}"
+
+
+def session_starts(work: list[tuple[str, list[dict]]]) -> list[bool]:
+    """True for each turn that starts a session: the first one, and any turn whose predecessor's messages are
+    not a prefix of its own.  Such a turn has nothing before it, so the engine reads its whole prompt: it is the
+    cold turn of its session, not a turn of the agent's short loop."""
+    return [i == 0 or work[i - 1][1] != msgs[:len(work[i - 1][1])] for i, (_, msgs) in enumerate(work)]
+
+
+def session_additions(name: str, work: list[tuple[str, list[dict]]], res: dict) -> dict:
+    """{tag: the tokens this turn added to its conversation}, the whole prompt less the turn before it in the
+    same session (median over rounds).  None for a session's first turn, and for a turn whose predecessor has no
+    row in the same round: there is nothing to subtract."""
+    starts = session_starts(work)
+    out: dict[str, float | None] = {}
+    for i, (tag, _) in enumerate(work):
+        out[tag] = None
+        if starts[i]:
+            continue                                     # a session's first turn: the whole prompt is new
+        before = {r["round"]: r["prompt_tokens"] for r in res[name].get(work[i - 1][0], [])}
+        now = {r["round"]: r["prompt_tokens"] for r in res[name].get(tag, [])}
+        out[tag] = median_of([now[k] - before[k] for k in now
+                              if k in before and now[k] is not None and before[k] is not None])
+    return out
+
+
+# ---------------------------------------------------------------- one arm's own state and process
+def arm_paths(home: Path, name: str, rnd: int) -> dict:
+    """This arm's own paths under `home`, one directory per arm per round.
+
+    The conversation-cache disk store and the expert profile survive a restart, so two arms must never share
+    them: a later arm would restore or start from the state of an earlier one."""
+    d = home / f"{name}_r{rnd}"
+    return {"dir": d, "log": d / "engine.log", "disk": d / "conversations", "profile": d / "expert-profile.bin"}
+
+
+def _redirect_arg(args: list[str], flag: str, path: str) -> None:
+    """Point every `flag PATH` in `args` at `path`, in place.
+
+    The engine takes the last occurrence of an option, and an arm's own `xargs` may add another one after the
+    config's, so every occurrence is rewritten.  The engine's parser reads the flag and its value as two
+    arguments (src/program/generate.cpp), so there is no `flag=PATH` form to rewrite."""
+    for i, arg in enumerate(args):
+        if arg == flag and i + 1 < len(args):
+            args[i + 1] = path
+
+
+def isolated_config(base: dict, name: str, rnd: int, home: Path, port: int) -> dict:
+    """The config one arm's server gets: `base` with this arm's own log, conversation-cache disk store and expert
+    profile, bound to the loopback address.
+
+    The API key is left out, so the operator's secret is never copied into a generated file.  The server then
+    answers only on 127.0.0.1, which needs no key (serve/server.py: an IP address passes the Host check).  Every
+    `--conversation-cache-disk` and `--expert-profile-save` in the config's own arguments, and in an arm's
+    `xargs`, is redirected as well.  `base` is not modified."""
+    cfg = dict(base)
+    cfg.pop("api_key", None)
+    cfg["host"] = "127.0.0.1"
+    cfg["port"] = port
+    p = arm_paths(home, name, rnd)
+    cfg["log"] = str(p["log"])
+    disk = str(p["disk"])
+    args = list(cfg.get("args") or [])
+    _redirect_arg(args, "--conversation-cache-disk", disk)
+    _redirect_arg(args, "--expert-profile-save", str(p["profile"]))
+    if args != (base.get("args") or []):
+        cfg["args"] = args
+    if cfg.get("conversation_cache_disk") is not None:
+        cfg["conversation_cache_disk"] = disk
+    if isinstance(cfg.get("expert_profile_save"), str) and cfg["expert_profile_save"].strip():
+        cfg["expert_profile_save"] = str(p["profile"])
+    return cfg
+
+
+def start_arm(cfg_path: Path, port: int, server_log: Path, env: dict, engine: str = "strata") -> subprocess.Popen:
+    """Start one arm's server: its own process group (so its engine can be ended with it), its own stdout and
+    stderr in the arm's directory, and no terminal.  `engine` is the server's own choice: "strata" for the model,
+    "mock" for the scripted stand-in that needs no GPU (a smoke run, with no engine timings)."""
+    out = open(server_log, "ab")
+    try:
+        return subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", engine, "--config",
+                                 str(cfg_path), "--port", str(port)], cwd=str(ROOT), env=env, stdout=out,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    finally:
+        out.close()
+
+
+def stop_arm(proc: subprocess.Popen) -> None:
+    """Stop one arm's server and the engine it started: SIGTERM first (the server sends QUIT to the engine and
+    waits for it), then SIGKILL of the arm's whole process group if anything is still there.  The group is the
+    arm's own (start_arm's new session), so this can never reach the benchmark itself.  Its id is the server's
+    pid, which still names the group when the server itself is gone and its engine is not."""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(120)
+        except subprocess.TimeoutExpired:
+            pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.wait(30)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def post(port: int, messages: list[dict], max_tokens: int, seed: int) -> dict:
+    """One turn's request.  A refusal (the context is too small for the prompt, a bad key) is raised with the
+    server's own words, not urllib's."""
     body = {"messages": messages, "tools": TOOLS, "max_tokens": max_tokens, "temperature": 1.0, "top_p": 0.95,
             "top_k": 20, "seed": seed, "reasoning_effort": "high"}
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=3600) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=3600) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"the server answered {e.code}: {e.read().decode('utf-8', 'replace')[:600]}") from e
+
+
+def turn_line(tag: str, m: dict) -> str:
+    """One measured turn, as the run prints it."""
+    return (f"{tag:16s} new {_num(m['new_tokens']):>6s}  reused {_num(m['reused']):>7s} ({_pct(m['reuse_ratio']):>6s})"
+            f"  prefill {_num(m['prefill_ms']):>9s} ms ({_num(m['ms_per_new_token']):>6s} ms/tok)"
+            f"  decode {_num(m['decode_tok_s']):>6s} tok/s  n {_num(m['out_tokens']):>4s}"
+            f"  req {_num(m['request_ms']):>9s} ms")
+
+
+def summarize(arms: list[tuple[str, dict]], work: list[tuple[str, list[dict]]], res: dict, targets: dict) -> None:
+    """Print the per-turn medians per arm, then the factor of every other arm against the first arm.
+
+    A cold turn (a session's first: the whole prompt is new) is listed like the others and kept out of the
+    medians of the short turns: one long cold read is not the per-turn cost of an agent at work."""
+    names = [name for name, _ in arms]
+    first = names[0]
+    starts = session_starts(work)
+    kind = {tag: ("cold" if start else "short") for (tag, _), start in zip(work, starts)}
+    short = [tag for (tag, _), start in zip(work, starts) if not start]
+    cold = [tag for (tag, _), start in zip(work, starts) if start]
+    med = {(name, tag): {k: median_of([row[k] for row in res[name].get(tag, [])]) for k in METRIC_KEYS}
+           for name in names for tag, _ in work}
+    added = {name: session_additions(name, work, res) for name in names}
+    print("\nper-turn medians over rounds ('target' is the requested size of the turn's tool result; 'added', "
+          "'new', 'reuse' and 'req ms' are measured; 'req ms' is the whole HTTP call, 'prefill ms' the engine's "
+          "own time):")
+    print(f"  {'turn':16s} {'kind':>5s} {'target':>6s} {'added':>7s} {'new':>7s} {'reuse':>7s} {'prefill ms':>10s} "
+          f"{'ms/tok':>7s} {'req ms':>9s} {'decode tok/s':>12s}  arm")
+    for tag, _ in work:
+        for name in names:
+            m = med[(name, tag)]
+            print(f"  {tag:16s} {kind[tag]:>5s} {_num(targets.get(tag)):>6s} {_num(added[name].get(tag)):>7s} "
+                  f"{_num(m['new_tokens']):>7s} {_pct(m['reuse_ratio']):>7s} {_num(m['prefill_ms']):>10s} "
+                  f"{_num(m['ms_per_new_token']):>7s} {_num(m['request_ms']):>9s} {_num(m['decode_tok_s']):>12s}"
+                  f"  {name}")
+    if len(names) < 2:
+        return
+    print(f"\nper turn against {first}: prefill is its milliseconds over the arm's (less time is better), decode "
+          "is the arm's tokens per second over its (more is better); above 1 is better for both.")
+    print(f"  {'turn':16s} {'kind':>5s} {'new':>7s} {'prefill':>8s} {'decode':>8s}  arm")
+    for tag, _ in work:
+        for name in names[1:]:
+            p = improvement(med[(name, tag)]["prefill_ms"], med[(first, tag)]["prefill_ms"], lower_is_better=True)
+            d = improvement(med[(name, tag)]["decode_tok_s"], med[(first, tag)]["decode_tok_s"])
+            print(f"  {tag:16s} {kind[tag]:>5s} {_num(med[(name, tag)]['new_tokens']):>7s} {_factor(p):>8s} "
+                  f"{_factor(d):>8s}  {name}")
+    for name in names[1:]:
+        for label, tags in (("short", short), ("cold", cold)):
+            if not tags:
+                continue
+            p = [improvement(med[(name, tag)]["prefill_ms"], med[(first, tag)]["prefill_ms"], lower_is_better=True)
+                 for tag in tags]
+            d = [improvement(med[(name, tag)]["decode_tok_s"], med[(first, tag)]["decode_tok_s"]) for tag in tags]
+            print(f"  {name}: {len(tags)} {label} turn{'' if len(tags) == 1 else 's'}: prefill "
+                  f"{_factor(median_of(p))} median ({sum(1 for x in p if x and x > 1)}/{len(tags)} faster), "
+                  f"decode {_factor(median_of(d))} median ({sum(1 for x in d if x and x > 1)}/{len(tags)} faster)")
+    measured = [tag for tag, _ in work if med[(first, tag)]["new_tokens"] is not None]
+    if not measured:
+        print("  no engine timings in this run: there is no new-token count to check between the arms")
+        return
+    same = sum(1 for tag in measured if len({med[(name, tag)]["new_tokens"] for name in names}) == 1)
+    print(f"  the same new-token count in every arm on {same}/{len(measured)} measured turns"
+          + ("" if same == len(measured) else "  <- the arms did different work: do not compare those turns"))
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("config")
     ap.add_argument("arms", nargs="+")
+    ap.add_argument("--workload", choices=("repo", "agentic"), default="repo")
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--max-new", type=int, default=256)
     ap.add_argument("--max-turns", type=int, default=0, help="only the first N turns (0: all)")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--log", default="agent_turns_bench.jsonl")
+    ap.add_argument("--prefix-tokens", type=int, default=8192, help="agentic: the shared prefix's target size")
+    ap.add_argument("--additions", default="64,128,256,512", help="agentic: each turn's target tool-result tokens")
+    ap.add_argument("--turns", type=int, default=16, help="agentic: how many short turns")
+    ap.add_argument("--engine", choices=("strata", "mock"), default="strata",
+                    help="the server's engine: mock needs no GPU and gives no engine timings (a smoke run)")
+    ap.add_argument("--workdir", default=None, help="where the arms keep their logs and caches (default: a fresh "
+                                                    "temporary directory, removed at the end)")
     a = ap.parse_args()
-    base = json.loads(Path(a.config).read_text())
+    base = json.loads(Path(a.config).read_text(encoding="utf-8"))
     arms = []
     for s in a.arms:
         name, _, kv = s.partition(":")
         arms.append((name, dict(x.split("=", 1) for x in kv.split(",") if x)))
-    work = turns()
+    targets: dict[str, int] = {}
+    additions: list[int] = []
+    if a.workload == "agentic":
+        additions = [int(x) for x in a.additions.replace(" ", "").split(",") if x]
+        if not additions:
+            raise SystemExit("--additions needs at least one size")
+        work = agentic_turns(a.prefix_tokens, additions, a.turns, a.seed)
+        targets = {"agentic.prefix": a.prefix_tokens, **{f"agentic.{i}": additions[i % len(additions)]
+                                                         for i in range(a.turns)}}
+    else:
+        work = turns()
     if a.max_turns:
         work = work[:a.max_turns]
-    out = open(a.log, "a")
+    owned = a.workdir is None
+    home = Path(tempfile.mkdtemp(prefix="agent-turns-")) if owned else Path(a.workdir)
+    home.mkdir(parents=True, exist_ok=True)
+    print(f"{a.workload}: {len(work)} turns, {a.rounds} rounds, arms {', '.join(n for n, _ in arms)}")
+    if a.workload == "agentic":
+        print(f"  prefix target {a.prefix_tokens} tokens, additions {additions} (targets: the report prints the "
+              "measured sizes)")
+    print(f"  workdir {home}" + (" (removed at the end; pass --workdir to keep it)" if owned else ""), flush=True)
+    out = open(a.log, "a", encoding="utf-8")
     res: dict = {n: {} for n, _ in arms}
-    for rnd in range(a.rounds):
-        for name, env in (arms if rnd % 2 == 0 else arms[::-1]):
-            cfg = dict(base)
-            e = dict(env)
-            if "exe" in e:
-                cfg["exe"] = e.pop("exe")
-            if "xargs" in e:
-                cfg["args"] = list(base["args"]) + e.pop("xargs").split(";")
-            cfg["port"] = a.port
-            cfg["log"] = str(Path(tempfile.gettempdir()) / f"agent_turns_{name}_r{rnd}.log")
-            cpath = Path(tempfile.gettempdir()) / f"agent_turns_{name}.json"
-            cpath.write_text(json.dumps(cfg, indent=1))
-            proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config",
-                                     str(cpath), "--port", str(a.port)], cwd=str(ROOT), env=dict(os.environ, **e),
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            try:
-                t0 = time.time()
-                wait_ready(a.port, proc)
-                print(f"round {rnd} {name}: ready in {time.time() - t0:.0f} s", flush=True)
-                for tag, msgs in work:
-                    r = post(a.port, msgs, a.max_new, a.seed)
-                    t = r.get("timings", {})
-                    row = {"round": rnd, "arm": name, "turn": tag, "decode": t.get("predicted_per_second"),
-                           "prompt_n": t.get("prompt_n"), "prompt": t.get("prompt_per_second"),
-                           "n": r.get("usage", {}).get("completion_tokens")}
-                    out.write(json.dumps(row) + "\n")
-                    out.flush()
-                    res[name].setdefault(tag, []).append(row)
-                    print(f"  {tag:16s} decode {row['decode']} tok/s  prompt {row['prompt_n']} tokens", flush=True)
-            finally:
-                proc.terminate()
+    try:
+        for rnd in range(a.rounds):
+            for name, env in (arms if rnd % 2 == 0 else arms[::-1]):
+                cfg = dict(base)
+                e = dict(env)
+                if "exe" in e:
+                    cfg["exe"] = e.pop("exe")
+                if "xargs" in e:
+                    cfg["args"] = list(base.get("args") or []) + [x for x in e.pop("xargs").split(";") if x]
+                cfg = isolated_config(cfg, name, rnd, home, a.port)
+                paths = arm_paths(home, name, rnd)
+                paths["dir"].mkdir(parents=True, exist_ok=True)
+                paths["disk"].mkdir(parents=True, exist_ok=True)
+                cpath = paths["dir"] / "config.json"
+                cpath.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+                proc = start_arm(cpath, a.port, paths["dir"] / "server.log", dict(os.environ, **e), a.engine)
                 try:
-                    proc.wait(60)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                time.sleep(5)
-    first = arms[0][0]
-
-    def per_turn(name: str, tag: str) -> float:
-        v = [x["decode"] for x in res[name].get(tag, []) if x["decode"]]
-        return statistics.mean(v) if v else float("nan")
-
-    print(f"\nper-turn decode ratio to {first} (mean over rounds per turn, then the median over turns):")
-    for name, _ in arms:
-        med = statistics.median([per_turn(name, t) for t, _ in work])
-        if name == first:
-            print(f"  {name:10s} median decode {med:6.1f} tok/s")
-            continue
-        r = [per_turn(name, t) / per_turn(first, t) for t, _ in work]
-        print(f"  {name:10s} median decode {med:6.1f} tok/s   x{statistics.median(r):.3f} (x{min(r):.2f} to "
-              f"x{max(r):.2f}), {sum(x > 1 for x in r)}/{len(r)} turns faster")
+                    t0 = time.time()
+                    wait_ready(a.port, proc)
+                    print(f"round {rnd} {name}: ready in {time.time() - t0:.0f} s", flush=True)
+                    for tag, msgs in work:
+                        t1 = time.perf_counter()
+                        r = post(a.port, msgs, a.max_new, a.seed)
+                        request_ms = round((time.perf_counter() - t1) * 1000, 1)
+                        m = turn_metrics(r.get("timings"), r.get("usage"), request_ms)
+                        row = {"round": rnd, "arm": name, "turn": tag, "workload": a.workload,
+                               "target": targets.get(tag), **m}
+                        out.write(json.dumps(row) + "\n")
+                        out.flush()
+                        res[name].setdefault(tag, []).append(row)
+                        print("  " + turn_line(tag, m), flush=True)
+                finally:
+                    stop_arm(proc)
+                    time.sleep(5)
+    except BaseException:
+        print(f"\nworkdir kept for diagnosis: {home}", flush=True)
+        raise
+    finally:
+        out.close()
+    if owned:
+        shutil.rmtree(home, ignore_errors=True)
+    summarize(arms, work, res, targets)
     return 0
 
 

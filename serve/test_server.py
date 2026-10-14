@@ -2595,6 +2595,31 @@ class PromptProgress(unittest.TestCase):
         self.engine.progress = (self.TOTAL - PP_DONE_TAIL - 1, self.TOTAL)
         self.assertEqual(prompt_progress(self.svc)["processed"], self.TOTAL - PP_DONE_TAIL - 1)
 
+    def test_the_configured_short_read_sets_the_tail(self):
+        # --short-read 640: the batched path stops up to 640 tokens short of the end, so a PP that close says the prompt
+        # is read (the hardcoded 64 let the 640-short line through as progress).  lazy: the args are all it needs.
+        engine = StrataEngine("strata", ["--short-read", "640"], lazy=True)
+        svc = Service(engine, ByteTokenizer(), ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        for short in (640, 639, 1):
+            engine.progress, engine.progress_ms = (self.TOTAL - short, self.TOTAL), 6600.0
+            self.assertIsNone(prompt_progress(svc), f"a PP {short} token(s) short of the end says it is read")
+        engine.progress = (self.TOTAL - 641, self.TOTAL)
+        self.assertEqual(prompt_progress(svc)["processed"], self.TOTAL - 641)
+
+    def test_the_engine_takes_the_last_short_read_and_clamps_it(self):
+        # generate.cpp: o.short_read = max(0, atoll(...)), once per --short-read, so the LAST one wins, a negative is 0
+        # (0 = off) and a value is read up to its first non-digit (atoll: "128junk" is 128).  The tail the server drops
+        # by must be the value the engine reads its prompt with.
+        for args, want in ((["--short-read", "64", "--short-read", "640"], 640),
+                           (["--short-read", "640", "--short-read", "64"], 64),
+                           (["--short-read", "-5"], 0),
+                           (["--short-read", "0"], 0),
+                           (["--short-read", "128junk"], 128),
+                           (["--short-read", "1.5"], 1),
+                           (["--short-read", "abc"], 0),
+                           (["--ctx", "4096"], PP_DONE_TAIL)):
+            self.assertEqual(StrataEngine("strata", args, lazy=True).short_read, want, args)
+
     def test_nothing_before_the_first_chunk(self):
         self.engine.progress = None
         self.assertIsNone(prompt_progress(self.svc), "no PP line yet: there is no rate to show")

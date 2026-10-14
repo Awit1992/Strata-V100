@@ -396,6 +396,21 @@ Repeat the sweep with [`bench/run_v100_prefill.py`](../bench/run_v100_prefill.py
 targets `2048,4096,8192,16384,32768`, `--repeats 3`, `--seed 20261003`,
 `--max-new 1`, and the same cooldown gate before every request.
 
+The same harness measures a chain of agent turns with `--chain`. It reads one prefix prompt. Then it
+sends one turn for each `--chain-diffs` value (default `0,1,32,64,128,256,512,1024,2048`). Each turn
+adds that exact number of tokens. Thus every prompt is a prefix of the next one. The engine's prompt
+cache stays on, and `--chain-cache-every` sets its checkpoint interval (default: a quarter of the
+prefix). A conversation disk store that the config names goes to a private directory under `--out`.
+The harness drops `--expert-profile-save`. The first diff is 0. That turn sends the same prompt again.
+Each row records the requested diff, the tokens the engine reused (`reused`), and the tokens it read
+(`prompt_read`). The engine resumes at most one token short of the prompt, so the two counts differ.
+Do not report the requested diff as a read count. Add an arm's own knobs with `--xargs`, `--env`,
+`--short-read N`, or `--pipeline-windows N`. Every request sends `pin=n-2` by default: the engine
+ignores `pin >= n-1`, so the next turn re-reads the last two tokens instead of the tokens above its
+newest periodic checkpoint. `--no-chain-pin-tail` turns the pin off and shows that gap. Example:
+`python bench/run_v100_prefill.py --chain --arm-label chain-baseline --exe /tmp/engine --out /tmp/chain`.
+Compare two chained runs with `--compare`.
+
 Long-context baseline for comparison (engine 0.1.20, models on the portable SSD, before the fast path):
 | Prompt size | Exact tokens | Prompt time | Prompt speed | Output speed | Expert-cache hit rate | Total request |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -1254,6 +1269,8 @@ print(r.choices[0].message.content)
   `--prefill auto` (8192 tokens), a 42,131 token prompt read in 15 s sent six of them. A prompt shorter than one chunk
   sends nothing, and that is on purpose: its only line arrives once the prompt is read, because the last tokens go
   through the verify windows rather than the batched path, so it stops up to `--short-read` tokens short of the end.
+  The server drops a PP that close to the end, and reads `--short-read` the way the engine does (the last one in the
+  args wins, a negative is 0), so the dropped line follows the configured threshold.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
   Zed's llama.cpp provider reads `/props` and offers tools from `chat_template_caps`. Its generic OpenAI-compatible
   provider does not: add `"capabilities": {"tools": true, "chat_completions": true}` on that model in Zed's settings.
@@ -2257,6 +2274,43 @@ token KL against off: mean 0.006, max 0.026 nats over 22 prompts; about half of 
 read the same either way. `auto` picks the share from wall-clock timings, so the same request can be split
 differently - and answer differently - from one run to the next (a resumed conversation's re-read differed in 31 of
 1,536 teacher-forced argmax tokens, #1684); a fixed share repeats, `0` gives the exact bytes of a run without it.
+
+**Compact CPU activation download.** A sharing layer downloads only the rows its CPU experts read. The layer used to copy its whole activation
+tensor (T x N floats) to the host on the compute stream, before the layer's host sync, whether or not any expert went
+to the CPU. At 2,048 tokens that copy is about 21 MB a layer, and 48 of them queue in front of the sync. The layer now
+collects the token rows its CPU experts read, gathers them on the device and copies the compact result on its own
+stream, beside the expert GEMMs. A layer that sends no expert to the CPU copies nothing. Every buffer of the share is
+now taken for the share the layer has, not for the chunk's worst case. The CPU quantizes the same FP32 row bytes.
+Automatic sharing still depends on timings. Identical model answers are not guaranteed.
+
+**Short-row Volta expert GEMM.** With `STRATA_PF_WMMA=1`, IQ3_XXS, IQ3_S, and IQ2_S gate/up
+and IQ4_NL down use a compact tile when the largest expert in the group has at most 128 rows.
+The tile uses 128-value weight chunks and two 64-row output tiles. IQ3_XXS, IQ3_S, and IQ4_NL
+use 64-value activation chunks and 44,032 bytes of dynamic shared memory. Static shared storage
+adds 1,024, 2,048, and 16 bytes respectively. IQ2_S uses 32-value activation chunks and 39,936
+bytes of dynamic shared memory. Its codebook adds 8,192 bytes. Each total fits the shared-memory
+budget for two blocks on one V100 SM. The short kernels have a 128-register limit per thread.
+Larger groups keep the original 256-row output tile to avoid extra weight decoding. Q2_0 and
+the other quantized formats keep their existing tile selection.
+
+Use `pf_wmma_parity` to check short and wide groups, sparse input-row indices, indirect weights,
+and output guards. Use `pf_wmma_parity --bench` on an idle GPU to measure validated IQ3_XXS,
+IQ3_S, IQ2_S, and IQ4_NL shapes. This mode measures eight launches in a CUDA graph and reports
+the median of seven CUDA-event windows. It excludes request setup, weight transfer, and token generation.
+
+**Early loan refill on split V100s.** Native packs with Volta WMMA format pairs can now use
+the existing early refill path by default. All stages must use Volta GPUs. A layer can use
+IQ3_XXS, IQ3_S, IQ2_S, or IQ4_XS gate/up with IQ4_NL or Q2_0 down. A Q2_0 gate/up and down
+pair is also supported. These pairs can differ between layers. An unsupported pair keeps the
+normal post-run refill path.
+Only a non-last stage can issue its refill early. Its compute streams must have finished a
+batched segment whose next segment returns the loan: either prompt completion or a short-read
+window. Checkpoint cuts before a short header window are eligible. A segment followed by another
+batched segment keeps its scratch loan. Explicit `STRATA_PREFILL_REFILL_OVERLAP=0`, serial refill,
+and blocking refill disable early refill.
+The last stage keeps the normal refill path. The refills copy the same expert-weight bytes.
+The stage also waits for KV-prefix prefetch DMA before it calls the refill hook. This prevents
+refill writes into a staging pool while a KV copy still uses that pool.
 
 Prompt time, medians of 10 interleaved pairs (off / auto, ms, `--expert-cache 1500`):
 

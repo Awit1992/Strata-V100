@@ -79,10 +79,13 @@ Include enough information for someone else to repeat your run:
   experimental speed projection was enabled; attach the resulting settings.
 - **Workload:** benchmark command or script, shareable prompts or instructions to
   build them, actual prompt and generated token counts, output cap, repetitions,
-  and cache state for each run.
+  and cache state for each run. For a per-turn agentic run, give the measured new
+  and reused token counts of each turn.
 
 Use GB or GiB consistently and name the unit. Mark unavailable values explicitly
-instead of guessing. Remove credentials and private content from configurations,
+instead of guessing. Write the report in ASD-STE100 Simplified Technical English:
+short sentences, one instruction or fact in each, active voice, and one term for
+one thing throughout. Remove credentials and private content from configurations,
 prompts, and logs before publishing them.
 
 ## How to measure
@@ -125,6 +128,75 @@ When comparing versions or settings, run both on the same machine and workload
 and list every changed setting. Preserve the per-run results: output text and
 draft acceptance can change speed even when the input is identical.
 
+## Agentic short turns
+
+A coding agent does not send one long prompt. It sends a long shared prefix
+once, and then many short turns. Each turn adds one assistant message and one
+tool result of some tens or hundreds of tokens. In the workload below, most of
+the prompt is already in the conversation cache, so the new tokens of a turn are
+small. A cost per request that does not depend on those tokens then shows up as a
+large `prompt_per_token_ms`. Measure it on your machine; do not assume it.
+
+Measure this shape with [`tools/agent_turns_bench.py`](../tools/agent_turns_bench.py).
+The example below compares the installed engine with a candidate that adds two
+engine options. It is an example only. It is not measured here, and it is not a
+recommendation.
+
+```bash
+python tools/agent_turns_bench.py strata-<model>.json 'base:' 'candidate:xargs=--pipeline-windows;1;--short-read;128' --workload agentic --rounds 2
+```
+
+The same tool runs without a GPU or a model, against the server's mock engine.
+Use this form to check the harness itself:
+
+```bash
+python tools/agent_turns_bench.py strata-<model>.json 'base:' 'candidate:' --engine mock --workload agentic --prefix-tokens 256 --turns 4 --max-new 8 --rounds 1
+```
+
+The tool starts one server per arm, sends the same turns to every arm, and
+reports the numbers the server itself gives in `timings`:
+
+- **New tokens:** `prompt_n`, the tokens the engine read for this turn.
+- **Reused tokens:** `cache_n`, the tokens the conversation cache already held.
+  Report these as a share of the prompt.
+- **Prefill latency:** `prompt_ms`, and `prompt_per_token_ms`, the time per new
+  token. A large `prompt_per_token_ms` on a short turn is a cost that does not
+  scale with the new tokens.
+- **Decode:** `predicted_per_second` and `predicted_ms`.
+- **The whole call:** the tool's own `request_ms`, from a wall clock around the
+  request. Parking or restoring a conversation, and the setup around the engine,
+  are inside it. The engine's own time (`prefill_ms` plus `predicted_ms`) is not
+  the whole cost of a turn.
+
+The tool lists a cold turn (a session's first: the whole prompt is new) on its
+own, and keeps it out of the medians of the short turns. One long cold read is
+not the per-turn cost of an agent at work.
+
+The tool also gives the factor of each other arm against the first arm, per
+turn. A factor above 1 is better. For the prefill latency the factor is the
+first arm's milliseconds divided by the arm's milliseconds. For the decode rate
+the factor is the arm's tokens per second divided by the first arm's.
+
+`--prefix-tokens` and `--additions` are requested sizes. They are not
+measurements. The tool builds the text from common English words, so one word is
+about one token. A turn also adds the assistant's line and the tool-call
+envelope: about 55 tokens with the tool set and chat template of this tool.
+Report the measured `added`, `prompt_n` and `prompt_tokens` values. Never report a
+requested size as a measured value.
+
+If two arms read a different number of new tokens on a turn, the arms did
+different work. Do not compare them on that turn.
+
+Give each arm its own conversation-cache disk directory. The disk store survives
+a restart, so a shared directory lets one arm restore the parked conversation of
+another arm. The tool does this itself. It also binds the server to 127.0.0.1,
+removes the API key from the generated config, and stops the server and its
+engine after every arm.
+
+Export the settings of your live service before a measured run. Every arm
+inherits the environment of the tool. An arm that misses one setting measures
+another configuration.
+
 ## Optional correctness checks
 
 Speed measurements alone do not establish answer quality. Include a small check
@@ -157,6 +229,10 @@ successes. A needle test measures recall on those inputs, not overall model qual
 4. Open a pull request against `Niko1221/Strata:main`. Summarize the hardware,
    model, configurations tested, and limitations. Keep a results-only submission
    separate from engine changes so reviewers can assess the measurements directly.
+5. Write the report in ASD-STE100 Simplified Technical English. Use short
+   sentences, one instruction or fact in each. Use the active voice. Use one term
+   for one thing throughout the report. Keep the terms of the engine (`prompt_n`,
+   `cache_n`, `prompt_ms`) exactly as the engine prints them.
 
 Maintainers can review the report and decide where to include it. Adding a report
 does not require changing the README's headline performance claims. For a failed

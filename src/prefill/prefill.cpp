@@ -855,6 +855,20 @@ struct Prefill::Impl {
     std::vector<uint8_t> cpu_nact;
     std::vector<kernels::cpu::ActQ> cpu_actq;   // a Q2_0 layer's activations (the pool's Q2_0 kernels read ActQ)
     std::vector<kernels::cpu::ExpertJobMulti> cpu_jobs;
+    // set_cpu_pool: the CPU's activation rows are deduplicated and gathered device-side, so only the rows the
+    // CPU's experts read cross the link.  Every buffer is taken for the share the layer actually has (`cpu_cap`
+    // rows, below), not for the chunk.  `cpu_gdev` is the gather destination and `cpu_gidx` its source tokens
+    // (`cpu_gdev_n` floats / `cpu_gidx_n` entries); `cpu_gather` and `cpu_pos` stage the compact order on the host
+    // (`cpu_pos[t]` = token t's compact row, or -1) and `cpu_need` is both the token mask and the compact rows'
+    // ActRows mask.  `cpu_xs` is the download's own stream - the layer's GEMMs must not queue behind it - and
+    // `cpu_x_ev` publishes its completion to the CPU thread.
+    float* cpu_gdev = nullptr;
+    int32_t* cpu_gidx = nullptr;
+    size_t cpu_gdev_n = 0, cpu_gidx_n = 0;
+    std::vector<int32_t> cpu_gather, cpu_pos;
+    std::vector<char> cpu_need;
+    cudaStream_t cpu_xs = nullptr;
+    cudaEvent_t cpu_x_ev = nullptr;
     // the measured share: running means of the CPU's ms per expert and the GPU's per streamed expert, and the share
     // they balance at (cpu_share_env)
     double cpu_c_ms = 0, cpu_g_ms = 0, cpu_share_now = 0.5;
@@ -969,6 +983,7 @@ void Prefill::release() {
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
+    if (impl_->cpu_xs) cudaStreamSynchronize(impl_->cpu_xs);
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -982,6 +997,10 @@ void Prefill::release() {
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
+    if (impl_->cpu_xs) cudaStreamDestroy(impl_->cpu_xs);
+    if (impl_->cpu_x_ev) cudaEventDestroy(impl_->cpu_x_ev);
+    if (impl_->cpu_gdev) cudaFree(impl_->cpu_gdev);
+    if (impl_->cpu_gidx) cudaFree(impl_->cpu_gidx);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     impl_->steps_up.release();
     impl_->tok_up.release();
@@ -1023,7 +1042,7 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 // is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
 // gate/up and down matrices a group buffer slot holds.  STRATA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
 constexpr int MMQ_GROUP = 16;              // experts per MMQ launch (the gather is per expert, as blobs arrive)
-static_assert(MMQ_GROUP <= kExpertPtrTableMax, "the indirect WMMA weight table covers one MMQ group");
+static_assert(MMQ_GROUP <= strata::kernels::kGroupedWeightTableMax, "the indirect WMMA weight table covers one MMQ group");
 constexpr int GROUPS = MMQ_GROUP;          // the compact tensor-core walk's group size (the same 16-expert launch)
 // MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
@@ -1175,7 +1194,9 @@ MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused, bool compact) {
         }
         if (wmma_buffers()) {
             static_assert(D >= K * 640);
-            return {T * K * 1280, 0, 0, 2 * MMQ_GROUP * sizeof(void*)};
+            // The indirect weight table travels as a by-value kernel argument now, so no Hq buffer is sized for
+            // this path; `take`'s 256-byte minimum still hands out the slot every buffer takes.
+            return {T * K * 1280, 0, 0, 0};
         }
         return {(mmq_plan().any ? T * K : T) * 1280, T * K * 640,
                 mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), 640)};
@@ -3322,20 +3343,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                  "(RAM is short); the GPU streams every expert\n", what);
                         };
                         if (cpu_maybe) {
-                            const size_t want = (size_t) T * N;
-                            if (m.cpu_x_n < want) {
-                                if (m.cpu_x) cudaFreeHost(m.cpu_x);
-                                m.cpu_x = nullptr;
-                                m.cpu_x_n = 0;
-                                if (cudaHostAlloc((void**) &m.cpu_x, want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-                                    (void) cudaGetLastError();
-                                    m.cpu_x = nullptr;
-                                    cpu_share_off("the activation buffer");
-                                } else {
-                                    m.cpu_x_n = want;
-                                }
+                            // The download's own stream and its event, once: the CPU's activations then travel
+                            // beside this layer's GEMMs instead of in front of the sync below.  The buffers
+                            // themselves are taken below, once the share is known.
+                            if (cpu_maybe && !m.cpu_xs &&
+                                cudaStreamCreateWithFlags(&m.cpu_xs, cudaStreamNonBlocking) != cudaSuccess) {
+                                (void) cudaGetLastError();
+                                m.cpu_xs = nullptr;
+                                cpu_share_off("the activation stream");
                             }
-                            if (cpu_maybe) cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
+                            if (cpu_maybe && !m.cpu_x_ev &&
+                                cudaEventCreateWithFlags(&m.cpu_x_ev, cudaEventDisableTiming) != cudaSuccess) {
+                                (void) cudaGetLastError();
+                                cpu_share_off("the activation event");
+                            }
                         }
                         // #579: a stall here is the GPU (this layer's attention and router, or the previous layer's
                         // work), not the host: the watchdog's report says so (only its text changes)
@@ -3343,21 +3364,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           l, p0);
                         cudaStreamSynchronize(m.cs);
                         core::progress_at("reading the prompt (batched): layer", l, p0);
-                        if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
-                            const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
-                            if (m.cpu_rows_n < cap) {
-                                if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
-                                m.cpu_rows = nullptr;
-                                m.cpu_rows_n = 0;
-                                if (cudaHostAlloc((void**) &m.cpu_rows, cap * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-                                    (void) cudaGetLastError();
-                                    m.cpu_rows = nullptr;
-                                    cpu_share_off("the rows buffer");
-                                } else {
-                                    m.cpu_rows_n = cap;
-                                }
-                            }
-                        }
                         if (m.cpu_pend) {   // the measured share: the last CPU-sharing layer's GPU time is final now
                             m.cpu_pend = false;
                             float g_ms = 0;
@@ -3425,6 +3431,74 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 cpu_blob[(size_t) e] = b;
                                 rows_cpu += cand[i].first;
                                 ++n_cpu;
+                            }
+                        }
+                        // set_cpu_pool: the share's buffers, now that the share is known.  `cpu_cap` is the most
+                        // activation rows the CPU's experts can read: one per routed pair they take, and never
+                        // more than the chunk's tokens.  The rows buffer holds the pool's output.  A buffer that
+                        // cannot be had still ends the share - the GPU takes every expert - and the selection is
+                        // undone here, before the row layout below reads it.
+                        size_t cpu_cap = 0;
+                        if (rows_cpu > 0) {
+                            cpu_cap = (size_t) std::min<int64_t>(T, rows_cpu);
+                            const size_t rows_want = (size_t) rows_cpu * 2 * N;   // headroom: few reallocations
+                            const size_t act_want = cpu_cap * N;
+                            auto buf_off = [&](const char* what) {
+                                cpu_share_off(what);
+                                on_cpu.clear();
+                                cpu_blob.clear();
+                                rows_cpu = 0;
+                                n_cpu = 0;
+                                cpu_cap = 0;
+                            };
+                            // the last layer's gather and download are done (its thread was joined): its buffers
+                            // may be given back before this layer's are taken
+                            if ((m.cpu_rows_n < rows_want || m.cpu_x_n < act_want || m.cpu_gdev_n < act_want ||
+                                 m.cpu_gidx_n < cpu_cap) && m.cpu_xs)
+                                cudaStreamSynchronize(m.cpu_xs);
+                            if (m.cpu_rows_n < rows_want) {
+                                if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
+                                m.cpu_rows = nullptr;
+                                m.cpu_rows_n = 0;
+                                if (cudaHostAlloc((void**) &m.cpu_rows, rows_want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                                    (void) cudaGetLastError();
+                                    buf_off("the rows buffer");
+                                } else {
+                                    m.cpu_rows_n = rows_want;
+                                }
+                            }
+                            if (rows_cpu > 0 && m.cpu_x_n < act_want) {
+                                if (m.cpu_x) cudaFreeHost(m.cpu_x);
+                                m.cpu_x = nullptr;
+                                m.cpu_x_n = 0;
+                                if (cudaHostAlloc((void**) &m.cpu_x, act_want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                                    (void) cudaGetLastError();
+                                    buf_off("the activation buffer");
+                                } else {
+                                    m.cpu_x_n = act_want;
+                                }
+                            }
+                            if (rows_cpu > 0 && m.cpu_gdev_n < act_want) {
+                                if (m.cpu_gdev) cudaFree(m.cpu_gdev);
+                                m.cpu_gdev = nullptr;
+                                m.cpu_gdev_n = 0;
+                                if (cudaMalloc((void**) &m.cpu_gdev, act_want * sizeof(float)) != cudaSuccess) {
+                                    (void) cudaGetLastError();
+                                    buf_off("the gather buffer");
+                                } else {
+                                    m.cpu_gdev_n = act_want;
+                                }
+                            }
+                            if (rows_cpu > 0 && m.cpu_gidx_n < cpu_cap) {
+                                if (m.cpu_gidx) cudaFree(m.cpu_gidx);
+                                m.cpu_gidx = nullptr;
+                                m.cpu_gidx_n = 0;
+                                if (cudaMalloc((void**) &m.cpu_gidx, cpu_cap * sizeof(int32_t)) != cudaSuccess) {
+                                    (void) cudaGetLastError();
+                                    buf_off("the token index buffer");
+                                } else {
+                                    m.cpu_gidx_n = cpu_cap;
+                                }
                             }
                         }
                         // multi-GPU: the rows of the experts the peer computes go last, as one block [rows_local, T*K)
@@ -3506,44 +3580,66 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         n_order = order.size();
                         }
 
+                        // set_cpu_pool: the CPU experts' activation rows.  Only the rows those experts read cross
+                        // the link: they are deduplicated into a compact order, gathered device-side into the
+                        // buffers the share sized above, and downloaded on their own stream.  The whole T x N
+                        // tensor used to be copied on the compute stream, before the sync above, whether or not
+                        // any expert qualified.  `cpu_pos` maps a token to its compact row, so the pool quantizes
+                        // the same row bytes into the same destinations the sparse feed did.  n_need <= cpu_cap:
+                        // each row it counts is one token, and a token the CPU's experts read needs at least one
+                        // of the routed pairs the selection counted in rows_cpu.
+                        int64_t n_need = 0;
+                        if (rows_cpu > 0) {
+                            if (m.cpu_need.size() < (size_t) T) m.cpu_need.resize((size_t) T);
+                            if (m.cpu_pos.size() < (size_t) T) m.cpu_pos.resize((size_t) T);
+                            if (m.cpu_gather.size() < cpu_cap) m.cpu_gather.resize(cpu_cap);
+                            std::memset(m.cpu_need.data(), 0, (size_t) T);
+                            for (int32_t e = 0; e < m.g->n_expert; ++e)
+                                if (on_cpu[(size_t) e])
+                                    for (int32_t r = 0; r < m.cnt[(size_t) e]; ++r)
+                                        m.cpu_need[(size_t) src_h[(size_t) m.off[(size_t) e] + (size_t) r]] = 1;
+                            for (int64_t t = 0; t < T; ++t)   // ascending: the compact rows keep the tokens' order
+                                if (m.cpu_need[(size_t) t]) {
+                                    m.cpu_pos[(size_t) t] = (int32_t) n_need;
+                                    m.cpu_gather[(size_t) n_need] = (int32_t) t;
+                                    m.cpu_need[(size_t) n_need++] = 1;   // ... and their ActRows mask is all ones
+                                } else {
+                                    m.cpu_pos[(size_t) t] = -1;
+                                }
+                            cudaMemcpyAsync(m.cpu_gidx, m.cpu_gather.data(), (size_t) n_need * sizeof(int32_t),
+                                            cudaMemcpyHostToDevice, m.cpu_xs);
+                            strata::kernels::gather_rows(reinterpret_cast<const uint8_t*>(m.mixed), (int64_t) N * 4,
+                                                         m.cpu_gidx, n_need,
+                                                         reinterpret_cast<uint8_t*>(m.cpu_gdev), m.cpu_xs);
+                            cudaMemcpyAsync(m.cpu_x, m.cpu_gdev, (size_t) n_need * N * sizeof(float),
+                                            cudaMemcpyDeviceToHost, m.cpu_xs);
+                            cudaEventRecord(m.cpu_x_ev, m.cpu_xs);
+                        }
                         // set_cpu_pool: the CPU's experts on a thread while this one streams and runs the GPU's; their
                         // unweighted rows land in Dm's row order, so the combine weights them as any other row
                         if (rows_cpu > 0) {
-                            const size_t want = (size_t) rows_cpu * N;
-                            if (m.cpu_rows_n < want) {
-                                if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
-                                m.cpu_rows = nullptr;
-                                m.cpu_rows_n = 0;
-                                const size_t cap_rows = (size_t) rows_cpu * 2;   // headroom: few reallocations
-                                if (cudaHostAlloc((void**) &m.cpu_rows, cap_rows * N * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
-                                    err = "prefill: cannot allocate the CPU experts' rows";
-                                    return false;
-                                }
-                                m.cpu_rows_n = cap_rows * N;
-                            }
                             const int64_t r0c = T * K - rows_cpu;
                             const strata::kernels::cpu::NativeFmt& cf = lay.fmt[(size_t) l];
                             if (cpu_share_env() < 0.0) {
                                 if (m.cpu_ev[0] == nullptr) { cudaEventCreate(&m.cpu_ev[0]); cudaEventCreate(&m.cpu_ev[1]); }
                                 cudaEventRecord(m.cpu_ev[0], m.cs);
                             }
-                            cpu_fut = std::async(std::launch::async, [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, src_h, l, T, r0c, this]() -> bool {
+                            cpu_fut = std::async(std::launch::async, [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, src_h, l, T, n_need, r0c, this]() -> bool {
                                 // A new thread inherits the GPU driver's single-core pin. Restore the pool's original
                                 // allowed CPUs, so the CPU's experts are computed on every core the pool may use.
                                 strata::kernels::cpu::restore_thread_affinity(cpu_pool_->submission_affinity());
+                                // the compact rows: gathered and downloaded on their own stream.  The timer below
+                                // starts after that wait, so the measured CPU cost stays the pool's own work.
+                                if (cudaEventSynchronize(m.cpu_x_ev) != cudaSuccess) return false;
                                 const auto t0 = std::chrono::steady_clock::now();
                                 constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
                                 // a Q2_0 layer (gate/up on the pool's Q2_0 kernels): ActQ activations, as decode's
                                 const bool q2 = strata::kernels::cpu::q2_native_kernels(cf.gu_type);
-                                if (q2 && m.cpu_actq.size() < (size_t) T) m.cpu_actq.resize((size_t) T);
-                                if (!q2 && m.cpu_nact.size() < (size_t) T * AB) m.cpu_nact.resize((size_t) T * AB);
-                                std::vector<char> need((size_t) T, 0);
-                                for (int32_t e = 0; e < m.g->n_expert; ++e)   // the tokens the CPU's experts read
-                                    if (on_cpu[(size_t) e])
-                                        for (int32_t r = 0; r < m.cnt[(size_t) e]; ++r)
-                                            need[(size_t) src_h[(size_t) m.off[(size_t) e] + (size_t) r]] = 1;
+                                if (q2 && m.cpu_actq.size() < (size_t) n_need) m.cpu_actq.resize((size_t) n_need);
+                                if (!q2 && m.cpu_nact.size() < (size_t) n_need * AB) m.cpu_nact.resize((size_t) n_need * AB);
+                                // every row of the compact buffer is one the CPU's experts read (cpu_need is all ones)
                                 const strata::kernels::cpu::ExpertPool::ActRows act_rows{
-                                    m.cpu_x, need.data(), T, (int) N,
+                                    m.cpu_x, m.cpu_need.data(), n_need, (int) N,
                                     q2 ? m.cpu_actq.data() : nullptr, q2 ? nullptr : m.cpu_nact.data()};
                                 cpu_pool_->quant_act_rows(cf, act_rows);
                                 m.cpu_jobs.clear();
@@ -3554,8 +3650,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     j.nt = m.cnt[(size_t) e];
                                     for (int r = 0; r < j.nt; ++r) {
                                         const int64_t p = (int64_t) m.off[(size_t) e] + r;
-                                        if (q2) j.act[r] = &m.cpu_actq[(size_t) src_h[(size_t) p]];
-                                        else j.nact[r] = m.cpu_nact.data() + (size_t) src_h[(size_t) p] * AB;
+                                        const size_t c = (size_t) m.cpu_pos[(size_t) src_h[(size_t) p]];
+                                        if (q2) j.act[r] = &m.cpu_actq[c];
+                                        else j.nact[r] = m.cpu_nact.data() + c * AB;
                                         j.out[r] = m.cpu_rows + (size_t) (p - r0c) * N;
                                     }
                                     m.cpu_jobs.push_back(j);
@@ -3934,8 +4031,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // lie (a ring blob, a resident cache slot) instead of gathering the group into
                         // grp_gu/grp_d first.  `down_off == mmq_gub` says the blob's gate|up matrices are one
                         // contiguous run - exactly what the gate/up launch reads from one pointer - else the
-                        // gather stays.  The table's pointers go in m.Hq's first and second 16 (dead on this
-                        // path): no buffer is allocated for them.
+                        // gather stays.  The group's pointers travel to the two launches by value.
                         //   The streamed walk needs group_gather - the flush is what holds a group's blobs to
                         // its last entry - and a ring that covers a group.  The non-streamed walk holds a whole
                         // group in its staging ring until the down projection, so it needs m.ring >=
@@ -4043,24 +4139,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     auto* h_out = reinterpret_cast<uint16_t*>(m.H);
                                     const void* w_gu = m.grp_gu;
                                     const void* w_dn = m.grp_d;
+                                    // the group's weights where they lie.  The streamed walk's entries no flush
+                                    // reached are still ring blobs whose copies must have landed (issued in
+                                    // order: the last covers the rest); the non-streamed walk's caller already
+                                    // waited for every expert's copy.  The pointers travel to both launches by
+                                    // value, so no device table and no extra launch.
+                                    strata::kernels::GroupedWeightTable tbl{};
                                     if (indirect_w) {
-                                        // the group's weights where they lie: the table in m.Hq's two halves.  The
-                                        // streamed walk's entries no flush reached are still ring blobs whose copies
-                                        // must have landed (issued in order: the last covers the rest); the
-                                        // non-streamed walk's caller already waited for every expert's copy.
                                         if (gg_nslots > 0) {
                                             pt.mark(kPfWaitCopy, cs);
                                             cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
                                         }
-                                        auto* tbl = reinterpret_cast<const void**>(m.Hq);
-                                        expert_ptr_table(gu_ptr, dn_ptr, ngx, tbl, tbl + MMQ_GROUP, m.cs);
-                                        w_gu = tbl;
-                                        w_dn = tbl + MMQ_GROUP;
+                                        tbl.n = ngx;
+                                        for (int i = 0; i < ngx; ++i) { tbl.gu[i] = gu_ptr[i]; tbl.dn[i] = dn_ptr[i]; }
                                     }
                                     pt.mark(kPfGemmGU, cs);
+                                    const strata::kernels::GroupedWeightTable* wt = indirect_w ? &tbl : nullptr;
                                     if (!strata::kernels::gemm_iq_f16_grouped(mmq_gt, w_gu, mmq_gub, 1280, N,
                                             m.mixed_h, N, m.bounds_dev + j0, ngx, (int) maxr, m.GU, 1280, m.cs,
-                                            m.src_dev, indirect_w)) {
+                                            m.src_dev, wt, false)) {
                                         err = "prefill: grouped WMMA gate/up rejected a covered shape";
                                         return false;
                                     }
@@ -4068,7 +4165,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     pt.mark(kPfGemmD, cs);
                                     if (!strata::kernels::gemm_iq_f16_grouped(mmq_dt, w_dn, mmq_db, N, 640,
                                             h + r0 * 640, 640, m.bounds_dev + n + 1 + g * (GROUPS + 1),
-                                            ngx, (int) maxr, m.Dm + r0 * N, N, m.cs, nullptr, indirect_w)) {
+                                            ngx, (int) maxr, m.Dm + r0 * N, N, m.cs, nullptr, wt, true)) {
                                         err = "prefill: grouped WMMA down rejected a covered shape";
                                         return false;
                                     }
@@ -4297,7 +4394,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail
                         if (cpu_share_env() < 0.0) cudaEventRecord(m.cpu_ev[1], m.cs);   // after the GPU's expert work
-                        if (!cpu_fut.get()) { err = "prefill: a CPU expert has no blob"; return false; }
+                        if (!cpu_fut.get()) { err = "prefill: the CPU experts' activation download failed"; return false; }
                         if (cpu_share_env() < 0.0 && n_stream > n_cpu) {
                             m.cpu_pend = true;
                             m.pend_cpu_ms = cpu_ms;
@@ -4529,16 +4626,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         err = std::string("prefill: expert copy stream: ") + cudaGetErrorString(cst);
         return false;
     }
-    // STRATA_PREFILL_REFILL_OVERLAP: a layer split's non-last stage has read every chunk, joined its chunk-scoped
-    // stager and issuer, read its final residual and synchronized BOTH streams, so nothing of this stage touches
-    // the cache slots it lent the prompt path again - and no copy is in flight into them (`m.copy` is what streams
-    // experts into the borrowed ring, which is carved from the same lent slots).  The loan's refill can be queued
-    // NOW, before waiting for the next stage's last chunk, instead of after the wait.  The hook is told the
-    // position this run reached so the caller can require it to be the request's final one: an earlier checkpoint
-    // segment must not refill a loan its own later chunks still read. run() drains every downstream future
-    // before returning, including after a hook failure. run_impl() leaves the tail in flight so the direct
-    // successor can accept the next chunk without waiting for every later stage.
-    if (on_stage_complete && !on_stage_complete(pos0 + n, err)) return false;
     if (kv_prefetch) {
         if (const cudaError_t cst = cudaStreamSynchronize(m.kv_copy); cst != cudaSuccess) {
             err = std::string("prefill: KV prefetch stream: ") + cudaGetErrorString(cst);
@@ -4547,6 +4634,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata KV prefetch: %lld layer prefixes, single existing staging pool\n",
                      (long long) kv_prefetches);
     }
+    // STRATA_PREFILL_REFILL_OVERLAP: a layer split's non-last stage has read every chunk, joined its chunk-scoped
+    // stager and issuer, read its final residual and synchronized the compute, expert-copy and KV-prefetch
+    // streams. Nothing of this stage touches the lent cache slots again, including DMA into the expert ring
+    // or KV staging pool carved from them. The loan's refill can be queued
+    // NOW, before waiting for the next stage's last chunk, instead of after the wait.  The hook is told the
+    // position this run reached so the caller can require it to be the request's final one: an earlier checkpoint
+    // segment must not refill a loan its own later chunks still read. run() drains every downstream future
+    // before returning, including after a hook failure. run_impl() leaves the tail in flight so the direct
+    // successor can accept the next chunk without waiting for every later stage.
+    if (on_stage_complete && !on_stage_complete(pos0 + n, err)) return false;
     stats_.ms_total += ms_since(t_start);
     if (pt.on) {
         pt.fold();

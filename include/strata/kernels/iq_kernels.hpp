@@ -80,18 +80,30 @@ void native_grouped_set_v1(bool v1);
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down).
 void native_expert_set_mode(int mode, int phase);
 
+/// The grouped WMMA launch's indirect weights: expert e's gate/up matrix at `gu[e]` and its down matrix at
+/// `dn[e]` (device pointers, in the group's order), for e < n.  The caller fills it and passes it by value, so
+/// the launch itself copies it: nothing on the host has to outlive the asynchronous launch (an async memcpy of
+/// a host array would).  Entries past `n` are never read - the launch's expert count bounds its grid.
+constexpr int kGroupedWeightTableMax = 16;   ///< the most experts one grouped launch covers
+struct GroupedWeightTable {
+    const void* gu[kGroupedWeightTableMax];
+    const void* dn[kGroupedWeightTableMax];
+    int n;
+};
 /// The Volta prompt experts (STRATA_PF_WMMA): Y[r] = X[ids ? ids[r] : r] . W_e^T for a group of experts, expert e's
-/// matrix at W + e * expert_bytes (n_out rows of K values of type ty, GGUF blocks) or, with `indirect_weights`, at
-/// W[e] where W is a device array of per-expert pointers (a caller's gathered blobs in the group's order, with
-/// expert_bytes unused); the activations FP16 with row stride ldx.  Output rows bounds[e] .. bounds[e+1] (row stride
+/// matrix at W + e * expert_bytes (n_out rows of K values of type ty, GGUF blocks) or, with `indirect`, at
+/// indirect->gu[e] / indirect->dn[e] (`down` picks the down matrix; W and expert_bytes are then unused).  The
+/// activations FP16 with row stride ldx.  Output rows bounds[e] .. bounds[e+1] (row stride
 /// ldy, FP32); the bounds are in Y's own row space (absolute for a full output buffer, group-relative for a view
 /// offset to the group's first row).  `ids` (may be null) gathers each output row's input row, so a caller reads an
-/// ungathered activation buffer without copying it.  FP16 tensor cores with FP32 sums.  The row-chunk factor is
-/// fixed at WG_MT = 4 (256 rows per block) for the gate/up projections and 2 for the Q2_0 down projection;
-/// there is no environment knob for it.  false: not launched (shape, type or device not covered).  CUDA sm_70+ only.
+/// ungathered activation buffer without copying it.  FP16 tensor cores with FP32 sums.  Q2_0 blocks cover up
+/// to 128 rows. IQ3_XXS, IQ3_S, IQ2_S and IQ4_NL use 128-row blocks when max_rows <= 128,
+/// and 256-row blocks otherwise. Other types use 256-row blocks.
+/// false: not launched (shape, type or device not covered). CUDA sm_70+ only.
 bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, int K, const void* X, int ldx,
                          const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream,
-                         const int32_t* ids = nullptr, bool indirect_weights = false);
+                         const int32_t* ids = nullptr, const GroupedWeightTable* indirect = nullptr,
+                         bool down = false);
 /// `iq_mmvq` and `native_expert_grouped` decode each weight part once and apply it to every column / entry;
 /// true selects the older kernels that decode it again per column (STRATA_OLD_IQ_MMVQ=1 at startup).  Both give
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.
