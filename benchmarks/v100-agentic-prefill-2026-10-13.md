@@ -147,8 +147,8 @@ python bench/run_v100_prefill.py --config "$CONFIG" --exe "$ENGINE" \
 
 The original cold results used the unchanged legacy harness. The updated cold mode uses the same request construction, but corrects effective-option reporting. Do not include diagnostic timing in scored runs. For the fixed-share correctness smoke, use share 0.25, one chain round, and `--max-new 1`.
 
-## Public evidence and service restoration
+## Local evidence and service restoration
 
-The [public result directory](../bench/results/2026-10-13-agentic-prefill/) contains sanitized cold, chained, fixed-share, and HTTP measurements. The provenance file records the environment and binary hashes. Machine-local paths are replaced with reproducibility labels. Engine and protocol logs remain private.
+Cold, chained, fixed-share, and HTTP measurements remain local, with the environment and binary hashes. Raw benchmark JSON is not tracked in this repository. This report retains the measured summaries and reproduction commands. Engine and protocol logs remain private.
 
 After testing, the original service was started with its unchanged engine and settings. Health reported `loaded: true`. An authenticated chat request returned `READY` with finish reason `stop`. The installed engine hash still matched the baseline. The restoration safety timer was stopped after the health and chat checks.

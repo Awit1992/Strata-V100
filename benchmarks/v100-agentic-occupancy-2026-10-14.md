@@ -19,7 +19,7 @@ The pack name is not a complete description of its expert formats. The pack meta
 
 Down projections use IQ4_NL in 39 layers and Q2_0 in nine layers. With the tested split at layer 16, GPU 0 has four IQ3_XXS gate/up layers and twelve IQ2_S layers. It has no IQ3_S gate/up layer. An IQ3_S-only optimization therefore misses all gate/up work on GPU 0.
 
-The [format evidence](../bench/results/2026-10-14-agentic-occupancy/actual-format-layout.json) records the per-layer layout without private model paths.
+The per-layer format measurements remain local. Raw benchmark JSON is not tracked in this repository.
 
 ## Short-row kernels
 
@@ -53,7 +53,7 @@ The ABBA sequence ran the first-pass kernel library, the final library twice, an
 | IQ2_S gate/up | 1.3225 | 0.9655 | 26.99% |
 | IQ4_NL down | 0.6080 | 0.5520 | 9.21% |
 
-These shapes use 64 experts. They are kernel measurements, not whole-model gains. The 256-row shapes use the original kernels. One final IQ3_S wide sample was 5.3 percent slower; its second sample was close to baseline. The other wide shapes stayed within 0.3 percent. See [all samples](../bench/results/2026-10-14-agentic-occupancy/micro-final-abba.json).
+These shapes use 64 experts. They are kernel measurements, not whole-model gains. The 256-row shapes use the original kernels. One final IQ3_S wide sample was 5.3 percent slower; its second sample was close to baseline. The other wide shapes stayed within 0.3 percent.
 
 ## Complete-output correctness control
 
@@ -80,7 +80,7 @@ Boundary-pinned chains measure exact prompt differences. Their final one-token w
 
 The initial HTTP trial had one arm with unusually repetitive output, complete expert-cache hits, and complete acceptance of suffix drafts. Its large apparent gain is not evidence of a kernel improvement. The final HTTP comparison disables route-tail skipping equally for all arms and retains private responses for diagnostic checks. Response text, private engine logs, and credentials must not be published.
 
-Intermediate IQ3_S-only results are retained as controls. They must not be labeled as results from the final mixed-format binary. The [public evidence directory](../bench/results/2026-10-14-agentic-occupancy/) separates result labels and records binary provenance.
+Intermediate IQ3_S-only results remain local as controls. They must not be labeled as results from the final mixed-format binary. Raw measurement files are excluded from the pull request.
 
 ## Final agent API comparison
 
@@ -107,7 +107,7 @@ Across the fourteen short turns, the median reduction in each turn's median pref
 | 1,081 | 2,946.0 | 2,742.9 | 6.89% |
 | 2,113 | 3,839.1 | 3,357.2 | 12.55% |
 
-Each row is the median of four corresponding requests. The last two large turns are slightly above 2K because the chat template adds tokens. Thirteen of fourteen short turns improved. The 65-token turn did not improve. See [per-turn prefill, HTTP, and decode results](../bench/results/2026-10-14-agentic-occupancy/http-final-summary.json).
+Each row is the median of four corresponding requests. The last two large turns are slightly above 2K because the chat template adds tokens. Thirteen of fourteen short turns improved. The 65-token turn did not improve.
 
 Overall HTTP decode medians were 66.40 tokens per second for the installed engine, 66.95 for the first pass, and 66.10 for the final engine. Individual decode buckets varied; the 1,089-token turn was slower. Generated sequences are not identical under automatic sharing. The total-request measurements include this cost rather than hiding it.
 
@@ -151,15 +151,15 @@ The final engine completed 16K and 32K requests with early refill enabled by def
 
 This smoke used int8 KV, 32,768 resident cells, a 524,288-cell maximum context, disabled KV growth, enabled KV prefetch, disabled prompt cache, and disabled short-read segmentation. The engine reported streamed KV and borrowed expert-cache space on both GPUs. Trace output recorded nonzero prefetch counts, early refill before batched-read completion, and zero cache slots left lent after refill.
 
-This exercises the moved copy fence with the default mixed-format guard. It is not a scored speed benchmark: there was one request per size and trace was enabled. See [the selected diagnostic lines](../bench/results/2026-10-14-agentic-occupancy/streamed-kv-evidence.json).
+This exercises the moved copy fence with the default mixed-format guard. It is not a scored speed benchmark: there was one request per size and trace was enabled. Diagnostic logs remain local.
 
 ## Provenance and restored service
 
-The experiment used two 16-GiB V100 GPUs, CUDA 12.8, SM70, the split at layer 16, and the same private model configuration. The public [provenance file](../bench/results/2026-10-14-agentic-occupancy/final-provenance.json) records binary hashes, final source hashes, and environment controls. Build checkout commit fields describe the collection context; they do not identify all final source changes.
+The experiment used two 16-GiB V100 GPUs, CUDA 12.8, SM70, the split at layer 16, and the same private model configuration. Binary hashes, final source hashes, and full measurements remain local. Build checkout commit fields describe the collection context; they do not identify all final source changes. This report retains the measured summaries and reproduction commands.
 
 The installed engine and first-pass binary were preserved. No candidate was installed. After all GPU runs, the original service was started with its unchanged engine and settings. Health reported the model loaded. An authenticated chat request returned `READY` with HTTP status 200 and finish reason `stop`. The installed engine hash still matched the baseline. The restoration timer was stopped after these checks.
 
-The final benchmark CPU suites passed sixty tests with the repository's `unittest` runner. Private response captures, credentials, and complete engine logs are not included in the public evidence.
+The final benchmark CPU suites passed sixty tests with the repository's `unittest` runner. Raw JSON, private response captures, credentials, and complete engine logs are not committed.
 
 ## Reproduce
 
