@@ -52,7 +52,7 @@ constexpr uint64_t kMagic = 0x4B53494443525453ull;
 constexpr uint64_t kPanelMagic = 0x53444B4C454E4150ull;
 constexpr uint32_t kChainHeaderBytes = 128;
 constexpr uint32_t kPanelHeaderBytes = 56;
-constexpr uint64_t kMaxMetadataBytes = 64ull << 20;
+constexpr uint64_t kMaxMetadataBytes = ConversationDiskStore::max_metadata_bytes;
 constexpr uint32_t kMaxStages = 1024;
 constexpr uint32_t kMaxCheckpoints = 1u << 20;
 constexpr uint32_t kMaxParts = 64;
@@ -163,17 +163,20 @@ uint64_t count_sections(ConversationDiskRecord& record) {
 struct MetaWriter {
     std::vector<uint8_t> data;
     std::vector<uint64_t> lengths;
+    bool measuring = false;
+    size_t measured_bytes = 0;
 
     void raw(const void* source, size_t bytes) {
+        if (measuring) { measured_bytes += bytes; return; }
         const uint8_t* first = static_cast<const uint8_t*>(source);
         data.insert(data.end(), first, first + bytes);
     }
-    void u8(uint8_t value) { data.push_back(value); }
+    void u8(uint8_t value) { raw(&value, sizeof(value)); }
     void u32(uint32_t value) { raw(&value, sizeof(value)); }
     void u64(uint64_t value) { raw(&value, sizeof(value)); }
     void i32(int32_t value) { raw(&value, sizeof(value)); }
     void i64(int64_t value) { raw(&value, sizeof(value)); }
-    void section(uint64_t bytes) { u64(bytes); lengths.push_back(bytes); }
+    void section(uint64_t bytes) { u64(bytes); if (!measuring) lengths.push_back(bytes); }
 
     void write_checkpoint(const ConversationCheckpoint& value) {
         u32(static_cast<uint32_t>(value.ids.size()));
@@ -481,6 +484,22 @@ bool stages_compatible(const ConversationDiskRecord& a, const ConversationDiskRe
 
 
 } // namespace
+
+size_t ConversationDiskStore::metadata_bytes(const SavedConversation& image) {
+    MetaWriter writer;
+    writer.measuring = true;
+    writer.u32(static_cast<uint32_t>(image.stage_images.size() + 1));
+    writer.write_stage(image);
+    for (const auto& stage : image.stage_images) writer.write_stage(stage);
+    return writer.measured_bytes;
+}
+
+size_t ConversationDiskStore::metadata_bytes(const ConversationCheckpoint& checkpoint) {
+    MetaWriter writer;
+    writer.measuring = true;
+    writer.write_checkpoint(checkpoint);
+    return writer.measured_bytes;
+}
 
 bool ConversationDiskStore::base_ids(const std::string& base_name, std::vector<int32_t>& ids,
                                      std::vector<ConversationImageKey>& imgs, std::string& error) const {

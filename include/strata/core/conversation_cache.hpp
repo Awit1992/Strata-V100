@@ -161,6 +161,12 @@ struct SavedConversation {
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
 
+    // An active checkpoint archive shares one authoritative K/V image across
+    // its checkpoint chain. Runtime-only: disk records already retain the chain.
+    bool checkpoint_archive = false;
+    bool archive_sealed = false; // a full disk-metadata group remains reusable, but no longer grows
+    int64_t unchanged_tokens = 0;
+
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
         for (const auto& c : checkpoints) if (c.pinned) return true;
@@ -245,6 +251,8 @@ public:
         reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);
         for (auto& s : reuse_.stages) s.unchanged_tokens = std::min(s.unchanged_tokens, first_dirty);
         if (reuse_.unchanged_tokens <= 0) reuse_ = {};
+        for (auto& e : entries_)
+            e.image.unchanged_tokens = std::min(e.image.unchanged_tokens, first_dirty);
     }
     ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
     size_t retained_bytes() const { return reuse_.bytes(); }
@@ -253,6 +261,37 @@ public:
                entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
     }
 
+    // Find one archive on this exact token/image branch, in either direction.
+    // Extending it moves its K/V buffers; adding an older checkpoint needs no
+    // second K/V image. Roots and independently parked conversations stay alone.
+    Match archive_for(const ConversationCheckpoint& checkpoint, bool cvec) const {
+        Match match;
+        int best_rank = 0;
+        for (size_t i = entries_.size(); i-- > 0;) {
+            const auto& image = entries_[i].image;
+            if (!image.checkpoint_archive || image.archive_sealed || image.cvec != cvec) continue;
+            const auto& a = image.live;
+            const auto& b = checkpoint;
+            const auto& shorter = a.ids.size() <= b.ids.size() ? a : b;
+            const auto& longer = a.ids.size() <= b.ids.size() ? b : a;
+            if (!std::equal(shorter.ids.begin(), shorter.ids.end(), longer.ids.begin())) continue;
+            size_t j = 0;
+            bool compatible = true;
+            for (const auto& key : longer.imgs) {
+                if (key.start >= (int64_t) shorter.ids.size()) break;
+                if (j == shorter.imgs.size() || !(shorter.imgs[j++] == key)) { compatible = false; break; }
+            }
+            if (!compatible || j != shorter.imgs.size()) continue;
+            const bool present = a.ids == b.ids || std::any_of(
+                image.checkpoints.begin(), image.checkpoints.end(), [&](const auto& c) { return c.ids == b.ids; });
+            const int rank = present ? 3 : image.unchanged_tokens >= (int64_t) shorter.ids.size() ? 2 : 1;
+            if (rank > best_rank || (rank == best_rank && (int64_t) a.ids.size() > match.tokens)) {
+                best_rank = rank;
+                match = {i, (int64_t) a.ids.size(), true};
+            }
+        }
+        return match;
+    }
     template<class Token>
     Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
         Match best;
@@ -341,7 +380,8 @@ public:
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.image.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.image.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
+            if (!e.image.checkpoint_archive && e.image.cvec == cvec && deepest && !deepest->ids.empty() &&
+                held(*deepest) && std::all_of(e.image.checkpoints.begin(), e.image.checkpoints.end(), held)) {
                 bytes_ -= e.image.bytes();
                 entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
                 ++dropped;

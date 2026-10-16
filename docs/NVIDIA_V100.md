@@ -210,3 +210,47 @@ profile. It reserves extra memory for a second verifier and stage snapshots.
 Do not apply it to a different machine without measurements. See the
 [local evaluation report](../benchmarks/v100-upstream-pr-evaluation-2026-10-15.md)
 for results, limits, and reproduction commands.
+
+## Historical checkpoint retention
+
+The conversation cache now preserves prompt checkpoints before the active
+retention policy removes them. A checkpoint archive has the recurrent state
+and its required KV backing. Compatible checkpoints share one backing image
+within each archive group. The L2 byte limit, slot limit, and free-RAM floor
+apply to these groups. L2 capacity victims move to L3 when L3 is enabled.
+An L3 restore can promote the complete archive to L2.
+
+A single-V100 smoke run used a 12,440-token synthetic prompt, eight short
+continuations, and edits before the active checkpoint window. The run used
+these limits:
+
+```text
+--prompt-cache 3 --prompt-cache-every 512
+--conversation-cache-mib 8192 --conversation-cache-slots 2
+--conversation-cache-min-tokens 0 --conversation-cache-min-free-mib 1024
+--conversation-cache-disk <scratch-directory>
+--conversation-cache-disk-gib 32
+--conversation-cache-disk-min-free-mib 128
+```
+
+The L2 archive retained 31 checkpoints after the eight continuations.
+An edit at token 6,144 restored the historical L2 checkpoint. The engine
+processed the remaining 6,296 tokens. Three unrelated requests then forced
+L2 evictions. An edit at token 7,168 restored an L3 checkpoint. The engine
+processed the remaining 5,272 tokens. Both requests produced the same output
+and main-model state hashes as their cold-reference requests. The logs showed
+L2-to-L3 spills and L3-to-L2 promotion. L2 occupancy stayed below 8 GiB and
+two slots.
+
+Restart parity is not an accepted result for this run. The host produced
+intermittent payload-checksum failures and state differences. A separate
+CPU-only 48 GiB memory probe found a one-bit error at byte offset 702,217,824.
+All six read passes found the same error: `f2f4632a05437dfe` was read as
+`f2f4632a45437dfe`. A separate disk-read check found a restored byte with value
+250 where the file contained 186. No checksum check was disabled or weakened.
+Correct the host-memory fault and repeat the restart and promotion parity
+checks before accepting this machine for persistent-cache validation.
+
+Finite cache budgets still limit history. A checkpoint that both L2 and L3
+have evicted is not available for reuse. The engine must process that prefix
+again.

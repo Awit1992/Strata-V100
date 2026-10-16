@@ -113,6 +113,66 @@ void test_root_priority() {
 int main() {
     test_root_priority();
     {
+        // Active-window rotation must not make older branch points disappear.
+        auto archive = image_with_checkpoint({1, 2, 3, 4, 5}, {1, 2});
+        archive.checkpoint_archive = true;
+        archive.unchanged_tokens = 5;
+        ConversationCache cache(1 << 20, 4);
+        check(cache.put(std::move(archive)), "checkpoint archive parks");
+        auto newer = image_with_checkpoint({1, 2, 3, 4, 5, 6}, {1, 2, 3, 4});
+        check(cache.put(std::move(newer)), "recent active window parks");
+        check(cache.best(std::vector<int32_t>{1, 2, 9, 9}, {}, true).tokens == 2,
+              "historical edit restores an archived checkpoint absent from the active window");
+        ConversationCheckpoint next;
+        next.ids = {1, 2, 3, 4, 5, 6};
+        auto match = cache.archive_for(next, true);
+        check(match.tokens == 5, "continued branch extends its existing backing");
+        next.ids = {1, 2, 3};
+        check(cache.archive_for(next, true).tokens == 5, "older checkpoint uses the covering archive");
+        next.imgs = {{1, 42}};
+        check(cache.archive_for(next, true).tokens == 0, "image changes cannot share archive backing");
+        next.imgs.clear();
+        check(cache.archive_for(next, false).tokens == 0, "steering changes cannot share archive backing");
+        cache.limit_reuse(3);
+        auto saved = cache.take(match.index);
+        check(saved.unchanged_tokens == 3, "rewrites invalidate archived K/V reuse past the dirty boundary");
+        check(saved.live.ids == std::vector<int32_t>({1, 2, 3, 4, 5}) &&
+              saved.checkpoints[0].ids == std::vector<int32_t>({1, 2}),
+              "invalidating reuse does not destroy the preserved branch");
+        saved.archive_sealed = true;
+        check(cache.put(std::move(saved)), "a full metadata group remains parked");
+        check(cache.archive_for(next, true).tokens == 0 &&
+              cache.best(std::vector<int32_t>{1, 2, 9}, {}, true).tokens == 2,
+              "sealed groups stop growing without losing historical reuse");
+    }
+    {
+        ConversationCache cache(1 << 20, 4);
+        auto stale = image_with_checkpoint({1, 2, 3, 4, 5}, {1, 2});
+        stale.checkpoint_archive = true;
+        stale.unchanged_tokens = 2;
+        check(cache.put(std::move(stale)), "rewritten branch remains reusable as an immutable image");
+        auto fresh = image_with_checkpoint({1, 2, 3, 4}, {1, 2});
+        fresh.checkpoint_archive = true;
+        fresh.unchanged_tokens = 4;
+        check(cache.put(std::move(fresh)), "current branch backing parks");
+        ConversationCheckpoint next;
+        next.ids = {1, 2, 3, 4, 5, 6};
+        check(cache.archive_for(next, true).tokens == 4,
+              "extension prefers proven unchanged backing over a longer rewritten branch");
+    }
+    {
+        auto older = image_with_checkpoint({1, 2, 3, 4, 5}, {1, 2});
+        ConversationCheckpoint deepest;
+        deepest.ids = {1, 2, 3, 4};
+        older.checkpoints.push_back(deepest);
+        ConversationCache cache(1 << 20, 4);
+        check(cache.put(std::move(older)), "conversation with historical checkpoints parks");
+        auto recent = image_with_checkpoint({1, 2, 3, 4, 6}, {1, 2, 3, 4});
+        check(cache.put(std::move(recent)), "conversation with a rotated checkpoint window parks");
+        check(cache.best(std::vector<int32_t>{1, 2, 8}, {}, true).tokens == 2,
+              "supersession cannot delete the only historical checkpoint");
+    }
+    {
         ConversationBuffer bytes;
         const size_t first = ConversationBuffer::segment_bytes + 17;
         const size_t peak = bytes.allocation_peak(first);

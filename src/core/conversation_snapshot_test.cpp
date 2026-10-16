@@ -152,6 +152,26 @@ void full_session(int fmt, int mode, int experts) {
     fill(177);
     check(conversation_snapshot_save(b,view,ss,g,draft.state,err),"capture complete B");
     {
+        // The session has advanced to B. Demotion must use the saved recurrent
+        // state at the older checkpoint, not B's current recurrent state.
+        const auto& historical = a.checkpoints[0];
+        const std::vector<ConversationCheckpoint> none;
+        const ConversationView old_view{historical.ids, historical.imgs, none, true, &historical};
+        SavedConversation archived;
+        check(conversation_snapshot_save(archived, old_view, ss, g, draft.state, err),
+              "demote a historical checkpoint with authoritative positional backing");
+        check(conversation_snapshot_restore(archived, ss, g, draft.state, err) == ConversationRestore::restored,
+              "restore the demoted checkpoint");
+        ConversationCheckpoint actual;
+        actual.ids = historical.ids;
+        check(conversation_checkpoint_save(actual, ss, g, err), "read back restored historical state");
+        check(actual.gdn == historical.gdn && actual.ple == historical.ple &&
+              actual.tails == historical.tails && actual.dead == historical.dead &&
+              actual.block_pos == historical.block_pos,
+              "historical restore recovers every recurrent state, not the later session state");
+        fill(177);
+    }
+    {
         // disk save path: metadata + streamed K/V give the same file as the captured image
         SavedConversation meta;
         std::vector<SessionKvSource> sources;
