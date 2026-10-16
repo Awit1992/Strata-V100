@@ -11,7 +11,7 @@ Strata is an open-source local runtime for [Qwen3.8-Flash-Next](https://huggingf
 ## What this fork focuses on
 
 - **Tesla V100 / Volta support (`sm_70`)**: preserve normal V100 builds and runtime support. V100 builds use a CUDA 12.x toolkit; CUDA 13 does not compile `sm_70` code.
-- **Test machine:** two Tesla V100-PCIE-16GB cards; one uses PCIe Gen3 x4 and the other Gen3 x16. The benchmark below uses only the x16 card. A system with both cards on full Gen3 x16 links could perform better, especially for multi-GPU workloads, but that configuration has not been measured here.
+- **Test machine:** two Tesla V100-PCIE-16GB cards; GPU 0 uses PCIe Gen3 x4 and GPU 1 uses Gen3 x16. The pipeline measurements below use both cards. The historical single-card benchmark uses only the x16 card. A system with two full Gen3 x16 links has not been measured here.
 - **Upstream integration**: this is not a separate replacement for Strata. Upstream changes are merged periodically, with V100 compatibility checked and corrected where needed. New upstream features may have hardware requirements above `sm_70`; they do not automatically accelerate V100.
 - **The wider Strata community**: improvements, bug reports, testing, documentation, and contributions for other supported platforms are welcome.
 
@@ -50,6 +50,63 @@ values (engine SHA-256 `e9ad337a…`), reported in the
 Parallel slots at the 524,288-token context depend on the split and the memory left on the
 last stage; the measured fallback (requested 2, served one request at a time, configuration
 untouched) is described in [docs/BATCHING.md](docs/BATCHING.md).
+
+## Dual-V100 pipeline performance — 15 October 2026
+
+The measured service profile enables `--pipeline-windows 2` with GPU order
+`0,1` and layer split `16`. It uses two 16-GiB V100 cards at 175 W,
+a Ryzen 5 3600, the native IQ3_S mixed-format model, int8 KV, and MTP
+with `--spec 8`. The configured context capacity remains 524,288 tokens.
+The largest measured prompt is 32,768 tokens.
+
+### Fresh-prompt prefill through 32K
+
+Each value is the median of three exact-token requests with no prompt reuse
+and a 16-token output cap. Prefill time excludes response generation.
+Throughput is prompt tokens divided by median prefill time.
+
+| Prompt tokens | Previous prefill time | Pipeline prefill time | Previous tokens/s | Pipeline tokens/s | Throughput change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,048 | 2.089 s | 2.090 s | 980.6 | 979.8 | −0.09% |
+| 8,192 | 5.487 s | 5.494 s | 1,493.0 | 1,491.2 | −0.13% |
+| 16,384 | 8.828 s | 8.857 s | 1,855.9 | 1,849.8 | −0.33% |
+| 32,768 | 15.668 s | 15.677 s | 2,091.4 | 2,090.2 | −0.06% |
+
+Fresh-prompt prefill is approximately unchanged. These small differences
+do not establish a meaningful regression.
+
+### Conversation decode
+
+The separate HTTP comparison uses an 8,828-token initial prompt and six
+continuation turns. Context reaches approximately 11.9K tokens. Each value
+is the median of four requests, with arm order reversed on alternate rounds
+and a 256-token output cap. New prompt tokens are the tokens processed on
+that turn, not the total context size.
+
+| Turn | New prompt tokens | Previous decode tokens/s | Pipeline decode tokens/s | Decode change |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 121 | 70.20 | 79.45 | +13.18% |
+| 2 | 321 | 70.60 | 82.05 | +16.22% |
+| 3 | 1,086 | 76.60 | 79.00 | +3.13% |
+| 4 | 128 | 73.00 | 79.90 | +9.45% |
+| 5 | 313 | 74.35 | 86.55 | +16.41% |
+| 6 | 1,089 | 74.15 | 80.75 | +8.90% |
+
+The median of the six decode throughput ratios is **+11.31%**.
+This is not a measured decode gain at every context size through 32K.
+Generated lengths and MTP work differ with automatic CPU sharing and
+resident routing. Whole-request latency is mixed; one short-turn HTTP
+median regresses. Do not interpret the decode gain as a guaranteed
+whole-request speedup or a matched-output comparison.
+
+A separate fixed-setting control matches all three complete 16-token output
+sequences at 2K, 8K, and 32K prompt sizes. It does not prove identical output
+for every production request.
+
+See the [evaluation report](benchmarks/v100-upstream-pr-evaluation-2026-10-15.md)
+for exact timings, build provenance, rejected trials, and reproduction
+commands. See the [service profile guide](docs/NVIDIA_V100.md#dual-pcie-pipeline-service-profile)
+before enabling the option on another installation.
 
 ## V100 benchmark
 

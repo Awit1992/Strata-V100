@@ -11,7 +11,9 @@ Environment=STRATA_WATCHDOG_S=300
 Environment=STRATA_SPLIT_RING=192
 EnvironmentFile=%h/strata-v100/.strata-service.env
 ExecStartPre=/usr/bin/mountpoint --quiet /mnt/strata-models
-ExecStart=%h/strata-v100/.venv/bin/python %h/strata-v100/serve/server.py --engine strata --config %h/strata-v100/strata-iq3_s-arena.json --host 0.0.0.0 --port 8088
+# Prepare this private profile as described in docs/NVIDIA_V100.md.
+# It enables two-stage decode on the measured GPU 0 x4 / GPU 1 x16 split.
+ExecStart=%h/strata-v100/.venv/bin/python %h/strata-v100/serve/server.py --engine strata --config %h/strata-v100/strata-iq3_s-pipeline.json --host 0.0.0.0 --port 8088
 Restart=always
 RestartSec=10
 TimeoutStopSec=30
