@@ -162,3 +162,43 @@ ports and the changes that do not apply to Volta.
 
 These controls do not establish a speed gain for every V100 configuration.
 See the [verification report](../benchmarks/v100-upstream-v0.1.43-2026-10-11.md).
+
+## Dual-PCIe pipeline service profile
+
+The [recent upstream PR review](../benchmarks/v100-upstream-pr-inventory-2026-10-15.md)
+includes the V100 pipeline report in upstream PR #2395. The tested local
+profile uses GPU 0 on PCIe x4 and GPU 1 on PCIe x16. Keep the GPU order
+`0,1` and the explicit layer split `16`. Do not use an equal-link assumption.
+
+The service template uses a separate private configuration,
+`strata-iq3_s-pipeline.json`. Prepare it from the existing configuration:
+
+```sh
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+source = Path("strata-iq3_s-arena.json")
+target = Path("strata-iq3_s-pipeline.json")
+config = json.loads(source.read_text())
+args = config["args"]
+if "--pipeline-windows" in args:
+    args[args.index("--pipeline-windows") + 1] = "2"
+else:
+    args.extend(["--pipeline-windows", "2"])
+target.write_text(json.dumps(config, indent=2) + "\n")
+target.chmod(0o600)
+PY
+```
+
+Keep both configurations private. Do not commit credentials, model paths,
+or conversation data. Install the service template only after the new
+configuration exists. Keep the previous engine and service settings for
+rollback. This profile does not change the model, quantization, context
+capacity, vision settings, or cache budgets.
+
+`--pipeline-windows 2` needs two GPU stages and MTP. It is not a batch-slot
+profile. It reserves extra memory for a second verifier and stage snapshots.
+Do not apply it to a different machine without measurements. See the
+[local evaluation report](../benchmarks/v100-upstream-pr-evaluation-2026-10-15.md)
+for results, limits, and reproduction commands.
