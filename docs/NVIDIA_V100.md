@@ -170,6 +170,14 @@ includes the V100 pipeline report in upstream PR #2395. The tested local
 profile uses GPU 0 on PCIe x4 and GPU 1 on PCIe x16. Keep the GPU order
 `0,1` and the explicit layer split `16`. Do not use an equal-link assumption.
 
+With `STRATA_KV_GROW=1`, use a build with the
+[pipeline KV-growth repair](../benchmarks/v100-pipeline-kv-growth-fix-2026-10-16.md).
+The original pipelined decode loop did not grow the mapped cells during a
+long response. It could fail with a CUDA illegal memory access even when
+the configured context had space left. The repair waits for speculative
+rollback and adaptive copies before growing both stages, then resumes
+pipelining. Short-output speed checks alone do not test this boundary.
+
 The service template uses a separate private configuration,
 `strata-iq3_s-pipeline.json`. Prepare it from the existing configuration:
 

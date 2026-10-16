@@ -59,6 +59,14 @@ a Ryzen 5 3600, the native IQ3_S mixed-format model, int8 KV, and MTP
 with `--spec 8`. The configured context capacity remains 524,288 tokens.
 The largest measured prompt is 32,768 tokens.
 
+**Long-response safety:** use a build with the
+[pipeline KV-growth repair](benchmarks/v100-pipeline-kv-growth-fix-2026-10-16.md)
+when combining this profile with `STRATA_KV_GROW=1`. The earlier pipeline
+loop could access unmapped KV cells during a long response. The repair
+drains speculative work before growing the mapping and then resumes
+pipelining. The short-output speed measurements below did not exercise
+that boundary.
+
 ### Fresh-prompt prefill through 32K
 
 Each value is the median of three exact-token requests with no prompt reuse

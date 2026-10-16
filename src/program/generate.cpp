@@ -12479,6 +12479,9 @@ int main(int argc, char** argv) {
                 PW undo_w;
                 int undo_keep = 0;
                 int32_t undo_ple[2] = {-1, -1};
+                PW kv_from;
+                int kv_keep = 0;
+                int64_t kv_target = 0;
                 int chain_kind = 0;      // 1: after an on-path verdict (A's drafts forced); 2: fresh (A's drafts from it)
                 bool early_used = false;
                 bool b_done = false;     // B has been made from the chain in flight
@@ -12763,6 +12766,30 @@ int main(int argc, char** argv) {
                         if (!doomed) break;
                         continue;
                     }
+                    // Grow only at a verified boundary. A speculative B must finish and its state must be restored
+                    // before the expert slots that back the new K/V cells can be moved or unmapped.
+                    if (kv_target != 0 && !doomed) {
+                        pl_drain();
+                        if (pl_adapt_thr.joinable()) pl_adapt_thr.join();
+                        if (!pl_adapt_ok) return die("an adaptive refill failed");
+                        if (exch_wait) pl_release();
+                        a_pl_settle();
+                        if (!adapt_tick(true, false)) return die("an adaptive refill failed");
+                        if (!kvg_ensure(kv_target, [&] { cudaDeviceSynchronize(); apply_pending(true); }))
+                            return die("the K/V cannot grow: no VRAM is left");
+                        if (ajob) a_pl_idle = [&](int st) { return !PV[st][0]->in_flight() && !PV[st][1]->in_flight(); };
+                        tre("KG", A.seq);
+                        kv_target = 0;
+                        mtp.set_source_R(V1(kv_from).final_R(0));
+                        chain_n = strata::kernels::kVerifyMaxT - 1;
+                        if (!mtp.chain_launch(kv_from.T, outp.data(), kv_from.p, kv_keep - 1,
+                                              nullptr, 0, chain_n, chain_n, err))
+                            return die(err);
+                        chain_kind = 2;
+                        tre("CL", kv_from.seq, 2);
+                        early_used = false;
+                        b_done = false;
+                    }
                     // ---- the drafter's chain, read as its outputs land (an event after each): a fresh A once its size
                     // is decided, then B once ITS size is decided - its bonus guess and a draft below spec_min_p (or
                     // S_mtp - 1 drafts) - so stage 0 need not wait for the whole chain
@@ -12934,7 +12961,12 @@ int main(int argc, char** argv) {
                     if (eos) finish = "stop";
                     else if (stop_req.load()) finish = "cancel";
                     const bool last = eos || produced_n >= max_new || stop_req.load();
-                    const bool on = B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
+                    // Cover both verifier windows and the drafter's lookahead, as the serial loop covers its window.
+                    // Do not promote B across a growth boundary: even a correct guess must be drained and rolled back.
+                    const int64_t next_cells = std::min<int64_t>(o.max_context,
+                        A.p + a + 1 + 2 * strata::kernels::kVerifyMaxT + 64);
+                    if (!last && kvg_on() && next_cells > kvg_cells()) kv_target = next_cells;
+                    const bool on = kv_target == 0 && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                         const int bin = std::min(9, std::max(0, (int) (B.p_on * 10.0f)));
@@ -12995,14 +13027,19 @@ int main(int argc, char** argv) {
                         // would finish it, and the other would wait for it forever)
                         B = PW{};
                         if (!last) {
-                            mtp.set_source_R(V1(A).final_R(0));
-                            chain_n = strata::kernels::kVerifyMaxT - 1;
-                            if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
-                                return die(err);
-                            chain_kind = 2;
-                            tre("CL", A.seq, 2);
-                            early_used = false;
-                            b_done = false;
+                            if (kv_target != 0) {
+                                kv_from = A;
+                                kv_keep = a + 1;
+                            } else {
+                                mtp.set_source_R(V1(A).final_R(0));
+                                chain_n = strata::kernels::kVerifyMaxT - 1;
+                                if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
+                                    return die(err);
+                                chain_kind = 2;
+                                tre("CL", A.seq, 2);
+                                early_used = false;
+                                b_done = false;
+                            }
                             PW nA;
                             nA.seq = A.seq + 1;
                             nA.p = A.p + a + 1;
