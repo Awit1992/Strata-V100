@@ -242,6 +242,14 @@ and main-model state hashes as their cold-reference requests. The logs showed
 L2-to-L3 spills and L3-to-L2 promotion. L2 occupancy stayed below 8 GiB and
 two slots.
 
+The installed service also passed an HTTP smoke check with its existing
+settings: a 524,288-token context, a 25 GiB L2, 32 cache slots, and the
+default active checkpoint count. Ten short chat turns completed. A change
+to the fifth user message then restored 124 tokens from L2 for a 293-token
+prompt. The earlier continuation reference reused 48 tokens. The runtime
+log confirmed an L2 restore, not an L3 restore. This check does not establish
+long-context or restart integrity on the faulty host.
+
 Restart parity is not an accepted result for this run. The host produced
 intermittent payload-checksum failures and state differences. A separate
 CPU-only 48 GiB memory probe found a one-bit error at byte offset 702,217,824.
