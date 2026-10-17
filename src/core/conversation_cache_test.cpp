@@ -1,5 +1,7 @@
 #include "strata/core/conversation_cache.hpp"
 
+#include "strata/core/conversation_prefix.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -108,15 +110,543 @@ void test_root_priority() {
               "explicit checkpoint pin remains protected when no victim is available");
     }
 }
+// A parked conversation and the fork of it share one physical prefix.  These are
+// the boundaries the parking path depends on: what a copy costs, what a write
+// detaches, what the cache charges, and what a bounded retention keeps.
+void test_shared_prefix() {
+    {   // ConversationBuffer: a prefix trim adopts pieces; a write copies only what it touches
+        ConversationBuffer source;
+        source.resize(ConversationBuffer::segment_bytes + 32, 7);
+        const size_t cut = ConversationBuffer::segment_bytes + 8;
+        ConversationBuffer fork;
+        fork.share_prefix(source, cut);
+        const uint8_t* full = nullptr;
+        const uint8_t* shared = nullptr;
+        const ConversationBuffer& shared_source = source;
+        const ConversationBuffer& shared_fork = fork;
+        shared_source.visit(0, 1, [&](const uint8_t* p, size_t, size_t) { full = p; return true; });
+        shared_fork.visit(0, 1, [&](const uint8_t* p, size_t, size_t) { shared = p; return true; });
+        check(fork.size() == cut && full == shared, "a prefix trim adopts the allocation instead of copying it");
+        check(fork.detach_peak(0, cut) == cut, "the whole trimmed prefix is still shared");
+        fork.resize(cut + 8, 9);
+        check(fork.detach_peak(0, cut) == cut && fork.detach_peak(cut, 8) == 0,
+              "appending to a shared piece allocates a new one and copies no prefix byte");
+        std::vector<uint8_t> tail(8, 0);
+        check(fork.read(tail.data(), cut, 8) && tail[0] == 9 && tail[7] == 9,
+              "the fork appends its own suffix");
+        check(source.detach_peak(0, 1) > 0 && source.read(tail.data(), cut, 8) && tail[0] == 7,
+              "the fork's append cannot alter the original");
+        check(source.size() == ConversationBuffer::segment_bytes + 32 && fork.size() == cut + 8,
+              "each side keeps its own extent");
+        // a dirty tail inside a shared piece copies that tail alone
+        const size_t dirty = 64;
+        const size_t at = cut - dirty;                       // inside the shared prefix
+        check(fork.detach_peak(at, dirty) == dirty, "the dirty tail is shared before the write");
+        check(fork.visit(at, dirty, [](uint8_t* p, size_t n, size_t) {
+                  std::memset(p, 9, n);
+                  return true;
+              }), "the dirty tail is written");
+        check(fork.detach_peak(0, at) == at, "the unchanged prefix is still shared, not copied");
+        check(fork.detach_peak(at, dirty) == 0, "and the written tail alone is private");
+        std::vector<uint8_t> probe(dirty, 0);
+        check(fork.read(probe.data(), at, dirty) && probe[0] == 9 && probe[dirty - 1] == 9,
+              "the write landed in the tail");
+        check(source.read(probe.data(), at, dirty) && probe[0] == 7,
+              "the source's own tail is untouched");
+    }
+    {
+        ConversationBuffer source;
+        source.resize(509);
+        std::vector<uint8_t> original(509);
+        for (size_t i = 0; i < original.size(); ++i) original[i] = uint8_t(i % 251);
+        source.visit(0, original.size(), [&](uint8_t* p, size_t n, size_t at) {
+            std::memcpy(p, original.data() + at, n);
+            return true;
+        });
+        auto branch = source;
+        auto expected = original;
+        for (const auto [at, count] : {std::pair<size_t, size_t>{101, 23}, {260, 17}}) {
+            branch.visit(at, count, [](uint8_t* p, size_t n, size_t) {
+                std::memset(p, 42, n);
+                return true;
+            });
+            std::fill(expected.begin() + at, expected.begin() + at + count, 42);
+        }
+        std::vector<uint8_t> actual(original.size());
+        check(branch.read(actual.data(), 0, actual.size()) && actual == expected,
+              "middle writes preserve the original bytes on both sides of each dirty range");
+        check(source.read(actual.data(), 0, actual.size()) && actual == original,
+              "middle writes leave the complete source unchanged");
+        size_t allocations = 0, allocation_bytes = 0;
+        branch.visit_allocations([&](const void*, size_t bytes) { ++allocations; allocation_bytes += bytes; });
+        check(allocations == 3 && allocation_bytes == 509 + 23 + 17 &&
+                  branch.allocation_bytes() == allocation_bytes,
+              "non-adjacent ranges of one allocation are charged once");
+        ConversationBuffer contiguous;
+        contiguous.resize(expected.size());
+        contiguous.visit(0, expected.size(), [&](uint8_t* p, size_t n, size_t at) {
+            std::memcpy(p, expected.data() + at, n);
+            return true;
+        });
+        check(branch == contiguous, "equality reads each split range at its allocation offset");
+        branch.resize(264);
+        branch.resize(272, 91);
+        expected.resize(264);
+        expected.resize(272, 91);
+        actual.resize(expected.size());
+        check(branch.read(actual.data(), 0, actual.size()) && actual == expected,
+              "rewind and regrowth preserve split ranges and fill only the new suffix");
+        const auto& readonly = branch;
+        readonly.visit(0, readonly.size(), [](auto* p, size_t, size_t) {
+            static_assert(std::is_const_v<std::remove_pointer_t<decltype(p)>>);
+            return true;
+        });
+        branch.share_prefix(branch, 130);
+        expected.resize(130);
+        actual.resize(130);
+        check(branch.read(actual.data(), 0, actual.size()) && actual == expected,
+              "a self prefix trim retains the requested bytes");
+    }
+    {
+        const size_t prefix = ConversationBuffer::segment_bytes;
+        ConversationCache cache(prefix + (1 << 20), 4);
+        auto source = image({1, 2, 3});
+        source.kv.resize(1);
+        source.kv[0].k.resize(prefix, 7);
+        check(cache.put(std::move(source)), "the original large prefix fits in the cache");
+        auto branch = cache.fork(0);
+        branch.live.ids.push_back(4);
+        branch.kv[0].k.resize(prefix + 8, 9);
+        check(cache.put(std::move(branch)) && cache.size() == 2,
+              "a short divergent suffix fits without a second prefix-sized allocation or source eviction");
+    }
+    {
+        auto source = image({1, 2, 3});
+        source.checkpoints.push_back(source.live);
+        const size_t payload = source.live.gdn.capacity();
+        const size_t budget = source.private_bytes() + payload;
+        ConversationCache cache(budget, 4);
+        check(cache.put(std::move(source)) && cache.bytes() == budget,
+              "one state shared by live and checkpoint fits a one-copy payload budget");
+        const auto branch = cache.fork(0);
+        check(cache.shared_bytes(branch) == payload,
+              "the shared-byte query counts repeated checkpoint references once");
+    }
+    for (const bool supersede : {false, true}) {
+        const size_t budget = 14 << 10;
+        ConversationCache cache(budget, 3);
+        auto source = image({1, 2, 3});
+        source.checkpoint_archive = supersede;
+        source.kv.resize(1);
+        source.kv[0].k.resize(6 << 10, 7);
+        check(cache.put(std::move(source)), "the shared-prefix owner parks before admission pressure");
+        auto unrelated = image({8, 9});
+        unrelated.kv.resize(1);
+        unrelated.kv[0].k.resize(6 << 10, 8);
+        check(cache.put(std::move(unrelated)), "an unrelated prefix fills the remaining cache space");
+        auto branch = cache.fork(0);
+        if (supersede) branch.checkpoints.push_back(branch.live);
+        branch.live.ids.push_back(4);
+        branch.live.gdn.resize(3 << 10, 9);
+        check(cache.put(std::move(branch)) && cache.bytes() <= budget && cache.size() == 1,
+              "removing a shared prefix owner does not free bytes still held by the incoming branch");
+        check(cache.best(std::vector<int32_t>{1, 2, 3, 4, 5}, {}, true).tokens == 4,
+              "the admitted branch remains restorable after its source and unrelated entry leave");
+    }
+    {
+        ConversationCache cache(1 << 20, 4);
+        auto source = image({});
+        for (int32_t i = 0; i < 100; ++i) source.live.ids.push_back(i);
+        auto stripped = source.live;
+        stripped.ids.resize(20);
+        stripped.drop_state();
+        source.checkpoints.push_back(std::move(stripped));
+        check(cache.put(std::move(source)), "a long conversation parks without an early running-state anchor");
+        std::vector<int32_t> prompt;
+        for (int32_t i = 0; i < 20; ++i) prompt.push_back(i);
+        prompt.push_back(999);
+        check(cache.best(prompt, {}, true).tokens == 0 && cache.shared_prefix(prompt, {}, true).prefix_tokens == 20,
+              "a stateless position cannot restore, but its backing still shares the full matching K/V prefix");
+        auto shorter = image({});
+        shorter.live.ids.assign(prompt.begin(), prompt.begin() + 15);
+        check(cache.put(std::move(shorter)), "a separate shorter restorable prefix parks");
+        const auto backing = cache.shared_prefix(prompt, {}, true);
+        check(cache.best(prompt, {}, true).tokens == 15 && backing.index == 0 && backing.prefix_tokens == 20,
+              "the nearest running-state anchor and longest shared K/V backing are selected independently");
+    }
+    {
+        ConversationCache cache(1 << 20, 4);
+        auto source = image({1, 2, 3});
+        source.kv.resize(1);
+        source.kv[0].k.resize(1 << 16, 5);
+        check(cache.put(std::move(source)), "a prefix parks before retained-buffer reuse");
+        const size_t alone = cache.bytes();
+        auto restored = cache.fork(0);
+        cache.retain(std::move(restored.kv), 3);
+        auto reuse = cache.take_reuse();
+        check(cache.bytes() == alone, "taking shared retained buffers removes only their private directory charge");
+        reuse.kv[0].k.visit(100, 17, [](uint8_t* p, size_t n, size_t) {
+            std::memset(p, 9, n);
+            return true;
+        });
+        uint8_t original[17]{};
+        const auto preserved = cache.fork(0);
+        check(cache.bytes() == alone && preserved.kv[0].k.read(original, 100, sizeof(original)) &&
+                  original[0] == 5 && original[16] == 5,
+              "an external retained-buffer rewrite leaves the parked prefix and its charge unchanged");
+        auto branch = image({1, 2, 3, 4});
+        branch.kv = std::move(reuse.kv);
+        const size_t expected = alone + branch.private_bytes() + branch.live.gdn.capacity() + 17;
+        check(cache.put(std::move(branch)) && cache.bytes() == expected,
+              "parking the rewritten retained branch charges its new state and dirty range, not the prefix again");
+        check(cache.evict_oldest() && cache.evict_oldest() && cache.bytes() == 0,
+              "releasing both retained-buffer branches removes every cache allocation charge");
+    }
+    {   // ConversationPayload: a checkpoint copy shares its running state; a write detaches it
+        ConversationCheckpoint first;
+        first.ids = {1, 2, 3};
+        first.gdn.assign(64, 7);
+        const ConversationCheckpoint& shared_first = first;
+        ConversationCheckpoint second = first;
+        const ConversationCheckpoint& shared_second = second;
+        const uint8_t* payload = shared_first.gdn.data();
+        check(shared_second.gdn.data() == payload && second.gdn == first.gdn,
+              "a checkpoint copy shares its payload");
+        second.gdn.assign(64, 9);
+        check(shared_first.gdn.data() == payload && shared_first.gdn.vec()[0] == 7 && second.gdn.vec()[0] == 9,
+              "writing the copy leaves the original payload alone");
+        check(!ConversationCheckpoint{}.has_state() && first.has_state(), "has_state() reports a captured state");
+        ConversationCheckpoint stripped = first;
+        stripped.drop_state();
+        check(!stripped.has_state() && stripped.ids == first.ids, "a dropped state keeps the matching position");
+    }
+    {   // the cache charges a shared prefix once; the newer branch leaves first
+        ConversationCache cache(1 << 20, 4);
+        auto source = image({1, 2, 3});
+        source.kv.resize(1);
+        source.kv[0].k.resize(1 << 16, 5);
+        check(cache.put(std::move(source)), "a conversation with a K/V backbone parks");
+        const size_t alone = cache.bytes();
+        SavedConversation fork = cache.fork(0);
+        const size_t metadata = fork.private_bytes();
+        check(fork.kv[0].k.size() == (1 << 16) && cache.bytes() == alone,
+              "a fork copies no payload and does not change the cache's charge");
+        check(cache.shared_bytes(fork) == fork.allocation_bytes() && fork.allocation_bytes() >= (1 << 16),
+              "every allocation of the fork is already charged to the parked source");
+        check(cache.make_room(fork), "a fork that shares the prefix needs no room of its own");
+        check(cache.put(std::move(fork)), "the fork parks beside its source");
+        check(cache.bytes() == alone + metadata, "the shared K/V is charged once; only new metadata is added");
+        check(cache.take(1).kv[0].k.size() == (1 << 16) && cache.bytes() >= (1 << 16),
+              "the shared prefix stays charged to the branch that is left");
+        check(cache.take(0).kv[0].k.size() == (1 << 16) && cache.bytes() == 0,
+              "the last owner frees the shared prefix");
+    }
+    {   // the same in the other order: the older branch goes first
+        ConversationCache cache(1 << 20, 4);
+        auto source = image({1, 2, 3});
+        source.kv.resize(1);
+        source.kv[0].k.resize(1 << 16, 5);
+        cache.put(std::move(source));
+        const size_t alone = cache.bytes();
+        auto fork = cache.fork(0);
+        const size_t metadata = fork.private_bytes();
+        check(cache.put(std::move(fork)) && cache.bytes() == alone + metadata, "the fork adds its metadata only");
+        check(cache.evict_oldest() && cache.bytes() >= (1 << 16),
+              "the survivor still pays for the shared prefix");
+        check(cache.evict_oldest() && cache.bytes() == 0, "and frees it when it goes too");
+    }
+    {   // a long parked conversation shares only the tokens a shorter request has in common
+        ConversationCache cache(1 << 20, 4);
+        SavedConversation long_one;
+        long_one.live.ids.assign(4096, 5);
+        long_one.live.gdn.assign(8, 1);
+        ConversationCheckpoint anchor;
+        anchor.ids.assign(1024, 5);
+        anchor.gdn.assign(8, 2);
+        long_one.checkpoints.push_back(std::move(anchor));
+        check(cache.put(std::move(long_one)), "a long conversation parks");
+        std::vector<int32_t> prompt(2048, 5);
+        prompt.back() = 9;                       // the request diverges at 2047
+        const auto match = cache.best(prompt, {}, true);
+        check(match.tokens == 1024 && !match.live, "the restore resumes from the checkpoint at 1024 tokens");
+        check(match.prefix_tokens == 2047,
+              "while the K/V it can share reaches the divergence, past the state it can restore");
+        const auto extension = cache.best(std::vector<int32_t>(4097, 5), {}, true);
+        check(extension.tokens == 4096 && extension.live && extension.prefix_tokens == 4096,
+              "an extension of the parked conversation shares its whole backing");
+    }
+    {   // a bounded retention: pinned, earliest, newest, then log-spaced history
+        SavedConversation archive;
+        archive.live.ids.assign(200, 5);
+        archive.live.gdn.assign(8, 1);
+        for (int i = 1; i <= 40; ++i) {
+            ConversationCheckpoint c;
+            c.ids.assign((size_t) i * 2, 5);
+            c.gdn.assign(8, 2);
+            archive.checkpoints.push_back(std::move(c));
+        }
+        archive.checkpoints[3].pinned = true;   // 8 tokens: never a victim
+        const size_t dropped = archive.compact_checkpoints(4);
+        std::vector<size_t> kept;
+        for (const auto& c : archive.checkpoints) kept.push_back(c.ids.size());
+        check(dropped == 34 && archive.checkpoints.size() == 6, "a bounded retention drops the rest whole");
+        check(kept == std::vector<size_t>({2, 8, 74, 76, 78, 80}),
+              "pinned, earliest, newest and log-spaced history survive - never a stripped position");
+        check(std::all_of(archive.checkpoints.begin(), archive.checkpoints.end(),
+                          [](const ConversationCheckpoint& c) { return c.has_state(); }),
+              "every survivor can still be restored");
+        check(archive.restorable_checkpoint(80) != nullptr && archive.restorable_checkpoint(80)->ids.size() == 80,
+              "the longest restorable checkpoint at that extent is the one offered");
+        SavedConversation positions = archive;
+        const size_t stripped = positions.drop_checkpoint_states(1);
+        size_t stateless = 0;
+        for (const auto& c : positions.checkpoints)
+            if (!c.has_state()) ++stateless;
+        check(stripped == stateless && stateless > 0 && positions.checkpoints.size() == archive.checkpoints.size(),
+              "the disk tier's state bound keeps the matching positions");
+        const ConversationCheckpoint* at74 = positions.restorable_checkpoint(74);
+        check(at74 != nullptr && at74->has_state() && at74->ids.size() == 8,
+              "a stripped position is never offered for resume");
+        SavedConversation long_archive;
+        long_archive.live.ids.assign(300, 5);
+        for (int i = 1; i <= 300; ++i) {
+            ConversationCheckpoint c;
+            c.ids.assign((size_t) i, 5);
+            c.gdn.assign(8, 2);
+            long_archive.checkpoints.push_back(std::move(c));
+        }
+        long_archive.compact_checkpoints(6);
+        check(long_archive.checkpoints.size() <= 8, "three hundred turn boundaries stay within the bound");
+    }
+    {
+        SavedConversation archive;
+        archive.live.ids.assign(31, 5);
+        archive.live.gdn.assign(8, 31);
+        archive.stage_images.resize(1);
+        archive.stage_images[0].live = archive.live;
+        for (size_t i = 1; i <= 30; ++i) {
+            ConversationCheckpoint primary, secondary;
+            primary.ids.assign(i, 5);
+            primary.gdn.assign(8, uint8_t(i));
+            primary.pinned = i == 7;
+            secondary.ids = primary.ids;
+            secondary.gdn.assign(8, uint8_t(i + 100));
+            archive.checkpoints.push_back(std::move(primary));
+            archive.stage_images[0].checkpoints.push_back(std::move(secondary));
+        }
+        archive.checkpoints[3].drop_state();
+        archive.stage_images[0].checkpoints[3].drop_state();
+        archive.compact_checkpoints(3);
+        const auto& other = archive.stage_images[0];
+        check(archive.checkpoints.size() <= 5 && other.checkpoints.size() == archive.checkpoints.size(),
+              "compacting a layer-split archive bounds every stage with one shared selection");
+        bool pin = false, aligned = true;
+        for (size_t i = 0; i < archive.checkpoints.size(); ++i) {
+            const auto& a = archive.checkpoints[i];
+            const auto& b = other.checkpoints[i];
+            aligned = aligned && a.ids == b.ids && a.has_state() && b.has_state() &&
+                      b.gdn[0] == uint8_t(a.ids.size() + 100);
+            pin = pin || (a.pinned && a.ids.size() == 7);
+        }
+        check(aligned && pin, "a primary-stage pin preserves its matching state on every stage");
+    }
+}
+
+ModelGeometry prefix_geometry() {
+    ModelGeometry g;
+    g.n_embd = 4096; g.n_layers = 48; g.qsa_interval = 4;
+    g.ssm_state_size = 128; g.ssm_k_heads = 16; g.ssm_v_heads = 32; g.ssm_d_conv = 4;
+    g.ssm_conv_channels = 8192; g.ssm_value_dim = 128; g.n_head = 32; g.n_head_kv = 2;
+    g.head_dim = 128; g.idx_q_heads = 4; g.idx_key_dim = 128; g.hc = 4; g.hc_lr = 4;
+    g.n_expert = 256; g.n_ff = 14336;
+    return g;
+}
+
+SavedConversation parked_prefix_image(const ModelGeometry& g, int64_t tokens) {
+    SavedConversation s;
+    s.geometry = conversation_geometry_key(g);
+    const int64_t page = strata::kernels::qsa_real_shapes().page_size;
+    const int64_t block = strata::kernels::qsa_real_shapes().idx_block;
+    s.live.ids.assign((size_t) tokens, 5);
+    s.kv.resize(1);
+    ConversationKv& layer = s.kv[0];
+    layer.cells = ((tokens + page - 1) / page) * page;
+    layer.heads = g.n_head_kv;
+    layer.head_dim = g.head_dim;
+    layer.page_size = page;
+    layer.idx_dim = g.idx_key_dim;
+    layer.pooled_rows = tokens / block + 1;
+    layer.k.resize((size_t) layer.cells * (size_t) g.n_head_kv * (size_t) g.head_dim * 2, 3);
+    layer.pooled.resize((size_t) layer.pooled_rows * (size_t) g.idx_key_dim * sizeof(float), 4);
+    return s;
+}
+
+// The parked 300k image keeps its long tail; a fork trimmed to an anchor restores
+// exactly that anchor's running state and copies no K/V byte to get there.
+void test_prefix_trim() {
+    const ModelGeometry g = prefix_geometry();
+    const int64_t page = strata::kernels::qsa_real_shapes().page_size;
+    const int64_t block = strata::kernels::qsa_real_shapes().idx_block;
+    const int64_t anchor = 4 * page, later = 6 * page, live = 8 * page;
+    SavedConversation image = parked_prefix_image(g, live);
+    ConversationCheckpoint at_anchor;
+    at_anchor.ids.assign((size_t) anchor, 5);
+    at_anchor.gdn.assign(64, 11);
+    at_anchor.tails.assign(32, 12);
+    image.checkpoints.push_back(at_anchor);
+    ConversationCheckpoint past;
+    past.ids.assign((size_t) later, 5);
+    past.gdn.assign(64, 13);
+    image.checkpoints.push_back(std::move(past));
+    const SavedConversation parked = image;    // shares everything, like a cache entry
+    const uint8_t* bytes = nullptr;
+    { const ConversationBuffer& first = image.kv[0].k;
+      first.visit(0, 1, [&](const uint8_t* p, size_t, size_t) { bytes = p; return true; }); }
+    const size_t full = image.kv[0].k.size();
+    std::string error;
+    check(conversation_snapshot_prefix(image, anchor, g, false, error), "trim to the anchor checkpoint");
+    check(error.empty(), "a valid trim reports no error");
+    check(image.live.ids.size() == (size_t) anchor && image.live.gdn == at_anchor.gdn &&
+          image.live.tails == at_anchor.tails,
+          "the anchor's own running state becomes the live state, so a restore is exact there");
+    check(image.checkpoints.empty(), "every checkpoint past the anchor is dropped");
+    const uint8_t* after = nullptr;
+    { const ConversationBuffer& first = image.kv[0].k;
+      first.visit(0, 1, [&](const uint8_t* p, size_t, size_t) { after = p; return true; }); }
+    check(after == bytes && image.kv[0].k.size() == (size_t) anchor * 2 * 128 * 2,
+          "the K/V keeps its allocation and only shrinks its extent");
+    check(image.kv[0].k.size() < full &&
+          image.kv[0].pooled.size() == (size_t) (anchor / block + 1) * 128 * sizeof(float),
+          "the indexer extent follows the anchor too");
+    check(image.kv[0].cells == anchor && image.kv[0].pooled_rows == anchor / block + 1,
+          "the recorded K/V extent follows the anchor");
+    check(parked.live.ids.size() == (size_t) live && parked.checkpoints.size() == 2 &&
+          parked.kv[0].k.size() == full, "the parked image is untouched by the trim");
+    image.kv[0].k.resize(image.kv[0].k.size() + 4, 9);
+    std::vector<uint8_t> probe(4, 0);
+    check(image.kv[0].k.read(probe.data(), full / 2 - 4, 4) && probe[0] == 3,
+          "a write past the anchor leaves the original K/V bytes alone");
+    check(parked.kv[0].k.read(probe.data(), full / 2 - 4, 4) && probe[0] == 3,
+          "and the parked image still reads its own prefix");
+    SavedConversation missing = parked;
+    check(!conversation_snapshot_prefix(missing, 5 * page, g, false, error) &&
+          missing.live.ids.size() == (size_t) live && missing.checkpoints.size() == 2,
+          "no checkpoint at that extent is refused, and the image is left as it was");
+    SavedConversation stateless = parked;
+    stateless.checkpoints[0].drop_state();
+    check(!conversation_snapshot_prefix(stateless, anchor, g, false, error),
+          "a matching position without a running state is refused");
+    SavedConversation split = parked;
+    split.stage_images.push_back(SavedConversation{});
+    check(!conversation_snapshot_prefix(split, anchor, g, false, error),
+          "a layer split's image is trimmed stage by stage");
+    SavedConversation delta = parked;
+    delta.kv[0].first_units[0] = anchor;
+    check(!conversation_snapshot_prefix(delta, anchor, g, false, error), "a disk delta image is refused");
+    SavedConversation malformed = parked;
+    malformed.kv[0].k.pop_back();
+    check(!conversation_snapshot_prefix(malformed, anchor, g, false, error) &&
+              malformed.live.ids.size() == (size_t) live && malformed.checkpoints.size() == 2,
+          "an incomplete K/V cell is rejected before checkpoint state or extents change");
+    SavedConversation parts = parked;
+    parts.live.stage_parts.push_back(ConversationCheckpoint{});
+    check(!conversation_snapshot_prefix(parts, anchor, g, false, error),
+          "a live checkpoint with stage parts is refused");
+    SavedConversation whole = parked;
+    check(conversation_snapshot_prefix(whole, live, g, false, error) && whole.checkpoints.size() == 2,
+          "an extent equal to the live state is a no-op trim");
+    ModelGeometry other = g;
+    other.head_dim = 64;
+    SavedConversation foreign = parked;
+    check(!conversation_snapshot_prefix(foreign, anchor, other, false, error),
+          "another model geometry is refused");
+    {   // a draft layer rides along: no indexer rows, and its own ring extent follows
+        SavedConversation draft_image = parked_prefix_image(g, live);
+        draft_image.kv.push_back(ConversationKv{});
+        ConversationKv& draft = draft_image.kv.back();
+        draft.cells = live;
+        draft.heads = g.n_head_kv;
+        draft.head_dim = g.head_dim;
+        draft.page_size = page;
+        draft.idx_dim = g.idx_key_dim;
+        draft.pooled_rows = 0;
+        draft.k.resize((size_t) live * 2 * 128 * 2, 6);
+        ConversationCheckpoint at_anchor;
+        at_anchor.ids.assign((size_t) anchor, 5);
+        at_anchor.gdn.assign(8, 1);
+        draft_image.checkpoints.push_back(std::move(at_anchor));
+        check(conversation_snapshot_prefix(draft_image, anchor, g, true, error),
+              "an image whose last layer is the draft trims too");
+        check(draft_image.kv.size() == 2 && draft_image.kv.back().pooled.empty() &&
+              draft_image.kv.back().pooled_rows == 0 &&
+              draft_image.kv.back().k.size() == (size_t) anchor * 2 * 128 * 2,
+              "the draft layer keeps its ring extent and never grows indexer rows");
+        check(draft_image.kv[0].pooled_rows == anchor / block + 1,
+              "the indexer layer keeps its own rows");
+    }
+}
+
+// A retiring checkpoint's capture borrows the unchanged backing a sibling still
+// holds.  Bounded sparse checkpoints, a replacement terminal tail and slot churn
+// must never make it recapture a K/V the cache already has: the archive's own
+// selection refuses a divergence inside its input (a genuine branch, not a reply
+// rewrite), and the cache then offers the parked sibling holding that prefix,
+// whose buffers the new image shares and the ledger charges exactly once.
+void test_retiring_capture_borrows_backing() {
+    const size_t section = 4u << 20;   // one K/V section: large enough that a copy would show
+    auto conversation = [&](std::initializer_list<int32_t> ids) {
+        SavedConversation s = image(ids);
+        s.kv.resize(1);
+        s.kv[0].k.resize(section, 7);
+        return s;
+    };
+    ConversationCache cache(48u << 20, 4);
+    auto snapshot = conversation({1, 2, 3, 4, 5, 6});   // the long parked conversation
+    snapshot.terminal_from = 6;
+    check(cache.put(std::move(snapshot)), "the long conversation parks");
+    auto archive = conversation({1, 2, 3, 4, 9, 9});    // a replaced terminal reply
+    archive.checkpoint_archive = true;
+    archive.terminal_from = 6;                          // its input ends where its live does
+    archive.unchanged_tokens = 6;
+    ConversationCheckpoint early;                       // one bounded sparse input anchor
+    early.ids = {1, 2};
+    early.gdn.resize(8, 1);
+    archive.checkpoints.push_back(std::move(early));
+    check(cache.put(std::move(archive)), "the archive with a bounded sparse checkpoint parks");
+    ConversationCheckpoint retiring;
+    retiring.ids = {1, 2, 3, 4, 5, 6, 7};               // continues the long conversation
+    check(cache.archive_for(retiring, true).tokens == 0,
+          "a divergence before the archive's input boundary is a genuine branch, not a replacement");
+    const auto lenders = cache.shared_prefixes(retiring.ids, retiring.imgs, true);
+    check(!lenders.empty() && lenders.front().prefix_tokens == 6 && lenders.front().index == 0,
+          "the cache offers the sibling that still holds the whole shared prefix");
+    const size_t before = cache.bytes();
+    auto borrower = cache.fork(lenders.front().index);
+    borrower.live.ids = retiring.ids;
+    borrower.checkpoints.clear();
+    borrower.terminal_from = 6;
+    check(cache.put(std::move(borrower)), "the retiring capture parks beside the backing it borrowed");
+    check(cache.evictions() == 0, "the capture does not evict the backing it borrows");
+    check(cache.bytes() - before <= section / 8,
+          "the borrowed backing is charged once, not copied for the capture");
+    const size_t both = cache.bytes();
+    check(cache.evict_oldest(), "the borrowed source can leave on slot pressure");
+    check(cache.bytes() + section / 2 >= both,
+          "dropping the source leaves the shared prefix charged to the capture that borrowed it");
+}
 }
 
 int main() {
     test_root_priority();
+    test_shared_prefix();
+    test_prefix_trim();
+    test_retiring_capture_borrows_backing();
     {
         ConversationCache cache(1 << 20, 4);
         auto old = image_with_checkpoint({1, 2, 3, 4, 5, 6}, {1, 2, 3, 4});
         old.checkpoint_archive = true;
         old.unchanged_tokens = 6;
+        old.terminal_from = 4;
         old.checkpoints.push_back(old.live); // a terminal state can be archived twice
         check(cache.put(std::move(old)), "park generated reply and its earlier branch point");
         ConversationCheckpoint next;
@@ -149,8 +679,7 @@ int main() {
         check(cache.put(std::move(old)), "park older archive");
         auto newer = image_with_checkpoint({1, 2, 3, 4}, {1, 2});
         newer.checkpoint_archive = true;
-        ConversationCheckpoint prior;
-        prior.ids = {1, 2, 3};
+        auto prior = image({1, 2, 3}).live;
         newer.checkpoints.push_back(prior);
         check(cache.put(std::move(newer)), "park archive containing every older branch point");
         check(cache.size() == 1 && cache.superseded() == 1 && cache.evictions() == 0,
@@ -158,6 +687,47 @@ int main() {
         check(cache.best(std::vector<int32_t>{1, 2, 9}, {}, true).tokens == 2 &&
               cache.best(std::vector<int32_t>{1, 2, 3, 9}, {}, true).tokens == 3,
               "archive supersession retains both historical restore points");
+    }
+    {
+        ConversationCache cache(1 << 20, 4);
+        auto old = image_with_checkpoint({1, 2, 3}, {1, 2});
+        old.checkpoint_archive = true;
+        check(cache.put(std::move(old)), "a restorable historical archive parks");
+        auto newer = image_with_checkpoint({1, 2, 3, 4}, {1, 2});
+        newer.checkpoint_archive = true;
+        ConversationCheckpoint position;
+        position.ids = {1, 2, 3};
+        newer.checkpoints.push_back(std::move(position));
+        check(cache.put(std::move(newer)) && cache.size() == 2 && cache.superseded() == 0 &&
+                  cache.best(std::vector<int32_t>{1, 2, 3, 9}, {}, true).tokens == 3,
+              "a stateless matching position cannot supersede the original historical running state");
+    }
+    for (const bool archived : {false, true}) {
+        ConversationCache cache(1 << 20, 4);
+        auto parent = image_with_checkpoint({1, 2, 3, 4, 5, 6}, {1, 2});
+        parent.checkpoint_archive = archived;
+        parent.terminal_from = 5;
+        parent.kv.resize(1);
+        parent.kv[0].k.resize(16384, 9);
+        check(cache.put(std::move(parent)), "the original long continuation parks");
+        cache.seal_branches(std::vector<int32_t>{1, 2, 99}, {}, true);
+        auto archive = cache.fork(0);
+        archive.checkpoint_archive = true;
+        archive.archive_sealed = false;
+        archive.checkpoints.push_back(archive.live);
+        archive.live.ids.push_back(7);
+        auto archive_ids = archive.live.ids;
+        archive_ids.push_back(99); // the request's final token is not a resume point
+        check(cache.put(std::move(archive)), "a shared archive temporarily covers the original state");
+        auto rotated = cache.take(cache.best(archive_ids, {}, true).index);
+        rotated.checkpoints.push_back(rotated.live);
+        rotated.live.ids.push_back(8);
+        rotated.compact_checkpoints(1);
+        check(cache.put(std::move(rotated)), "the bounded archive rotates away from the original state");
+        const auto original = cache.best(std::vector<int32_t>{1, 2, 3, 4, 5, 6, 99}, {}, true);
+        check(original.tokens == 6 && original.live &&
+                  cache.fork(original.index).live.gdn.vec() == std::vector<uint8_t>(64, 7),
+              "archive compaction cannot remove the original long continuation's running state");
     }
     {
         // Active-window rotation must not make older branch points disappear.
@@ -209,8 +779,7 @@ int main() {
     }
     {
         auto older = image_with_checkpoint({1, 2, 3, 4, 5}, {1, 2});
-        ConversationCheckpoint deepest;
-        deepest.ids = {1, 2, 3, 4};
+        auto deepest = image({1, 2, 3, 4}).live;
         older.checkpoints.push_back(deepest);
         ConversationCache cache(1 << 20, 4);
         check(cache.put(std::move(older)), "conversation with historical checkpoints parks");
@@ -218,6 +787,23 @@ int main() {
         check(cache.put(std::move(recent)), "conversation with a rotated checkpoint window parks");
         check(cache.best(std::vector<int32_t>{1, 2, 8}, {}, true).tokens == 2,
               "supersession cannot delete the only historical checkpoint");
+    }
+    for (const size_t extent : {size_t(700), size_t(1000), ConversationBuffer::segment_bytes + 1000}) {
+        ConversationBuffer source;
+        source.resize(1000, 7);
+        auto branch = source;
+        const size_t peak = branch.allocation_peak(extent, 350);
+        branch.resize(extent);
+        branch.visit(350, extent - 350, [](uint8_t* p, size_t n, size_t) {
+            std::memset(p, 9, n);
+            return true;
+        });
+        check(branch.bytes() <= peak, "a resized shared suffix and its split directory fit the admitted peak");
+        uint8_t prefix = 0, suffix = 0, original = 0;
+        check(branch.read(&prefix, 349, 1) && prefix == 7 &&
+                  branch.read(&suffix, extent - 1, 1) && suffix == 9 &&
+                  source.read(&original, 999, 1) && original == 7,
+              "the admitted suffix write preserves the original prefix through shrink, rewrite, and growth");
     }
     {
         ConversationBuffer bytes;
@@ -328,8 +914,7 @@ int main() {
     }
     {
         auto s = image({1, 2, 3});
-        ConversationCheckpoint cp;
-        cp.ids = {1, 2};
+        auto cp = image({1, 2}).live;
         s.checkpoints.push_back(cp);
         ConversationCache cache(4096, 4);
         cache.put(std::move(s));
@@ -375,7 +960,7 @@ int main() {
         // #342: MAIN -> SUB (9 turns) -> MAIN with 4 slots.  Every SUB turn parks the previous turn's live state
         // (its reply as generated, which the next request re-rendered) with a chain that holds that turn's
         // boundary checkpoint; the copy a turn back adds only that stale tail and is dropped, so MAIN survives.
-        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        auto cp = [](std::vector<int32_t> ids) { auto c = image({}).live; c.ids = std::move(ids); return c; };
         auto with = [](std::vector<int32_t> prefix, std::initializer_list<int32_t> more) {
             prefix.insert(prefix.end(), more); return prefix;
         };
@@ -406,7 +991,7 @@ int main() {
     {
         // what is NOT superseded: another conversation sharing only the root, an entry without checkpoints, the
         // other steering mode, a branch whose deepest checkpoint the new chain does not hold
-        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        auto cp = [](std::vector<int32_t> ids) { auto c = image({}).live; c.ids = std::move(ids); return c; };
         ConversationCache cache(1 << 20, 8);
         SavedConversation other = image({1, 2, 3, 4, 50, 51, 52});
         other.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 50, 51})};

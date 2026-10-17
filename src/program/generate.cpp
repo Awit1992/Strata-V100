@@ -643,9 +643,9 @@ struct Options {
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
-    /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
-    /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
-    /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
+    /// --serve: bound ordinary recurrent checkpoints in the active window and each parked archive.
+    /// Each state needs about 118 MB of host RAM. Archives keep sparse prefix anchors, not one state per turn.
+    /// Explicit pins remain protected. Matching requests replay only the suffix after a retained anchor.
     int prompt_cache = 6;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
@@ -8285,6 +8285,16 @@ int main(int argc, char** argv) {
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        // The input boundary of the state the session currently holds: the prompt length of the request
+        // that produced it (0 = unknown).  A capture whose extent reaches it records it in
+        // SavedConversation::terminal_from, so a later request can tell "the client rewrote the reply"
+        // from "the client rewound into the input" without guessing from token distances.
+        int64_t live_prompt_tokens = 0;
+        // The boundary a capture of `tokens` tokens may record: the prompt it descends from once the
+        // capture reaches past the prompt's end (a generated reply), else 0 - still input, or unknown.
+        auto capture_terminal_from = [&](int64_t tokens) -> int64_t {
+            return live_prompt_tokens > 0 && tokens >= live_prompt_tokens ? live_prompt_tokens : 0;
+        };
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
         strata::core::ConversationCache conversations(
@@ -8303,6 +8313,7 @@ int main(int argc, char** argv) {
             disk_options.budget_bytes = (uint64_t) o.conversation_cache_disk_gib << 30;
             disk_options.max_records = (size_t) o.conversation_cache_disk_slots;
             disk_options.min_free_bytes = (uint64_t) o.conversation_cache_disk_min_free_mib << 20;
+            disk_options.max_checkpoint_states = (size_t) std::max(1, o.prompt_cache);
             std::string derr;
             const strata::core::ConversationDiskStatus opened = disk.open(disk_options, derr);
             if (opened != strata::core::ConversationDiskStatus::ok) {
@@ -8326,6 +8337,8 @@ int main(int argc, char** argv) {
             size_t tokens = 0;
             size_t snapshot_bytes = 0;
             int64_t delta_tokens = 0;       // the park's new tokens (a seed: its whole slice)
+            bool spill = false;
+            bool root = false;
         };
         std::optional<std::future<DiskWriteResult>> pending_disk_write;
         // The L3 disk chain of the MAIN live session: `main_chain` is the store's chain key (stable
@@ -8343,12 +8356,14 @@ int main(int argc, char** argv) {
                              (unsigned long long) disk.bytes());
                 return;
             }
-            std::fprintf(stderr, "strata serve: conversation disk: parked %zu tokens (+%lld) in %.1f ms; records=%zu "
-                         "bytes=%llu evictions=%llu corruptions=%llu snapshot_bytes=%zu\n",
+            std::fprintf(stderr, "strata serve: conversation disk: %s %zu tokens (+%lld) in %.1f ms; records=%zu "
+                         "bytes=%llu evictions=%llu corruptions=%llu snapshot_bytes=%zu%s\n",
+                         result.root ? "root parked" : "parked",
                          result.tokens, (long long) result.delta_tokens,
                          result.capture_ms + result.write_ms, disk.records(),
                          (unsigned long long) disk.bytes(), (unsigned long long) disk.evictions(),
-                         (unsigned long long) disk.corruptions(), result.snapshot_bytes);
+                         (unsigned long long) disk.corruptions(), result.snapshot_bytes,
+                         result.spill ? " source=l2-spill" : "");
         };
         // The stage that owns the MTP drafter: the last stage in a split (the drafter is bound to it), CUDA0
         // alone otherwise.  Only its image carries the draft layer; every other stage saves its own carve.
@@ -8357,6 +8372,53 @@ int main(int argc, char** argv) {
         auto owns_draft = [&](size_t i) -> bool { return mtp_on && i + 1 == disk_stage_count; };
         auto stage_session = [&](size_t i) -> strata::core::SessionState& { return i == 0 ? ss : stages[i - 1]->ss; };
         auto stage_device = [&](size_t i) -> int { return i == 0 ? 0 : stages[i - 1]->dev; };
+        auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
+            std::vector<ImgKey> v;
+            for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
+            return v;
+        };
+        auto stage_prefix_unchanged = [&](const strata::core::SavedConversation& part, size_t i,
+                                          int64_t tokens, std::string& why) {
+            const auto& session = stage_session(i);
+            const size_t layers = (size_t) session.qsa_alloc;
+            if (part.kv.size() != layers + (owns_draft(i) ? 1 : 0)) return false;
+            const strata::core::OnDevice on(stage_device(i));
+            const cudaError_t sync = cudaDeviceSynchronize();
+            if (sync != cudaSuccess) {
+                why = std::string("cannot compare cached prefix: ") + cudaGetErrorString(sync);
+                return false;
+            }
+            for (size_t j = 0; j < part.kv.size(); ++j) {
+                const bool index = j < layers;
+                const auto& state = index ? session.qsa_states[session.qsa_ord0 + j] : mtp.kv_state();
+                const int64_t prefix = index ? tokens : std::max<int64_t>(0, tokens - 1);
+                bool same = false;
+                if (!strata::core::conversation_kv_prefix_matches(
+                        part.kv[j], state, g, prefix, index, same, why) || !same) return false;
+            }
+            return true;
+        };
+        // The longest prefix of a parked image the device still agrees with, byte for byte: the requested
+        // extent, then every checkpoint the image holds inside it (a page the engine recomputed can differ
+        // even at equal IDs), then nothing.  A caller borrows exactly this much K/V and reads the rest from
+        // the device, so a retiring checkpoint never copies a backing a sibling already holds.
+        auto verified_prefix = [&](const strata::core::SavedConversation& image, int64_t upto,
+                                   std::string& why) -> int64_t {
+            if (upto <= 0 || image.stage_images.size() + 1 != disk_stage_count) return 0;
+            std::vector<int64_t> ladder{upto};
+            for (const auto& c : image.checkpoints)
+                if (!c.ids.empty() && (int64_t) c.ids.size() < upto) ladder.push_back((int64_t) c.ids.size());
+            std::sort(ladder.begin(), ladder.end(), [](int64_t left, int64_t right) { return left > right; });
+            ladder.erase(std::unique(ladder.begin(), ladder.end()), ladder.end());
+            for (const int64_t tokens : ladder) {
+                if (tokens <= 0) break;
+                bool same = true;
+                for (size_t i = 0; i < disk_stage_count && same; ++i)
+                    same = stage_prefix_unchanged(i == 0 ? image : image.stage_images[i - 1], i, tokens, why);
+                if (same) return tokens;
+            }
+            return 0;
+        };
         // Capture must finish before the session is overwritten. The file write then runs while the next request
         // uses the GPUs. A lookup or a later park joins the one pending write before it touches the store index.
         auto park_disk = [&]() {
@@ -8365,63 +8427,70 @@ int main(int argc, char** argv) {
             const size_t upto = live.size();
             if (upto == 0) return;
             const auto t0 = Clock::now();
-            // ---- The chain for the outgoing conversation: its tracked chain; otherwise re-adopt
-            // the longest matching 'c' chain (a restart), or the 'p' root as the seed base (a fresh
-            // chat sharing the system prompt).
+            // Append a proven continuation or replace only an obsolete terminal
+            // reply. A genuine shorter branch keeps the source continuation.
             std::string name = main_chain;
             std::string base_name;
-            uint64_t cover = main_cover, base_tokens = 0;
-            uint64_t unchanged = main_cover;
-            if (!name.empty() && !disk.cover(name, cover)) name.clear();   // the chain was evicted
+            uint64_t cover = 0, base_tokens = 0;
+            if (!name.empty() &&
+                (!disk.cover(name, cover) || main_cover < cover ||
+                 !disk.can_append(name, live, live_imgs, cvec_cached, cover)))
+                name.clear();
             if (name.empty()) {
                 strata::core::ConversationDiskMatch m;
-                if (disk.best(live, live_imgs, cvec_cached, m) && m.tokens > 0 && !m.name.empty()) {
-                    if (m.name[0] == 'c') {
-                        name = m.name;
-                        unchanged = (uint64_t) m.tokens;
-                        if (!disk.cover(name, cover)) name.clear();   // evicted between best and park
-                    } else if (m.name[0] == 'p') {
-                        base_name = m.name;
-                        base_tokens = (uint64_t) m.tokens;
+                if (disk.shared_prefix(live, live_imgs, cvec_cached, m) && m.prefix_tokens > 0) {
+                    strata::core::ConversationDiskRecord base;
+                    std::string why;
+                    bool same = disk.get_prefix(m.name, base, (uint64_t) m.prefix_tokens, why) ==
+                                    strata::core::ConversationDiskStatus::ok &&
+                                base.stages.size() == disk_stage_count;
+                    int64_t common = m.prefix_tokens;
+                    auto matches = [&](int64_t tokens) {
+                        for (size_t i = 0; i < base.stages.size(); ++i)
+                            if (!stage_prefix_unchanged(base.stages[i], i, tokens, why)) return false;
+                        return true;
+                    };
+                    if (same && !matches(common)) {
+                        // A replay can change the reply cells but retain the
+                        // input and an earlier prefix. Try every boundary, not
+                        // only the newest checkpoint that may itself differ.
+                        std::vector<int64_t> boundaries;
+                        auto add = [&](int64_t tokens) {
+                            if (tokens > 0 && tokens < common) boundaries.push_back(tokens);
+                        };
+                        add((int64_t) main_cover);
+                        add(live_prompt_tokens);
+                        add(base.stages[0].terminal_from);
+                        for (const auto& c : base.stages[0].checkpoints) add((int64_t) c.ids.size());
+                        for (const auto& c : checks) add((int64_t) c.ids.size());
+                        std::sort(boundaries.begin(), boundaries.end(), std::greater<int64_t>());
+                        boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+                        same = false;
+                        for (const int64_t boundary : boundaries)
+                            if (matches(boundary)) { common = boundary; same = true; break; }
+                    }
+                    if (same) {
+                        if (m.name[0] == 'c' &&
+                            disk.can_append(m.name, live, live_imgs, cvec_cached, (uint64_t) common)) {
+                            name = m.name;
+                            cover = (uint64_t) common;
+                        } else {
+                            base_name = m.name;
+                            base_tokens = (uint64_t) common;
+                        }
                     }
                 }
+                if (name.empty()) cover = base_tokens;
             }
-            if (name.empty())
-                cover = base_tokens;   // a fresh seed: capture [seed base .. upto), never a stale cover
-            if (!name.empty()) {
-                const uint64_t rewind_at = std::min<uint64_t>((uint64_t) upto, unchanged);
-                if (rewind_at < cover) {
-                    // A checkpoint restore can rewrite the stored tail even
-                    // when the new conversation is longer than the old record.
-                    std::string rerr;
-                    const auto status = disk.rewind_chain(name, rewind_at, cover, rerr);
-                    if (status == strata::core::ConversationDiskStatus::miss) {
-                        name.clear();
-                        cover = 0;   // no retained panel: seed a self-contained branch
-                    } else if (status != strata::core::ConversationDiskStatus::ok) {
-                        std::fprintf(stderr, "strata serve: conversation disk: skip parking (%s)\n", rerr.c_str());
-                        main_chain.clear();
-                        main_cover = 0;
-                        return;
-                    }
-                }
-                if (upto == cover) return;          // nothing new since the last park: zero I/O
-                if (upto < cover) {                 // rewound below every held panel: re-seed next park
-                    main_chain.clear();
-                    main_cover = 0;
-                    return;
-                }
-            }
+            if (upto == cover) return;
             // ---- Split the checkpoints into per-stage parts (unchanged from the full-image park).
             std::vector<std::vector<ConvCheckpoint>> stage_checks(disk_stage_count);
             for (auto& v : stage_checks) v.reserve(checks.size());
-            // The delta carries only NEW checkpoints: positions strictly after the park's base (the
-            // seed base or the last panel's end).  The store rejects any checkpoint at or under the
-            // base ("an invalid checkpoint in the delta"), and a rejected park re-captures the whole
-            // [base, upto) K/V on every request - the observed steady-state TTFT spike on chats that
-            // share the 'p' root chain and keep an early checkpoint under it.
+            // Ordinary checkpoints belong to the new delta. Explicit pins can
+            // precede its base: the bounded sidecar must retain them even when
+            // an earlier archive spill did not include that active pin.
             for (const ConvCheckpoint& c : checks) {
-                if (c.ids.size() <= cover) continue;                // already merged or in the base chain
+                if (c.ids.size() <= cover && !c.pinned) continue;
                 if (c.ids.size() > live.size()) return;             // an incomplete part set
                 if (!stages.empty() && c.stage_parts.size() != stages.size()) return;   // an incomplete part set
                 for (size_t i = 0; i < disk_stage_count; ++i) {
@@ -8429,6 +8498,7 @@ int main(int argc, char** argv) {
                     part.ids = c.ids;
                     part.imgs = c.imgs;
                     part.used = c.used;
+                    part.pinned = c.pinned;
                     if (i == 0) {
                         part.gdn = c.gdn; part.ple = c.ple; part.tails = c.tails;
                         part.dead = c.dead; part.block_pos = c.block_pos;
@@ -8456,6 +8526,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation disk: skip parking (%s)\n", derr.c_str());
                     return;
                 }
+                record.stages[i].terminal_from =
+                    live_prompt_tokens <= (int64_t) upto ? live_prompt_tokens : 0;
             }
             const size_t ram_bytes = record.bytes();
             const size_t tokens = upto;
@@ -8464,15 +8536,26 @@ int main(int argc, char** argv) {
             if (fresh) {
                 // The chain key from the seed's content: stable for the chain's whole life.
                 name = strata::core::conversation_disk_name(live, live_imgs, cvec_cached);
+                if (disk.has(name)) {
+                    const std::string stem = name;
+                    uint64_t variant = 0;
+                    do { name = stem + "-" + std::to_string(++variant); } while (disk.has(name));
+                }
             }
             const std::string chain_key = name;
-            const std::string seed_base = base_name;
+            strata::core::ConversationDiskBase seed_base;
+            seed_base.name = base_name;
+            seed_base.tokens = base_tokens;
+            if (base_tokens) {
+                seed_base.ids.assign(live.begin(), live.begin() + (size_t) base_tokens);
+                seed_base.imgs = imgs_below(live_imgs, (int64_t) base_tokens);
+            }
             const int64_t delta_tokens = (int64_t) tokens - (int64_t) cover;
             // Capture must finish before the session is overwritten. The file write then runs while the next
             // request uses the GPUs. A lookup or a later park joins the one pending write before the store index.
             pending_disk_write.emplace(std::async(std::launch::async,
                 [&disk, record = std::move(record), capture_ms, tokens, ram_bytes, delta_tokens,
-                 chain_key, fresh, seed_base, base_tokens, aff = pool.submission_affinity()]() mutable {
+                 chain_key, fresh, seed_base = std::move(seed_base), aff = pool.submission_affinity()]() mutable {
                     // A new thread inherits the GPU driver's single-core pin (pool.hpp); restore the pool's
                     // original allowed CPUs so the file write is not restricted to that one core.
                     strata::kernels::cpu::restore_thread_affinity(aff);
@@ -8483,9 +8566,18 @@ int main(int argc, char** argv) {
                     result.delta_tokens = delta_tokens;
                     const auto write_at = Clock::now();
                     try {
-                        result.status = fresh
-                            ? disk.seed(chain_key, std::move(record), seed_base, base_tokens, result.error)
-                            : disk.append(chain_key, std::move(record), result.error);
+                        if (!fresh) {
+                            result.status = disk.append(chain_key, std::move(record), result.error);
+                        } else {
+                            result.status = strata::core::ConversationDiskStatus::invalid;
+                            if (!seed_base.name.empty() && seed_base.name[0] == 'c')
+                                result.status = disk.replace_terminal_tail(
+                                    seed_base.name, seed_base.tokens, std::move(record), result.error);
+                            if (result.status == strata::core::ConversationDiskStatus::invalid) {
+                                result.error.clear();
+                                result.status = disk.seed(chain_key, std::move(record), seed_base, result.error);
+                            }
+                        }
                     } catch (const std::exception& e) {
                         result.status = strata::core::ConversationDiskStatus::failed;
                         result.error = e.what();
@@ -8496,7 +8588,9 @@ int main(int argc, char** argv) {
                     result.write_ms = std::chrono::duration<double, std::milli>(Clock::now() - write_at).count();
                     return result;
                 }));
-            main_chain = chain_key;
+            // A fresh prefix borrow can replace its source's terminal tail or
+            // publish a new branch. Re-adopt the actual chain on the next park.
+            main_chain = fresh && base_tokens != 0 ? std::string() : chain_key;
             main_cover = (uint64_t) tokens;
         };
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
@@ -8573,32 +8667,41 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
-        // L2 victims already own complete host snapshots. Move them to L3 without a GPU capture.
-        // Complete seeds avoid replaying a history of repeated hot-conversation parks.
+        // Move L2 victims to the same writer lane as direct parks. The request
+        // thread retains no second payload and does not perform the file write.
         auto spill_saved = [&](strata::core::SavedConversation&& image, bool root) noexcept -> bool {
             if (!disk_enabled || (root && !o.conversation_cache_disk_keep_root)) return false;
-            const auto t0 = Clock::now();
             try {
                 finish_disk_write();
                 const size_t tokens = image.live.ids.size();
-                const size_t snapshot_bytes = image.bytes();
-                std::string derr;
-                const auto status = disk.spill(std::move(image), root, derr);
-                if (status != strata::core::ConversationDiskStatus::ok) {
-                    std::fprintf(stderr, "strata serve: conversation disk: write failed in %.1f ms (%s); source=l2-spill\n",
-                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), derr.c_str());
-                    return false;
-                }
-                std::fprintf(stderr, "strata serve: conversation disk: %s %zu tokens (+%zu) in %.1f ms; "
-                                     "records=%zu bytes=%llu evictions=%llu corruptions=%llu snapshot_bytes=%zu source=l2-spill\n",
-                             root ? "root parked" : "parked", tokens, tokens,
-                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             disk.records(), (unsigned long long) disk.bytes(),
-                             (unsigned long long) disk.evictions(), (unsigned long long) disk.corruptions(), snapshot_bytes);
+                pending_disk_write.emplace(std::async(std::launch::async,
+                    [&disk, image = std::move(image), root, tokens,
+                     aff = pool.submission_affinity()]() mutable {
+                        strata::kernels::cpu::restore_thread_affinity(aff);
+                        DiskWriteResult result;
+                        result.tokens = tokens;
+                        result.delta_tokens = (int64_t) tokens;
+                        result.spill = true;
+                        result.root = root;
+                        const auto start = Clock::now();
+                        try {
+                            uint64_t written_tokens = 0;
+                            size_t written_bytes = 0;
+                            result.status = disk.spill(std::move(image), root, result.error,
+                                                       &written_tokens, &written_bytes);
+                            result.snapshot_bytes = written_bytes;
+                            result.delta_tokens = (int64_t) written_tokens;
+                        } catch (const std::exception& e) {
+                            result.error = e.what();
+                        } catch (...) {
+                            result.error = "unknown exception";
+                        }
+                        result.write_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+                        return result;
+                    }));
                 return true;
             } catch (const std::exception& e) {
-                std::fprintf(stderr, "strata serve: conversation disk: write failed in %.1f ms (%s); source=l2-spill\n",
-                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), e.what());
+                std::fprintf(stderr, "strata serve: conversation disk: write failed (%s); source=l2-spill\n", e.what());
             }
             return false;
         };
@@ -8632,11 +8735,6 @@ int main(int argc, char** argv) {
                              live.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
                 return true;
             }
-            // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
-            // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
-                std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
-                             "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
@@ -8653,6 +8751,33 @@ int main(int argc, char** argv) {
             } merge_back{cs, checks, n_st > 0};
             const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
             auto reuse = conversations.take_reuse();
+            if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                const auto match = conversations.shared_prefix(live, live_imgs, cvec_cached);
+                if (match.prefix_tokens > reuse.unchanged_tokens) {
+                    auto backing = conversations.fork(match.index);
+                    int64_t common = match.prefix_tokens;
+                    auto matches = [&](int64_t tokens) {
+                        if (backing.stage_images.size() != n_st) return false;
+                        for (size_t i = 0; i < disk_stage_count; ++i) {
+                            const auto& part = i == 0 ? backing : backing.stage_images[i - 1];
+                            if (!stage_prefix_unchanged(part, i, tokens, err)) return false;
+                        }
+                        return true;
+                    };
+                    bool compatible = matches(common);
+                    if (!compatible) {
+                        common = std::min(common, backing.unchanged_tokens);
+                        compatible = common > reuse.unchanged_tokens && matches(common);
+                    }
+                    if (compatible) {
+                        const int64_t captured = (int64_t) backing.live.ids.size();
+                        reuse = {std::move(backing.kv), captured, common, {}};
+                        for (auto& part : backing.stage_images)
+                            reuse.stages.push_back({std::move(part.kv), captured, common, {}});
+                    }
+                    err.clear();
+                }
+            }
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -8696,13 +8821,12 @@ int main(int argc, char** argv) {
                 err.clear();
             }
             estimate += stage_estimate;
-            // A park carrying its own retained K/V replaces memory the cache
-            // already held, so capacity is make_room's call - it runs next either
-            // way, and put()'s accounting still bounds the budget. The with-reuse
-            // estimate must stay uncapped: it counts the retained buffers'
-            // capacity and directories, and put() charges that same true size -
-            // a capped figure would under-evict and overfill the budget.
-            if (!conversations.make_room(estimate, held)) {
+            // A shared prefix already charged to L2 needs no second capacity
+            // reservation. Capture still admits its COW detach and allocation peak.
+            size_t shared = conversations.shared_bytes(reuse);
+            for (const auto& part : stage_reuse) shared += conversations.shared_bytes(part);
+            const size_t capacity = estimate > shared ? estimate - shared : 0;
+            if (!conversations.make_room(capacity, held)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB cannot fit byte budget or protected slots)\n",
                              estimate >> 20);
                 return true;
@@ -8742,10 +8866,14 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
                                  evicted, evicted == 1 ? "" : "s", additional >> 20,
                                  (long long) o.conversation_cache_min_free_mib);
+                // The input boundary this park's live state descends from: the reply past it is what a
+                // later re-rendered turn may replace.
+                const int64_t parked_terminal_from = capture_terminal_from((int64_t) live.size());
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
                         std::move(reuse), &reused_bytes)) return false;
+                image.terminal_from = parked_terminal_from;
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
@@ -8755,6 +8883,7 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
                             std::move(stage_reuse[k]), &reused_bytes))
                         return false;
+                    part.terminal_from = parked_terminal_from;
                     image.stage_images.push_back(std::move(part));
                 }
                 // A successful L2 admission does not write through to L3.
@@ -8807,11 +8936,6 @@ int main(int argc, char** argv) {
         Clock::time_point pp_t0 = Clock::now();
         int64_t recent_kv_cells = 0;
         auto last_kv_activity = Clock::now();
-        auto imgs_below = [&](const std::vector<ImgKey>& all, int64_t L) {
-            std::vector<ImgKey> v;
-            for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
-            return v;
-        };
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed
         // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
         // the next, so each stage saves its own part when IT reaches a checkpoint position (the same rule as below:
@@ -8848,6 +8972,7 @@ int main(int argc, char** argv) {
                 if (match.tokens > 0) previous = conversations.take(match.index);
                 auto store = [&](strata::core::SavedConversation&& image, size_t reused_bytes = 0) {
                     image.checkpoint_archive = true;
+                    image.compact_checkpoints((size_t) std::max(1, o.prompt_cache));
                     const size_t bytes = image.bytes();
                     const size_t count = image.checkpoints.size() + 1;
                     const size_t tokens = image.live.ids.size();
@@ -8878,16 +9003,28 @@ int main(int argc, char** argv) {
                 if (covered) {
                     const bool present = previous.live.ids == checkpoint.ids ||
                         std::any_of(previous.checkpoints.begin(), previous.checkpoints.end(),
-                                    [&](const auto& c) { return c.ids == checkpoint.ids; });
+                                    [&](const auto& c) { return c.has_state() && c.ids == checkpoint.ids; });
                     if (present) return store(std::move(previous));
                 }
-                int64_t historical_tokens = 0;
-                bool replaceable = !previous.live.pinned;
-                for (const auto& c : previous.checkpoints) {
-                    if (c.ids == previous.live.ids) { if (c.pinned) replaceable = false; continue; }
-                    historical_tokens = std::max<int64_t>(historical_tokens, c.ids.size());
-                }
-                replaceable = replaceable && historical_tokens > 0 && historical_tokens <= shared_tokens;
+                // The anchors this chain may keep: the states inside the prefix
+                // this capture shares with the device (every later request still
+                // reaches them) and every pin.  A state past it belongs to the
+                // reply being replaced, or to a position the client rewrote, so it
+                // is disposable - one copy of it per turn never accumulates.
+                const int64_t keep_limit = std::min<int64_t>(shared_tokens, (int64_t) previous.live.ids.size());
+                int64_t kept_tokens = 0;
+                for (const auto& c : previous.checkpoints)
+                    if (!c.ids.empty() && (c.pinned || (int64_t) c.ids.size() <= keep_limit))
+                        kept_tokens = std::max<int64_t>(kept_tokens, (int64_t) c.ids.size());
+                const bool keep_previous_live =
+                    !previous.live.ids.empty() && (int64_t) previous.live.ids.size() <= keep_limit;
+                if (keep_previous_live)
+                    kept_tokens = std::max<int64_t>(kept_tokens, (int64_t) previous.live.ids.size());
+                // A reply this image recorded a boundary for may be replaced; a
+                // chain whose anchors all sit inside the prefix this capture
+                // borrows keeps them exactly where they are.
+                bool replaceable = !previous.live.pinned && previous.terminal_from > 0 &&
+                                   shared_tokens >= previous.terminal_from && kept_tokens <= shared_tokens;
                 auto recover = [&](int64_t prefix) -> bool {
                     if (previous.unchanged_tokens >= prefix) return true;
                     bool same = true;
@@ -8909,18 +9046,22 @@ int main(int argc, char** argv) {
                     if (same) previous.unchanged_tokens = prefix;
                     return true;
                 };
-                int64_t required = terminal_rewrite ? historical_tokens : shared_tokens;
+                int64_t required = shared_tokens;
                 if (match.tokens > 0 && !recover(required)) return false;
                 if (previous.unchanged_tokens < required && replaceable) {
-                    // Recomputed reply cells can differ even with equal IDs.
-                    // Keep the historical chain and replace only its terminal
-                    // state, provided every retained checkpoint is still valid.
+                    // Recomputed reply cells can differ even with equal IDs: the
+                    // device may still agree up to the deepest anchor the chain
+                    // keeps.  Keep that history and replace only the reply.
                     terminal_rewrite = true;
                     covered = false;
-                    required = historical_tokens;
+                    required = kept_tokens;
                     if (!recover(required)) return false;
                 }
-                if (match.tokens > 0 && previous.unchanged_tokens < required) {
+                // Nothing of this backing can be reused: the device disagrees with
+                // it past a boundary the chain still needs, or it holds no cells.
+                const bool no_reuse = !covered &&
+                    std::min({previous.unchanged_tokens, (int64_t) previous.live.ids.size(), shared_tokens}) <= 0;
+                if (match.tokens > 0 && (previous.unchanged_tokens < required || no_reuse)) {
                     // A historical prefix changed. Keep that independent branch.
                     if (!store(std::move(previous))) return false;
                     previous = {};
@@ -8955,6 +9096,35 @@ int main(int argc, char** argv) {
                 size_t estimate = 0, retained = 0;
                 std::vector<strata::core::ConversationKvReuse> reuse(disk_stage_count);
                 const std::vector<ConvCheckpoint> no_checks;
+                // No archive chain can lend this capture its backing: a parked
+                // sibling that holds the same prefix still can.  Same independent
+                // selection as park_current_body - the longest common prefix first,
+                // confirmed byte for byte on the device - so a retiring checkpoint
+                // never recaptures a K/V the cache already holds.  Only the K/V is
+                // borrowed: the chain it came from stays where it is, so the new
+                // image starts with no anchors of its own.
+                int64_t borrowed = 0, borrow_extent = 0;
+                if (!covered && old[0].kv.empty()) {
+                    for (const auto& lender : conversations.shared_prefixes(checkpoint.ids, checkpoint.imgs, cvec_cached)) {
+                        strata::core::SavedConversation backing;
+                        try { backing = conversations.fork(lender.index); }
+                        catch (const std::bad_alloc&) { break; }
+                        const int64_t common = verified_prefix(backing, lender.prefix_tokens, err);
+                        if (common <= 0) continue;
+                        for (size_t i = 0; i < disk_stage_count; ++i)
+                            old[i].kv = std::move((i == 0 ? backing : backing.stage_images[i - 1]).kv);
+                        borrowed = common;
+                        borrow_extent = (int64_t) backing.live.ids.size();
+                        break;
+                    }
+                    err.clear();   // a refused comparison is not this capture's failure
+                }
+                // The K/V this capture reuses: the shared prefix the device just
+                // confirmed (a shorter one after a partial recovery), or the prefix
+                // a sibling lent.  Everything past it is read from the device, and
+                // no anchor outside it can stay honest.
+                const int64_t reuse_tokens = borrowed > 0 ? borrowed
+                    : std::min({old[0].unchanged_tokens, (int64_t) old[0].live.ids.size(), shared_tokens});
                 for (size_t i = 0; i < disk_stage_count; ++i) {
                     auto& part = old[i];
                     if (covered) {
@@ -8962,17 +9132,26 @@ int main(int argc, char** argv) {
                         estimate += part.bytes();
                         continue;
                     }
-                    const int64_t captured = (int64_t) part.live.ids.size();
-                    if (terminal_rewrite) {
-                        // The client replaced the generated reply. Earlier
-                        // branch points still match; only the obsolete terminal
-                        // state (and any duplicate of it) leaves the chain.
+                    const int64_t captured = borrowed > 0 ? borrow_extent : (int64_t) part.live.ids.size();
+                    if (borrowed == 0) {
+                        // Keep the anchors inside the prefix this capture reuses -
+                        // the positions every later request still shares - and every
+                        // pin.  An ordinary state past it belongs to the reply being
+                        // replaced, or to a position the client rewrote: it is
+                        // disposable, so one copy of it per turn never accumulates.
                         part.checkpoints.erase(std::remove_if(part.checkpoints.begin(), part.checkpoints.end(),
-                            [&](const auto& c) { return c.ids == part.live.ids; }), part.checkpoints.end());
-                    } else if (captured > 0 && part.live.ids != states[i].ids)
-                        part.checkpoints.push_back(std::move(part.live));
-                    reuse[i] = {std::move(part.kv), captured,
-                                std::min({old[0].unchanged_tokens, captured, shared_tokens}), {}};
+                            [&](const auto& c) {
+                                if (c.pinned) return false;
+                                return (int64_t) c.ids.size() > reuse_tokens || c.ids == part.live.ids;
+                            }), part.checkpoints.end());
+                        // An outgoing state the client's new input covers verbatim
+                        // is a historical input anchor; one past the reused prefix
+                        // is the reply being written and goes with it.
+                        if (!terminal_rewrite && captured > 0 && captured <= reuse_tokens &&
+                            part.live.ids != states[i].ids)
+                            part.checkpoints.push_back(std::move(part.live));
+                    }
+                    reuse[i] = {std::move(part.kv), captured, reuse_tokens, {}};
                     const strata::core::OnDevice on(stage_device(i));
                     const strata::core::ConversationView view{
                         states[i].ids, states[i].imgs, no_checks, cvec_cached, &states[i]};
@@ -8987,7 +9166,10 @@ int main(int argc, char** argv) {
                     estimate += bytes + metadata;
                     retained += reuse[i].bytes() + metadata;
                 }
-                conversations.make_room(estimate);
+                size_t shared = 0;
+                for (size_t i = 0; i < old.size(); ++i)
+                    shared += conversations.shared_bytes(old[i]) + conversations.shared_bytes(reuse[i]);
+                conversations.make_room(estimate > shared ? estimate - shared : 0);
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t additional = covered ? 0 : estimate > retained ? estimate - retained : 0;
                 auto admit = [&] {
@@ -9013,6 +9195,9 @@ int main(int argc, char** argv) {
                                 &reused_bytes)) return false;
                         part.checkpoints = std::move(old[i].checkpoints);
                         part.unchanged_tokens = (int64_t) states[i].ids.size();
+                        // The boundary this capture's state descends from: the reply
+                        // past it is what a later re-rendered turn may replace.
+                        part.terminal_from = capture_terminal_from((int64_t) states[i].ids.size());
                     }
                     if (i == 0) image = std::move(part);
                     else image.stage_images.push_back(std::move(part));
@@ -9033,18 +9218,8 @@ int main(int argc, char** argv) {
             err.clear();
         };
         auto resident_indices = [&](const std::vector<ConvCheckpoint>& chain, int64_t upto) {
-            std::vector<size_t> eligible;
-            for (size_t k = 0; k < chain.size(); ++k)
-                if ((int64_t) chain[k].ids.size() <= upto) eligible.push_back(k);
-            std::sort(eligible.begin(), eligible.end(), [&](size_t a, size_t b) {
-                return chain[a].ids.size() < chain[b].ids.size();
-            });
-            const size_t limit = (size_t) std::max(1, o.prompt_cache);
-            if (eligible.size() > limit) {
-                if (limit == 1) eligible.erase(eligible.begin(), eligible.end() - 1);
-                else eligible.erase(eligible.begin() + 1, eligible.end() - (limit - 1));
-            }
-            return eligible;
+            return strata::core::conversation_checkpoint_indices(
+                chain, (size_t) std::max(1, o.prompt_cache), upto);
         };
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
                                  const std::vector<int32_t>* tokens = nullptr) -> bool {
@@ -9082,7 +9257,9 @@ int main(int argc, char** argv) {
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
                 const int64_t old_tail = tail_ckpt_len;
                 for (const auto& k : checks)
-                    if (old_tail >= 0 && (int64_t) k.ids.size() == old_tail && !archive_checkpoint(k))
+                    if (old_tail >= 0 && (int64_t) k.ids.size() == old_tail &&
+                        (k.pinned || live_prompt_tokens == 0 || old_tail <= live_prompt_tokens) &&
+                        !archive_checkpoint(k))
                         archive_dropped("cannot preserve the outgoing tail");
                 checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
                                  return old_tail >= 0 && (int64_t) k.ids.size() == old_tail;
@@ -9113,7 +9290,11 @@ int main(int argc, char** argv) {
                     }
                 const size_t victim = strata::program::conv_cache::eviction_victim(
                     stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), pin_flags.get());
-                if (!archive_checkpoint(checks[victim])) archive_dropped("cannot preserve the retention victim");
+                const auto& retired = checks[victim];
+                if ((retired.pinned || live_prompt_tokens == 0 ||
+                     (int64_t) retired.ids.size() <= live_prompt_tokens) &&
+                    !archive_checkpoint(retired))
+                    archive_dropped("cannot preserve the retention victim");
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
             return true;
@@ -11163,6 +11344,7 @@ int main(int argc, char** argv) {
                     checks = std::move(image.checkpoints);
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
+                    live_prompt_tokens = 0; // session files do not preserve input-boundary provenance
                     live_ok = true;
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
@@ -11410,6 +11592,14 @@ int main(int argc, char** argv) {
                         from_live = false;
                     }
             }
+            // A resident anchor that reaches the immutable input already serves
+            // a reply rewrite. A parked point inside that same generated tail
+            // does not justify parking and transferring another whole image.
+            const bool resident_reply_anchor = live_ok && live_prompt_tokens > 0 &&
+                                               resume >= live_prompt_tokens - 1;
+            auto needs_parked_state = [&](int64_t tokens) {
+                return !resident_reply_anchor || tokens > (int64_t) live.size();
+            };
             if (std::getenv("STRATA_TRACE_RESUME") != nullptr) {
                 std::string why = "from_live";
                 if (!(o.prompt_cache > 0 || disk_enabled) || want_cvec != cvec_cached) {
@@ -11485,11 +11675,13 @@ int main(int argc, char** argv) {
             const uint64_t disk_lookup_bytes = disk_lookup ? disk.bytes() : 0;
             bool disk_chosen = false;
             strata::core::ConversationDiskRecord record;
-            if (strata::program::conv_cache::disk_reuse_wins(disk_hit, dmatch.tokens, parked.tokens, resume,
+            if (needs_parked_state(dmatch.tokens) &&
+                strata::program::conv_cache::disk_reuse_wins(disk_hit, dmatch.tokens, parked.tokens, resume,
                                                              slot_tokens, slot_source >= 0)) {
                 const auto t_read = Clock::now();
                 std::string derr;
-                const strata::core::ConversationDiskStatus got = disk.get(dmatch.name, record, derr);
+                const strata::core::ConversationDiskStatus got =
+                    disk.get_prefix(dmatch.name, record, (uint64_t) dmatch.tokens, derr);
                 const double read_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_read).count();
                 if (got == strata::core::ConversationDiskStatus::ok &&
                     record.stages.size() == disk_stage_count) {
@@ -11524,10 +11716,9 @@ int main(int argc, char** argv) {
                                      disk.records(), (unsigned long long) disk.bytes(),
                                      (unsigned long long) disk_hits, (unsigned long long) disk_misses);
                     } else {
-                        std::fprintf(stderr, "strata serve: conversation disk: discard invalid record %s (%s)\n",
+                        std::fprintf(stderr, "strata serve: conversation disk: skip invalid state in %s (%s)\n",
                                      dmatch.name.c_str(), derr.c_str());
-                        std::string rerr;
-                        disk.remove(dmatch.name, rerr);
+                        record.stages.clear();
                     }
                 } else if (got == strata::core::ConversationDiskStatus::corrupt) {
                     // get() already removed the file and counted the corruption.
@@ -11544,14 +11735,27 @@ int main(int argc, char** argv) {
                 }
             }
             std::optional<strata::core::SavedConversation> incoming;
-            bool incoming_root = false;
-            if (!disk_chosen &&
+            if (!disk_chosen && needs_parked_state(parked.tokens) &&
                 strata::program::conv_cache::ram_reuse_wins(parked.tokens, resume, slot_tokens)) {
-                incoming_root = o.conversation_cache_keep_root && conversations.pinned(parked.index);
-                incoming.emplace(conversations.take(parked.index));
-                incoming_root = incoming_root && incoming->checkpoints.empty() &&
-                    std::all_of(incoming->stage_images.begin(), incoming->stage_images.end(),
-                                [](const auto& part) { return part.checkpoints.empty(); });
+                try {
+                    incoming.emplace(conversations.fork(parked.index));
+                    auto later = std::move(incoming->stage_images);
+                    bool valid = strata::core::conversation_snapshot_prefix(
+                        *incoming, parked.tokens, g, owns_draft(0), err);
+                    for (size_t i = 0; valid && i < later.size(); ++i)
+                        valid = strata::core::conversation_snapshot_prefix(
+                            later[i], parked.tokens, g, owns_draft(i + 1), err);
+                    incoming->stage_images = std::move(later);
+                    if (!valid) {
+                        std::fprintf(stderr, "strata serve: conversation cache: discard invalid prefix (%s)\n", err.c_str());
+                        incoming.reset();
+                        err.clear();
+                    }
+                } catch (const std::bad_alloc&) {
+                    std::fprintf(stderr, "strata serve: conversation cache: cannot allocate prefix metadata; reading the prompt\n");
+                    incoming.reset();
+                    err.clear();
+                }
             }
             if (incoming) slot_source = -1;
             if (disk_lookup && !disk_chosen) {
@@ -11595,27 +11799,26 @@ int main(int argc, char** argv) {
             const bool inbound_inside_live =
                 live_ok && resume > 0 && (int64_t) live.size() > resume &&
                 std::equal(ids.begin(), ids.begin() + (size_t) resume, live.begin());
-            // pin=N: this request resumes exactly at the pinned shared prefix of the conversation the session holds
-            // (a sibling query of the last one).  What the last query added past it is its private suffix - a few
-            // dozen tokens, cheaper to read than the prefix's whole K/V is to copy to the host - so it is not parked:
-            // N queries keep one prefix.  A request without pin=, or one that resumes anywhere else, parks as before.
-            bool pin_sibling = false;
-            if (req_pin > 0 && req_ckpt && o.prompt_cache >= 3 && !from_live && !incoming && slot_source < 0 &&
-                resume == req_pin && live_ok)
-                for (const ConvCheckpoint& c : checks)
-                    if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
+            size_t incoming_held = 0;
+            if (incoming) {
+                const size_t bytes = incoming->bytes();
+                incoming_held = bytes - std::min(bytes, conversations.shared_bytes(*incoming));
+            }
             if ((!from_live && !inbound_inside_live) || incoming || disk_chosen || slot_source >= 0) {
-                if (!pin_sibling && !park_current(incoming ? incoming->bytes() : 0)) {
+                if (!park_current(incoming_held)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
             }
-            else if (!from_live && !pin_sibling) {
+            else if (!from_live) {
                 for (const auto& c : checks)
                     if ((int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs)) {
+                        if (resident_reply_anchor && !c.pinned &&
+                            (int64_t) c.ids.size() > live_prompt_tokens) continue;
                         if (!archive_checkpoint(c)) archive_dropped("cannot preserve an outgoing checkpoint");
                     }
             }
+            conversations.seal_branches(ids, req_imgs, cvec_cached);
             // A longer disk record (disk_chosen: it beat the slot's giveback) restores over the main session in
             // the `if (disk_chosen)` block below, so the giveback copy would be thrown away - skip it, and the
             // longest valid prefix still wins (the disk's resume replaces the slot's).
@@ -11659,7 +11862,7 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
             }
-            // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
+            // The incoming image holds only the selected state anchor and its K/V prefix.
             if (incoming && !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce)) {
                 std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
                 return 1;
@@ -11700,26 +11903,16 @@ int main(int argc, char** argv) {
                                  mtp.kv_state().kv_mode, "ram",
                                  (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
                 }
-                const bool keep_archive = incoming->checkpoint_archive;
-                if (incoming_root || keep_archive) {
-                    live = incoming->live.ids;
-                    live_imgs = incoming->live.imgs;
-                } else {
-                    live = std::move(incoming->live.ids);
-                    live_imgs = std::move(incoming->live.imgs);
-                }
+                ConvCheckpoint anchor = incoming->live;
+                anchor.used = ++check_clock;
+                anchor.stage_parts.clear();
+                for (const auto& part : incoming->stage_images)
+                    anchor.stage_parts.push_back(part.live);
+                live = std::move(incoming->live.ids);
+                live_imgs = std::move(incoming->live.imgs);
                 main_chain.clear();     // a RAM image: re-adopt its disk chain at the next park
                 main_cover = 0;
-                if (keep_archive) {
-                    // The archive remains immutable in L2. Only the resident
-                    // checkpoint window is copied; all K/V keeps one owner.
-                    checks.clear();
-                    for (size_t k : resident_indices(incoming->checkpoints, parked.tokens)) {
-                        checks.push_back(incoming->checkpoints[k]);
-                        for (const auto& part : incoming->stage_images)
-                            checks.back().stage_parts.push_back(part.checkpoints[k]);
-                    }
-                } else if (stages.empty()) {
+                if (stages.empty()) {
                     checks = std::move(incoming->checkpoints);
                 } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
                     strata::core::ConversationCheckpointSplit cs;
@@ -11727,22 +11920,27 @@ int main(int argc, char** argv) {
                     for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
+                const auto at = std::find_if(checks.begin(), checks.end(), [&](const auto& c) {
+                    return c.ids == anchor.ids && c.imgs == anchor.imgs;
+                });
+                if (at == checks.end()) checks.push_back(std::move(anchor));
+                else {
+                    anchor.pinned = anchor.pinned || at->pinned;
+                    *at = std::move(anchor);
+                }
                 cvec_cached = incoming->cvec;
                 resume = parked.tokens;
-                from_live = parked.live;
-                if (keep_archive) {
-                    incoming->unchanged_tokens = (int64_t) live.size();
-                    if (!conversations.put(std::move(*incoming))) spill_saved(std::move(*incoming), false);
-                } else if (incoming_root) {
-                    // Keep the immutable root available for another chat; its K/V is never an active reuse buffer.
-                    try { conversations.put(std::move(*incoming), 0, true); }
-                    catch (const std::bad_alloc&) {
-                        std::fprintf(stderr, "strata serve: conversation cache: skip retaining root (host allocation failed)\n");
+                // The fork was trimmed to the selected checkpoint. Its running
+                // state is already restored, and the original branch stays in L2.
+                from_live = true;
+                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                    try {
+                        std::vector<std::vector<strata::core::ConversationKv>> stage_kv;
+                        for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
+                        conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                    } catch (const std::bad_alloc&) {
+                        std::fprintf(stderr, "strata serve: conversation cache: cannot retain restored K/V metadata\n");
                     }
-                } else if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
-                    std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
-                    for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
@@ -11786,6 +11984,11 @@ int main(int argc, char** argv) {
                     strata::core::conversation_memory_admit(strata::core::available_host_bytes(), 0,
                         (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024) &&
                     conversations.make_room(record.bytes());
+                ConvCheckpoint anchor = record.stages[0].live;
+                anchor.used = ++check_clock;
+                anchor.stage_parts.clear();
+                for (size_t i = 1; i < record.stages.size(); ++i)
+                    anchor.stage_parts.push_back(record.stages[i].live);
                 if (promote) {
                     try {
                         live = record.stages[0].live.ids;
@@ -11808,6 +12011,14 @@ int main(int argc, char** argv) {
                     }
                     checks.push_back(std::move(c));
                 }
+                const auto at = std::find_if(checks.begin(), checks.end(), [&](const auto& c) {
+                    return c.ids == anchor.ids && c.imgs == anchor.imgs;
+                });
+                if (at == checks.end()) checks.push_back(std::move(anchor));
+                else {
+                    anchor.pinned = anchor.pinned || at->pinned;
+                    *at = std::move(anchor);
+                }
                 for (const ConvCheckpoint& checkpoint : checks)
                     check_clock = std::max(check_clock, checkpoint.used);
                 resume = dmatch.tokens;
@@ -11829,6 +12040,7 @@ int main(int argc, char** argv) {
                         for (size_t i = 1; i < record.stages.size(); ++i)
                             root.stage_images.push_back(std::move(record.stages[i]));
                         root.checkpoint_archive = !disk_root;
+                        root.compact_checkpoints((size_t) std::max(1, o.prompt_cache));
                         root.unchanged_tokens = (int64_t) live.size();
                         const size_t bytes = root.bytes();
                         const bool stored = conversations.put(std::move(root), 0, disk_root);
@@ -11856,6 +12068,7 @@ int main(int argc, char** argv) {
             if (!from_live && !main_chain.empty())
                 main_cover = std::min(main_cover, (uint64_t) resume);
             live_ok = false;   // until this request has finished, the session is in between
+            live_prompt_tokens = 0;   // the outgoing conversation has been parked: no state here descends from a known prompt yet
             // Avoid shrinking and refilling expert slots between short turns in an active burst.
             // Vision and explicit reserve-pressure paths still reclaim VRAM immediately.
             if (kvg_on()) {
@@ -11924,6 +12137,10 @@ int main(int argc, char** argv) {
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             conversations.limit_reuse(read_from);
             pp_total = n;
+            // This request's input boundary: a capture that reaches past `n` holds
+            // the generated reply that starts here.  Captures made while reading
+            // the prompt stay below it and record 0 (still input).
+            live_prompt_tokens = n;
             pp_from = read_from;
             pp_reached = read_from;
             pp_exact = true;   // a restore, a checkpoint mount or a zeroed session: the state is exactly at read_from
@@ -12592,6 +12809,15 @@ int main(int argc, char** argv) {
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
                                      "them\n", (long long) il_parts + 1, il_ms);
+            // Keep the predecode input boundary inside the existing active
+            // checkpoint limit. The final prompt token is evaluated by the
+            // first decode window; a reply rewrite can resume just before it
+            // without loading a parked copy of the previous generated tail.
+            if (!cancelled && req_ckpt && o.prompt_cache > 0 && n > 1 && at == n - 1 &&
+                !checkpoint_at(n - 1)) {
+                std::printf("ERR saving the input checkpoint failed%s\n", ckpt_why.c_str());
+                return 1;
+            }
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
