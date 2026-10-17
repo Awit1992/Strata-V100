@@ -8979,6 +8979,15 @@ int main(int argc, char** argv) {
                 return false;
             }
         };
+
+        // Preserving a checkpoint is an optimization: the session stays correct
+        // without it, so a failure here must never end the running engine.  Log
+        // what was dropped and keep serving.
+        auto archive_dropped = [&](const char* what) {
+            std::fprintf(stderr, "strata serve: checkpoint archive: %s (%s); the checkpoint is dropped\n",
+                         what, err.empty() ? "no space" : err.c_str());
+            err.clear();
+        };
         auto resident_indices = [&](const std::vector<ConvCheckpoint>& chain, int64_t upto) {
             std::vector<size_t> eligible;
             for (size_t k = 0; k < chain.size(); ++k)
@@ -9029,7 +9038,8 @@ int main(int argc, char** argv) {
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
                 const int64_t old_tail = tail_ckpt_len;
                 for (const auto& k : checks)
-                    if (old_tail >= 0 && (int64_t) k.ids.size() == old_tail && !archive_checkpoint(k)) return false;
+                    if (old_tail >= 0 && (int64_t) k.ids.size() == old_tail && !archive_checkpoint(k))
+                        archive_dropped("cannot preserve the outgoing tail");
                 checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
                                  return old_tail >= 0 && (int64_t) k.ids.size() == old_tail;
                              }), checks.end());
@@ -9059,7 +9069,7 @@ int main(int argc, char** argv) {
                     }
                 const size_t victim = strata::program::conv_cache::eviction_victim(
                     stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), pin_flags.get());
-                if (!archive_checkpoint(checks[victim])) return false;
+                if (!archive_checkpoint(checks[victim])) archive_dropped("cannot preserve the retention victim");
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
             return true;
@@ -11558,10 +11568,8 @@ int main(int argc, char** argv) {
             }
             else if (!from_live && !pin_sibling) {
                 for (const auto& c : checks)
-                    if (((int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs)) &&
-                        !archive_checkpoint(c)) {
-                        std::printf("ERR preserving outgoing checkpoint: %s\n", err.c_str());
-                        return 1;
+                    if ((int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs)) {
+                        if (!archive_checkpoint(c)) archive_dropped("cannot preserve an outgoing checkpoint");
                     }
             }
             // A longer disk record (disk_chosen: it beat the slot's giveback) restores over the main session in

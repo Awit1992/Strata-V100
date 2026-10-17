@@ -210,6 +210,8 @@ Related checkpoints share one KV image per archive group. The engine moves and e
 
 Archive groups use the same L2 byte and slot limits as saved conversations. L2 capacity victims move to L3 when the disk tier is enabled. A successful L2 admission does not also write the image to disk. If an image cannot fit in L2, the engine attempts to store it in L3. Physical-RAM and disk free-space limits still apply. The minimum-token setting also applies to checkpoint archives.
 
+Preserving a checkpoint is an optimization, not a requirement. If the host RAM floor or the disk budget refuses the image, the engine drops the checkpoint, logs the drop, and continues serving. It does not stop the server. The session stays correct; only the reuse of that checkpoint is lost.
+
 Lookup selects the longest compatible prefix across the active session, L2, L3, and idle batch slots. Tokens, image identity, and control-vector mode must match. For an edit to an earlier message, reuse ends at a saved checkpoint before the first changed token. The engine must process the suffix again; it cannot resume at an arbitrary matching token without the recurrent state at that position. Increasing `--prompt-cache` is not a substitute for checkpoint preservation.
 
 An L2 archive remains available after restore. A valid L3 image is promoted to L2 when the byte budget and physical-RAM floor permit it. Only a bounded subset of its checkpoints becomes resident in the active session. Restoring one branch does not remove other checkpoints from the saved archive.
