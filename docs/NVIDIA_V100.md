@@ -220,6 +220,41 @@ within each archive group. The L2 byte limit, slot limit, and free-RAM floor
 apply to these groups. L2 capacity victims move to L3 when L3 is enabled.
 An L3 restore can promote the complete archive to L2.
 
+A full prompt read removes the proof that active KV bytes remain unchanged.
+It does not remove the saved archive. Before the engine extends a matching
+archive after a rewrite, it compares the saved prefix with the active KV
+bytes on each stage. The check includes each live cell in a partial page
+and each completed index row. It excludes unused cells and the moving spare
+row. Equal token IDs alone do not permit reuse.
+
+The engine moves the existing buffers and copies only the new or changed
+pages. If the client replaces a terminal reply, the engine keeps the
+earlier checkpoint chain and replaces the obsolete terminal state in the
+same backing image. All earlier checkpoints must still match the incoming
+branch. Their KV prefix must remain unchanged or pass the exact byte check.
+An explicit terminal pin prevents this replacement.
+
+A difference after the last historical checkpoint does not require another
+full image. The engine copies that changed suffix. A difference before a
+historical checkpoint keeps an independent branch. An archive leaves L2
+without an L3 write only if its replacement retains all its restore points,
+including its live checkpoint.
+
+The 64 MiB disk metadata limit remains unchanged. Metadata contains token
+IDs, image keys, and payload lengths. Recurrent-state bytes are payload, not
+metadata. At 340,000 tokens, 19 token-ID lists require about 24.6 MiB per
+stage. The limit can seal larger groups; it does not explain a new group
+at every checkpoint. The reuse boundary is the shorter of the saved image
+and the incoming checkpoint, not the incoming checkpoint length alone.
+
+A deterministic single-GPU engine check used a 12,293-token synthetic
+prompt, eight chat continuations with replaced reply tails, and an unrelated
+full prompt read between continuations. One archive retained the chain.
+After that full read, the archive grew from 28 to 35 checkpoints. The last
+three extensions reused 189,330,432 to 189,578,880 KV bytes and took 193.1
+to 193.9 ms. No capacity eviction or host-RAM admission failure occurred.
+This check does not establish decode speed at a 340,000-token context.
+
 A single-V100 smoke run used a 12,440-token synthetic prompt, eight short
 continuations, and edits before the active checkpoint window. The run used
 these limits:

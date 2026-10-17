@@ -324,6 +324,73 @@ int main() {
             cuda_check(cudaDeviceSynchronize());
             check(conversation_kv_save(a,f.state,f.g,upto,index,err),"save A");
             check(a.bytes()==conversation_kv_bytes(f.state,f.g,upto,index),"size estimate equals snapshot payload");
+            if (upto >= 9 && upto < 96) {
+                const int64_t anchor = (upto / 2 / 4) * 4;
+                f.fill_after(91, anchor);
+                bool same = false;
+                check(conversation_kv_prefix_matches(a, f.state, f.g, upto, index, same, err) && !same,
+                      "rewritten reply cells invalidate the terminal state");
+                check(conversation_kv_prefix_matches(a, f.state, f.g, anchor, index, same, err) && same,
+                      "rewritten reply cells do not invalidate earlier historical checkpoints");
+                ConversationKv incremental = a, fresh;
+                size_t reused = 0;
+                check(conversation_kv_save(fresh, f.state, f.g, upto, index, err) &&
+                      conversation_kv_save(incremental, f.state, f.g, upto, index, err, anchor, &reused),
+                      "replace rewritten reply cells in the existing backing");
+                check(reused > 0 && equal(incremental, fresh),
+                      "suffix replacement retains historical pages and equals a full capture");
+                f.fill(13);
+            }
+            if (upto > 0 && upto % 4) {
+                bool same = false;
+                const size_t per = f.sizes[0] / size_t(f.state.max_cells * f.g.n_head_kv);
+                const size_t page = size_t(upto / 4) * 4 * f.g.n_head_kv * per;
+                const size_t head = size_t(f.g.n_head_kv - 1) * 4 * per;
+                cuda_check(cudaMemset(static_cast<uint8_t*>(f.sources[0]) + page + head + size_t(upto % 4) * per,
+                                     99, per));
+                check(conversation_kv_prefix_matches(a, f.state, f.g, upto, index, same, err) && same,
+                      "unused cells in a partial multi-head page do not invalidate the prefix");
+                cuda_check(cudaMemset(static_cast<uint8_t*>(f.sources[0]) + page + head + size_t(upto % 4 - 1) * per,
+                                     99, per));
+                check(conversation_kv_prefix_matches(a, f.state, f.g, upto, index, same, err) && !same,
+                      "the last live cell of the last head participates in exact prefix validation");
+                f.fill(13);
+            }
+            if (upto > 4 && upto < 96) {
+                ConversationCache cache(1 << 24, 4);
+                SavedConversation archive;
+                archive.live.ids.resize(upto, 1);
+                archive.checkpoint_archive = true;
+                archive.unchanged_tokens = upto;
+                archive.kv.push_back(a);
+                check(cache.put(std::move(archive)), "park branch before full prefill");
+                cache.limit_reuse(0);
+                ConversationCheckpoint next;
+                next.ids.resize(upto + 1, 1);
+                const auto match = cache.archive_for(next, true);
+                check(match.tokens == upto, "full prefill keeps the matching archive discoverable");
+                auto previous = cache.take(match.index);
+                bool same = false;
+                check(conversation_kv_prefix_matches(previous.kv[0], f.state, f.g, upto, index, same, err) && same,
+                      "exact prefix validation recovers archive reuse after a full prefill");
+                size_t reused = 0;
+                ConversationKv fresh;
+                check(conversation_kv_save(fresh, f.state, f.g, upto + 1, index, err),
+                      "capture full-prefill continuation reference");
+                check(conversation_kv_save(previous.kv[0], f.state, f.g, upto + 1, index, err, upto, &reused),
+                      "append to recovered archive");
+                check(reused > 0 && equal(previous.kv[0], fresh),
+                      "recovered append retains pages and equals a fresh capture");
+                previous.checkpoints.push_back(std::move(previous.live));
+                previous.live = next;
+                previous.unchanged_tokens = upto + 1;
+                check(cache.put(std::move(previous)) && cache.size() == 1 && cache.evictions() == 0,
+                      "full-prefill continuation grows one archive without a spill");
+                f.fill(177);
+                check(conversation_kv_prefix_matches(a, f.state, f.g, upto, index, same, err) && !same,
+                      "matching tokens do not authorize reuse of different K/V bytes");
+                f.fill(13);
+            }
             f.fill(177);
             check(conversation_kv_save(b,f.state,f.g,upto,index,err),"save B");
             check(upto==0 || !equal(a,b),"fixture changes state");

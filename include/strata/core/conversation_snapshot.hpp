@@ -13,8 +13,8 @@ namespace strata::core {
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).
 size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index);
-// A nonzero unchanged_tokens is valid only for storage retained from an image
-// actually restored into this session, bounded by every subsequent rewrite.
+// A nonzero unchanged_tokens requires restored storage bounded by subsequent
+// rewrites, or an exact prefix comparison against the synchronized session.
 // Equal token IDs alone do not establish that its K/V bytes are unchanged.
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
@@ -31,6 +31,12 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& state,
 // fingerprints the authoritative payload only. Never changes model state.
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                             int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error);
+// Revalidate an archived prefix after session rewrites. Compare token cells and
+// completed index rows exactly; exclude padding and the moving spare row.
+// A false match is not an error. The caller synchronizes the device first.
+bool conversation_kv_prefix_matches(const ConversationKv& image, const QsaState& state,
+                                    const ModelGeometry& g, int64_t tokens, bool include_index,
+                                    bool& matches, std::string& error);
 // Disk save without a host copy: the layer's authoritative K/V as a streamed source (same bytes and metadata as
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,

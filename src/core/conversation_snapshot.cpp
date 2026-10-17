@@ -180,6 +180,56 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     return true;
 }
 
+bool conversation_kv_prefix_matches(const ConversationKv& image, const QsaState& st,
+                                    const ModelGeometry& g, int64_t tokens, bool index,
+                                    bool& matches, std::string& error) {
+    matches = false;
+    Layout l{};
+    if (!layout(st, g, tokens, index, l, error) || !valid(st, l, tokens, error)) return false;
+    if (image.format != l.format || image.heads != g.n_head_kv || image.head_dim != g.head_dim ||
+        image.page_size != l.page_size || image.idx_dim != g.idx_key_dim ||
+        image.cells < tokens) return true;
+    const auto src = pools(st);
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const std::array<const ConversationBuffer*, 5> saved =
+        {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    std::array<uint8_t, 65536> scratch;
+    for (size_t i = 0; i < saved.size(); ++i) {
+        bool equal = true, copied = true;
+        auto compare = [&](size_t begin, size_t count) {
+            if (begin > saved[i]->size() || count > saved[i]->size() - begin) return false;
+            return saved[i]->visit(begin, count, [&](const uint8_t* p, size_t n, size_t at) {
+                // Streamed pools are host allocations. Avoid a full second copy.
+                if (i < 4 && st.kv_mode != 0)
+                    return std::memcmp(p, static_cast<const uint8_t*>(src[i]) + at, n) == 0;
+                for (size_t offset = 0; offset < n; offset += scratch.size()) {
+                    const size_t chunk = std::min(scratch.size(), n - offset);
+                    copied = transfer(scratch.data(), static_cast<const uint8_t*>(src[i]) + at + offset, chunk, error);
+                    if (!copied || std::memcmp(p + offset, scratch.data(), chunk)) return false;
+                }
+                return true;
+            });
+        };
+        if (i == 4) {
+            equal = compare(0, index ? size_t(tokens / strata::kernels::qsa_real_shapes().idx_block) *
+                                      g.idx_key_dim * 4 : 0);
+        } else if (l.cells && sizes[i]) {
+            // [page][head][cell][dimension]: the last page is not a
+            // contiguous token prefix when the model has multiple heads.
+            const size_t per_cell = sizes[i] / size_t(l.cells) / size_t(g.n_head_kv);
+            const size_t full = size_t(tokens / l.page_size * l.page_size) * g.n_head_kv * per_cell;
+            equal = compare(0, full);
+            for (int64_t head = 0; head < g.n_head_kv && equal && tokens % l.page_size; ++head)
+                equal = compare(full + size_t(head * l.page_size) * per_cell,
+                                size_t(tokens % l.page_size) * per_cell);
+        }
+        if (!copied) return false;
+        if (!equal) return true;
+    }
+    matches = true;
+    return true;
+}
+
 size_t conversation_kv_tail_bytes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
                                   int64_t first_token) {
     std::string error;

@@ -204,6 +204,7 @@ public:
         size_t index = 0;
         int64_t tokens = 0;
         bool live = false;
+        int64_t prefix_tokens = 0; // archive backing shared with the incoming checkpoint
     };
 
     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
@@ -261,9 +262,9 @@ public:
                entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
     }
 
-    // Find one archive on this exact token/image branch, in either direction.
-    // Extending it moves its K/V buffers; adding an older checkpoint needs no
-    // second K/V image. Roots and independently parked conversations stay alone.
+    // Find an archive on this branch, or replace its rewritten terminal reply
+    // when every earlier checkpoint remains on the incoming branch. Historical
+    // edits before that chain keep an independent archive.
     Match archive_for(const ConversationCheckpoint& checkpoint, bool cvec) const {
         Match match;
         int best_rank = 0;
@@ -274,20 +275,31 @@ public:
             const auto& b = checkpoint;
             const auto& shorter = a.ids.size() <= b.ids.size() ? a : b;
             const auto& longer = a.ids.size() <= b.ids.size() ? b : a;
-            if (!std::equal(shorter.ids.begin(), shorter.ids.end(), longer.ids.begin())) continue;
+            const int64_t common = std::mismatch(shorter.ids.begin(), shorter.ids.end(), longer.ids.begin()).first -
+                                   shorter.ids.begin();
+            const bool terminal_rewrite = common < (int64_t) shorter.ids.size();
+            if (terminal_rewrite) {
+                int64_t anchor = 0;
+                bool compatible = !a.pinned;
+                for (const auto& c : image.checkpoints) {
+                    if (c.ids == a.ids) { if (c.pinned) compatible = false; continue; }
+                    anchor = std::max<int64_t>(anchor, c.ids.size());
+                }
+                if (!compatible || anchor == 0 || common < anchor) continue;
+            }
             size_t j = 0;
             bool compatible = true;
             for (const auto& key : longer.imgs) {
-                if (key.start >= (int64_t) shorter.ids.size()) break;
+                if (key.start >= common) break;
                 if (j == shorter.imgs.size() || !(shorter.imgs[j++] == key)) { compatible = false; break; }
             }
-            if (!compatible || j != shorter.imgs.size()) continue;
+            if (!compatible || (j < shorter.imgs.size() && shorter.imgs[j].start < common)) continue;
             const bool present = a.ids == b.ids || std::any_of(
                 image.checkpoints.begin(), image.checkpoints.end(), [&](const auto& c) { return c.ids == b.ids; });
-            const int rank = present ? 3 : image.unchanged_tokens >= (int64_t) shorter.ids.size() ? 2 : 1;
-            if (rank > best_rank || (rank == best_rank && (int64_t) a.ids.size() > match.tokens)) {
+            const int rank = present ? 4 : terminal_rewrite ? 1 : image.unchanged_tokens >= common ? 3 : 2;
+            if (rank > best_rank || (rank == best_rank && common > match.prefix_tokens)) {
                 best_rank = rank;
-                match = {i, (int64_t) a.ids.size(), true};
+                match = {i, (int64_t) a.ids.size(), true, common};
             }
         }
         return match;
@@ -366,6 +378,9 @@ public:
     // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
     // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
+    // An archive also requires its live checkpoint in the replacement. Keep
+    // every historical restore point; discard a fully covered group without
+    // treating it as a capacity victim or writing it to L3.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
         auto held = [&](const ConversationCheckpoint& c) {
@@ -380,8 +395,11 @@ public:
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.image.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (!e.image.checkpoint_archive && e.image.cvec == cvec && deepest && !deepest->ids.empty() &&
-                held(*deepest) && std::all_of(e.image.checkpoints.begin(), e.image.checkpoints.end(), held)) {
+            const bool subsumed = e.image.checkpoint_archive
+                ? held(e.image.live)
+                : deepest && !deepest->ids.empty() && held(*deepest);
+            if (e.image.cvec == cvec && subsumed &&
+                std::all_of(e.image.checkpoints.begin(), e.image.checkpoints.end(), held)) {
                 bytes_ -= e.image.bytes();
                 entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
                 ++dropped;
