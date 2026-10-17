@@ -247,17 +247,26 @@ settings: a 524,288-token context, a 25 GiB L2, 32 cache slots, and the
 default active checkpoint count. Ten short chat turns completed. A change
 to the fifth user message then restored 124 tokens from L2 for a 293-token
 prompt. The earlier continuation reference reused 48 tokens. The runtime
-log confirmed an L2 restore, not an L3 restore. This check does not establish
-long-context or restart integrity on the faulty host.
+log confirmed an L2 restore, not an L3 restore.
 
-Restart parity is not an accepted result for this run. The host produced
-intermittent payload-checksum failures and state differences. A separate
-CPU-only 48 GiB memory probe found a one-bit error at byte offset 702,217,824.
-All six read passes found the same error: `f2f4632a05437dfe` was read as
-`f2f4632a45437dfe`. A separate disk-read check found a restored byte with value
-250 where the file contained 186. No checksum check was disabled or weakened.
-Correct the host-memory fault and repeat the restart and promotion parity
-checks before accepting this machine for persistent-cache validation.
+The first restart checks failed because of the host memory, not the cache
+code. The host uses non-ECC memory and has no error log, so the fault made
+no hardware record. A CPU-only pattern test found one bit that always read
+back wrong. Two cold engine runs of the same prompt then gave different
+model-state fingerprints, so no state comparison was possible.
+
+The operator removed the two 16 GB modules and kept the two 32 GB modules.
+A 54 GiB pattern scan of the 62.7 GiB of installed memory found no fault.
+Two cold engine runs then gave identical model-state fingerprints, and the
+restart and promotion parity checks passed:
+
+- the L3 restore after a full engine restart matched the cold reference;
+- the L2 promotion matched the cold reference;
+- the model-state fingerprints and the outputs were identical.
+
+The defective module is one of the two removed 16 GB modules. That pair
+carries no part number and serial number 00000000. Test each module alone to
+confirm which one is defective.
 
 Finite cache budgets still limit history. A checkpoint that both L2 and L3
 have evicted is not available for reuse. The engine must process that prefix
