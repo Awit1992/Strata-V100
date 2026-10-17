@@ -366,6 +366,9 @@ public:
     // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
     // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
+    // An archive also requires its live checkpoint in the replacement. Keep
+    // every historical restore point; discard a fully covered group without
+    // treating it as a capacity victim or writing it to L3.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
         auto held = [&](const ConversationCheckpoint& c) {
@@ -380,8 +383,11 @@ public:
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.image.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (!e.image.checkpoint_archive && e.image.cvec == cvec && deepest && !deepest->ids.empty() &&
-                held(*deepest) && std::all_of(e.image.checkpoints.begin(), e.image.checkpoints.end(), held)) {
+            const bool subsumed = e.image.checkpoint_archive
+                ? held(e.image.live)
+                : deepest && !deepest->ids.empty() && held(*deepest);
+            if (e.image.cvec == cvec && subsumed &&
+                std::all_of(e.image.checkpoints.begin(), e.image.checkpoints.end(), held)) {
                 bytes_ -= e.image.bytes();
                 entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
                 ++dropped;

@@ -113,6 +113,23 @@ void test_root_priority() {
 int main() {
     test_root_priority();
     {
+        ConversationCache cache(1 << 20, 4);
+        auto old = image_with_checkpoint({1, 2, 3}, {1, 2});
+        old.checkpoint_archive = true;
+        check(cache.put(std::move(old)), "park older archive");
+        auto newer = image_with_checkpoint({1, 2, 3, 4}, {1, 2});
+        newer.checkpoint_archive = true;
+        ConversationCheckpoint prior;
+        prior.ids = {1, 2, 3};
+        newer.checkpoints.push_back(prior);
+        check(cache.put(std::move(newer)), "park archive containing every older branch point");
+        check(cache.size() == 1 && cache.superseded() == 1 && cache.evictions() == 0,
+              "a fully subsumed archive is removed without a disk spill");
+        check(cache.best(std::vector<int32_t>{1, 2, 9}, {}, true).tokens == 2 &&
+              cache.best(std::vector<int32_t>{1, 2, 3, 9}, {}, true).tokens == 3,
+              "archive supersession retains both historical restore points");
+    }
+    {
         // Active-window rotation must not make older branch points disappear.
         auto archive = image_with_checkpoint({1, 2, 3, 4, 5}, {1, 2});
         archive.checkpoint_archive = true;

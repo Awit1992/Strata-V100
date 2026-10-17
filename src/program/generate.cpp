@@ -8879,6 +8879,28 @@ int main(int argc, char** argv) {
                                     [&](const auto& c) { return c.ids == checkpoint.ids; });
                     if (present) return store(std::move(previous));
                 }
+                const int64_t shared_tokens = std::min<int64_t>(match.tokens, checkpoint.ids.size());
+                if (match.tokens > 0 && previous.unchanged_tokens < shared_tokens) {
+                    // Rewrites invalidate provenance, not the immutable archive.
+                    // Recover it only after exact comparison on every stage.
+                    bool same = true;
+                    for (size_t i = 0; i < disk_stage_count && same; ++i) {
+                        const strata::core::OnDevice on(stage_device(i));
+                        if (!gpu_sync_ok()) return false;
+                        const auto& part = i == 0 ? previous : previous.stage_images.at(i - 1);
+                        const auto& session = stage_session(i);
+                        const size_t layers = (size_t) session.qsa_alloc;
+                        if (part.kv.size() != layers + (owns_draft(i) ? 1 : 0)) { same = false; break; }
+                        for (size_t j = 0; j < part.kv.size() && same; ++j) {
+                            const bool index = j < layers;
+                            const auto& state = index ? session.qsa_states[session.qsa_ord0 + j] : mtp.kv_state();
+                            const int64_t tokens = index ? shared_tokens : std::max<int64_t>(0, shared_tokens - 1);
+                            if (!strata::core::conversation_kv_prefix_matches(
+                                    part.kv[j], state, g, tokens, index, same, err)) return false;
+                        }
+                    }
+                    if (same) previous.unchanged_tokens = shared_tokens;
+                }
                 if (match.tokens > 0 && previous.unchanged_tokens <
                         std::min<int64_t>(match.tokens, checkpoint.ids.size())) {
                     // Token equality does not prove byte identity after a
