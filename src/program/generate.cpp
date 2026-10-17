@@ -8872,17 +8872,24 @@ int main(int argc, char** argv) {
                                  reused_bytes, count);
                     return true;
                 };
-                bool covered = match.tokens >= (int64_t) checkpoint.ids.size();
+                const int64_t shared_tokens = match.prefix_tokens;
+                bool terminal_rewrite = shared_tokens < std::min<int64_t>(match.tokens, checkpoint.ids.size());
+                bool covered = !terminal_rewrite && match.tokens >= (int64_t) checkpoint.ids.size();
                 if (covered) {
                     const bool present = previous.live.ids == checkpoint.ids ||
                         std::any_of(previous.checkpoints.begin(), previous.checkpoints.end(),
                                     [&](const auto& c) { return c.ids == checkpoint.ids; });
                     if (present) return store(std::move(previous));
                 }
-                const int64_t shared_tokens = std::min<int64_t>(match.tokens, checkpoint.ids.size());
-                if (match.tokens > 0 && previous.unchanged_tokens < shared_tokens) {
-                    // Rewrites invalidate provenance, not the immutable archive.
-                    // Recover it only after exact comparison on every stage.
+                int64_t historical_tokens = 0;
+                bool replaceable = !previous.live.pinned;
+                for (const auto& c : previous.checkpoints) {
+                    if (c.ids == previous.live.ids) { if (c.pinned) replaceable = false; continue; }
+                    historical_tokens = std::max<int64_t>(historical_tokens, c.ids.size());
+                }
+                replaceable = replaceable && historical_tokens > 0 && historical_tokens <= shared_tokens;
+                auto recover = [&](int64_t prefix) -> bool {
+                    if (previous.unchanged_tokens >= prefix) return true;
                     bool same = true;
                     for (size_t i = 0; i < disk_stage_count && same; ++i) {
                         const strata::core::OnDevice on(stage_device(i));
@@ -8894,18 +8901,27 @@ int main(int argc, char** argv) {
                         for (size_t j = 0; j < part.kv.size() && same; ++j) {
                             const bool index = j < layers;
                             const auto& state = index ? session.qsa_states[session.qsa_ord0 + j] : mtp.kv_state();
-                            const int64_t tokens = index ? shared_tokens : std::max<int64_t>(0, shared_tokens - 1);
+                            const int64_t tokens = index ? prefix : std::max<int64_t>(0, prefix - 1);
                             if (!strata::core::conversation_kv_prefix_matches(
                                     part.kv[j], state, g, tokens, index, same, err)) return false;
                         }
                     }
-                    if (same) previous.unchanged_tokens = shared_tokens;
+                    if (same) previous.unchanged_tokens = prefix;
+                    return true;
+                };
+                int64_t required = terminal_rewrite ? historical_tokens : shared_tokens;
+                if (match.tokens > 0 && !recover(required)) return false;
+                if (previous.unchanged_tokens < required && replaceable) {
+                    // Recomputed reply cells can differ even with equal IDs.
+                    // Keep the historical chain and replace only its terminal
+                    // state, provided every retained checkpoint is still valid.
+                    terminal_rewrite = true;
+                    covered = false;
+                    required = historical_tokens;
+                    if (!recover(required)) return false;
                 }
-                if (match.tokens > 0 && previous.unchanged_tokens <
-                        std::min<int64_t>(match.tokens, checkpoint.ids.size())) {
-                    // Token equality does not prove byte identity after a
-                    // rewrite. Keep that branch intact; do not mix its K/V
-                    // with newly computed recurrent state.
+                if (match.tokens > 0 && previous.unchanged_tokens < required) {
+                    // A historical prefix changed. Keep that independent branch.
                     if (!store(std::move(previous))) return false;
                     previous = {};
                     covered = false;
@@ -8947,10 +8963,16 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     const int64_t captured = (int64_t) part.live.ids.size();
-                    if (captured > 0 && part.live.ids != states[i].ids)
+                    if (terminal_rewrite) {
+                        // The client replaced the generated reply. Earlier
+                        // branch points still match; only the obsolete terminal
+                        // state (and any duplicate of it) leaves the chain.
+                        part.checkpoints.erase(std::remove_if(part.checkpoints.begin(), part.checkpoints.end(),
+                            [&](const auto& c) { return c.ids == part.live.ids; }), part.checkpoints.end());
+                    } else if (captured > 0 && part.live.ids != states[i].ids)
                         part.checkpoints.push_back(std::move(part.live));
                     reuse[i] = {std::move(part.kv), captured,
-                                std::min(old[0].unchanged_tokens, captured), {}};
+                                std::min({old[0].unchanged_tokens, captured, shared_tokens}), {}};
                     const strata::core::OnDevice on(stage_device(i));
                     const strata::core::ConversationView view{
                         states[i].ids, states[i].imgs, no_checks, cvec_cached, &states[i]};

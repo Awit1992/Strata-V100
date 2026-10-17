@@ -324,6 +324,23 @@ int main() {
             cuda_check(cudaDeviceSynchronize());
             check(conversation_kv_save(a,f.state,f.g,upto,index,err),"save A");
             check(a.bytes()==conversation_kv_bytes(f.state,f.g,upto,index),"size estimate equals snapshot payload");
+            if (upto >= 9 && upto < 96) {
+                const int64_t anchor = (upto / 2 / 4) * 4;
+                f.fill_after(91, anchor);
+                bool same = false;
+                check(conversation_kv_prefix_matches(a, f.state, f.g, upto, index, same, err) && !same,
+                      "rewritten reply cells invalidate the terminal state");
+                check(conversation_kv_prefix_matches(a, f.state, f.g, anchor, index, same, err) && same,
+                      "rewritten reply cells do not invalidate earlier historical checkpoints");
+                ConversationKv incremental = a, fresh;
+                size_t reused = 0;
+                check(conversation_kv_save(fresh, f.state, f.g, upto, index, err) &&
+                      conversation_kv_save(incremental, f.state, f.g, upto, index, err, anchor, &reused),
+                      "replace rewritten reply cells in the existing backing");
+                check(reused > 0 && equal(incremental, fresh),
+                      "suffix replacement retains historical pages and equals a full capture");
+                f.fill(13);
+            }
             if (upto > 0 && upto % 4) {
                 bool same = false;
                 const size_t per = f.sizes[0] / size_t(f.state.max_cells * f.g.n_head_kv);
