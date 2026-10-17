@@ -211,41 +211,115 @@ Do not apply it to a different machine without measurements. See the
 [local evaluation report](../benchmarks/v100-upstream-pr-evaluation-2026-10-15.md)
 for results, limits, and reproduction commands.
 
-## Historical checkpoint retention
+## Prefix-aware conversation storage
 
-The conversation cache now preserves prompt checkpoints before the active
-retention policy removes them. A checkpoint archive has the recurrent state
-and its required KV backing. Compatible checkpoints share one backing image
-within each archive group. The L2 byte limit, slot limit, and free-RAM floor
-apply to these groups. L2 capacity victims move to L3 when L3 is enabled.
-An L3 restore can promote the complete archive to L2.
+L2 keeps one shared K/V backing for matching conversation prefixes.
+A short branch has its own token metadata and changed suffix. It does not
+remove the original long continuation. The cache charges shared payload
+allocations once, including when it admits a branch or evicts another owner.
+Writes detach only the ranges that change. The allocation forecast includes
+buffer-directory growth and shared suffix writes.
 
-A full prompt read removes the proof that active KV bytes remain unchanged.
-It does not remove the saved archive. Before the engine extends a matching
-archive after a rewrite, it compares the saved prefix with the active KV
-bytes on each stage. The check includes each live cell in a partial page
-and each completed index row. It excludes unused cells and the moving spare
-row. Equal token IDs alone do not permit reuse.
+K/V reuse and recurrent-state restore are separate operations. The engine
+can share K/V through a branch point without having a recurrent state there.
+It must restore a valid earlier state and process the remaining prompt.
+An explicit pin can retain an exact boundary. Ordinary history uses bounded
+anchors instead of one permanent state per turn. The same anchor selection
+applies to every split stage.
+A branch inside the saved input freezes its source archive. A later append
+can share that source's K/V without rotating away its original resume state.
+The active list also admits a predecode input anchor. Reply rewrites can
+resume there instead of loading a parked state from the obsolete reply.
 
-The engine moves the existing buffers and copies only the new or changed
-pages. If the client replaces a terminal reply, the engine keeps the
-earlier checkpoint chain and replaces the obsolete terminal state in the
-same backing image. All earlier checkpoints must still match the incoming
-branch. Their KV prefix must remain unchanged or pass the exact byte check.
-An explicit terminal pin prevents this replacement.
+Before it shares saved backing after a rewrite, the engine compares the
+retained prefix with the active K/V bytes. This includes live cells in a
+partial page and completed indexer rows. It excludes unused cells and the
+moving spare row. Equal token IDs alone do not permit reuse. If replay
+changes boundary cells, the engine can share a shorter verified prefix.
 
-A difference after the last historical checkpoint does not require another
-full image. The engine copies that changed suffix. A difference before a
-historical checkpoint keeps an independent branch. An archive leaves L2
-without an L3 write only if its replacement retains all its restore points,
-including its live checkpoint.
+L3 uses prefix references and K/V delta panels. A branch can reference a
+shorter extent of a longer chain without truncating that chain. Bounded
+`.states` slots hold retained recurrent, PLE, indexer, and draft state.
+New panels do not add an inline state copy on every turn. A sidecar write
+failure fails the cache write instead of using an unbounded fallback.
+The first stored generated end that later input consumes can retain one
+ordinary state slot. Dense input checkpoints do not rotate away this original
+resume point. Its marker survives restart without increasing the slot limit.
+Legacy inline states remain readable. They occupy disk space until their
+chain is evicted or replaced. A cut inside a legacy panel still requires
+the reader to verify that complete panel's checksum.
 
-The 64 MiB disk metadata limit remains unchanged. Metadata contains token
-IDs, image keys, and payload lengths. Recurrent-state bytes are payload, not
-metadata. At 340,000 tokens, 19 token-ID lists require about 24.6 MiB per
-stage. The limit can seal larger groups; it does not explain a new group
-at every checkpoint. The reuse boundary is the shorter of the saved image
-and the incoming checkpoint, not the incoming checkpoint length alone.
+The L2 byte limit, slot limit, and free-RAM floor still apply. L2 capacity
+victims can move to L3. Disk limits include chain and sidecar bytes.
+Pins consume state storage. Finite budgets can still evict conversations.
+These changes do not increase the active context limit or remove long-context
+decode costs.
+
+The saved input-prompt boundary identifies an obsolete generated tail.
+A client can replace that tail without creating a new conversation on each
+turn. A branch before that boundary keeps its source continuation.
+A nearby checkpoint is not proof of a terminal rewrite. Records without
+boundary provenance use the conservative branch path.
+If replay changes cells before the input boundary, replacement requires the
+remaining original input tokens and image keys to match. An input edit
+still creates a separate branch.
+
+### Current native branch check
+
+A native V100 check used a 300,000-token parent and a 20,008-token branch.
+No exact boundary pin was set. The first branch reused 16,384 tokens and
+processed the remaining prefix. Twenty growing-input turns then reused the
+resident input anchor. Their prompt time was 356 to 407 ms.
+
+After those turns, the short branch reused 20,007 tokens. The original long
+continuation reused 300,015 tokens and produced the same output as its first
+return. Peak L2 storage was 8,508,704,232 bytes across four parked groups.
+No capacity eviction occurred. Archive history stayed at six checkpoints.
+These figures describe cache allocations, not process RSS or GPU memory.
+
+A 300,000-token L3-only retention check also passed. This check preceded the
+final replay-boundary correction. The engine restarted before the 20
+growing-input turns. Both long returns
+reused 300,015 tokens. The final short return reused 20,007 tokens.
+The store held two chains and 6,189,411,036 bytes in total, including
+1,298,695,712 bytes of bounded state sidecars. Allocated disk space was
+6,189,428,736 bytes.
+
+Disk-only append prompt time was 7.84 to 9.73 seconds in this check.
+Disk-only operation still pays for prefix verification and state writes.
+The storage and recovery result does not imply RAM-speed disk reuse.
+
+The final writer was also exercised with K/V and running states captured
+from that 300,000-token run. The short branch referenced 16,384 source tokens.
+Its chain held 55,581,873 bytes, not a second copy of the matching prefix.
+The source chain held 4,580,646,417 bytes. Total storage was 5,226,544,706
+bytes with the states retained for this replay. The original 300,015-token
+state and the 20,023-token branch restored with exact state payloads and K/V.
+
+The final native writer also passed a 40,000-token parent check with a
+20,008-token branch, restart, and 20 growing-input turns. It retained two
+chains. After repeated parking, the short chain still referenced 16,384
+source tokens and held 55,889,222 bytes. Total storage was 1,851,520,352
+bytes, including 1,180,632,496 bytes of bounded state sidecars.
+The original parent return reused 40,014 tokens and produced the same output.
+
+A separate final check pinned the 19,998-token boundary. The short chain
+referenced all 19,998 tokens and held 429,625 bytes. Generated token IDs and
+all nine canonical main-state hash fields matched the RAM reference in
+four request cases.
+
+All nine focused conversation and session tests passed. All 84 cache-tool
+and prefill-tool tests passed. AddressSanitizer and UndefinedBehaviorSanitizer
+checks passed 4,394 RAM assertions and 1,863 disk assertions. The disk checks
+include branch preservation, bounded state slots,
+restart recovery, missing sidecars, and state-publication failures. A dedicated
+check replaces 20 generated tails as the input grows. It verifies the latest
+image after restart, the original input anchor, and historical-branch refusal.
+
+### Earlier unbounded-archive checks
+
+The following results used the earlier retention policy. They are historical
+evidence, not acceptance results for the bounded policy described above.
 
 A deterministic single-GPU engine check used a 12,293-token synthetic
 prompt, eight chat continuations with replaced reply tails, and an unrelated

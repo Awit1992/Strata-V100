@@ -228,8 +228,19 @@ void full_session(int fmt, int mode, int experts) {
         check(conversation_snapshot_save(fresh,view,ss,g,draft.state,err),"full capture reference after growth or rewind");
         size_t peak=0,reused=0;
         check(conversation_snapshot_capture_bytes(reuse,view,ss,g,draft.state,peak,err),"admit incremental capture peak");
+        // The retained K/V is adopted and the checkpoints are adopted by reference: only the
+        // allocations on top of what `a` already holds are new physical RAM, and the admission
+        // (peak minus the retained capacity it already counts) has to cover them.
+        const size_t retained=reuse.bytes();
+        ConversationLedger held;
+        for (const auto& layer : a.kv) held.adopt(layer);
+        for (const auto& c : checkpoints) held.adopt(c);
         check(conversation_snapshot_save(incremental,view,ss,g,draft.state,err,std::move(reuse),&reused),"capture with retained pages");
-        check(incremental.bytes() <= peak,"incremental allocation stays within admitted bound");
+        size_t fresh_bytes=0;
+        incremental.visit_allocations([&](const void* allocation,size_t bytes){
+            if (!held.holds(allocation)) fresh_bytes+=bytes; });
+        check(peak>=retained && fresh_bytes<=peak-retained,
+              "the capture's new physical allocation stays within the admitted bound");
         check(incremental.live.gdn==fresh.live.gdn && incremental.live.ple==fresh.live.ple &&
               incremental.live.dead==fresh.live.dead && equal(incremental.kv[0],fresh.kv[0]) &&
               equal(incremental.kv[1],fresh.kv[1]),"incremental capture equals full capture after growth or rewind");
@@ -272,9 +283,17 @@ void full_session(int fmt, int mode, int experts) {
         size_t peak=0,reused=0;
         check(conversation_snapshot_save(fresh,view,ss,g,nullptr,err),"full stage capture reference");
         check(conversation_snapshot_capture_bytes(reuse,view,ss,g,nullptr,peak,err),"admit an incremental stage capture");
+        const size_t retained=reuse.bytes();
+        ConversationLedger held;
+        for (const auto& layer : stage.kv) held.adopt(layer);
+        for (const auto& c : checkpoints) held.adopt(c);
         check(conversation_snapshot_save(incremental,view,ss,g,nullptr,err,std::move(reuse),&reused),"incremental stage capture");
-        check(reused>0 && incremental.bytes()<=peak && equal(incremental.kv[0],fresh.kv[0]) &&
-              incremental.live.gdn==fresh.live.gdn,"an incremental stage capture reuses pages and equals a full one");
+        size_t fresh_bytes=0;
+        incremental.visit_allocations([&](const void* allocation,size_t bytes){
+            if (!held.holds(allocation)) fresh_bytes+=bytes; });
+        check(reused>0 && peak>=retained && fresh_bytes<=peak-retained &&
+              equal(incremental.kv[0],fresh.kv[0]) && incremental.live.gdn==fresh.live.gdn,
+              "an incremental stage capture reuses pages within the admitted bound and equals a full one");
         SavedConversation split_image=stage;
         split_image.stage_images.push_back(stage);
         check(!conversation_snapshot_validate(split_image,ss,g,draft.state,err),

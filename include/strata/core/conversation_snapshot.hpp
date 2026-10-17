@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_prefix.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
@@ -19,8 +20,14 @@ size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int6
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
                           int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
+// `unchanged_tokens`: the first token the next save will rewrite.  It adds the
+// bytes a save must copy to detach a dirty tail still shared with another owner
+// (0 for a private buffer), so a retained shared prefix is not charged twice.
+// The draft layer's save rewrites one token earlier - its ring's final cell is
+// refreshed on the next compute - so its caller passes max(unchanged_tokens - 1, 0).
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                                   int64_t upto, bool include_index, size_t& bytes, std::string& error);
+                                   int64_t upto, bool include_index, size_t& bytes, std::string& error,
+                                   int64_t unchanged_tokens = 0);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);

@@ -119,7 +119,20 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     size_t estimate = 0;
     check(conversation_snapshot_bytes({image.live.ids,image.live.imgs,image.checkpoints,true},ss,g,draft.st,estimate,error),
           "capture estimate works without CUDA");
-    check(estimate == image.bytes(), "estimate covers checkpoint/indexer/spare payloads");
+    // The estimate admits every physical byte the capture allocates itself: the live running state (all
+    // five payloads), the K/V pages with the indexer's completed rows and the moving spare row, and the
+    // metadata.  A checkpoint the view already holds is adopted by the copy, so its payloads are not
+    // charged a second time.
+    size_t shared_payloads = 0;
+    for (const auto& c : image.checkpoints) shared_payloads += c.allocation_bytes();
+    check(estimate >= image.allocation_bytes() - shared_payloads,
+          "estimate covers every physical byte the capture newly allocates");
+    auto stripped = image;
+    for (auto& c : stripped.checkpoints) c.drop_state();
+    size_t without_state = 0;
+    check(conversation_snapshot_bytes({stripped.live.ids,stripped.live.imgs,stripped.checkpoints,true},
+                                      ss,g,draft.st,without_state,error) && without_state == estimate,
+          "a retained checkpoint's payloads are shared, not charged again");
     auto unchanged = [&] {
         auto pristine = [](const auto& bytes) { return std::all_of(bytes.begin(),bytes.end(),[](uint8_t b){return b==0xa5;}); };
         if (!pristine(gdn) || !pristine(history) || ss.ple_prev[0] != -1 || ss.ple_prev[1] != -1) return false;
@@ -215,15 +228,31 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation full,incremental;
     check(conversation_snapshot_save(full,view,ss,g,draft.st,error), "full capture through host transfer backend");
     const size_t full_copies = copied_bytes;
+    // The fresh estimate admits every physical byte the full capture allocated itself; the checkpoint
+    // payloads the view holds are shared with the copy (the same set `shared_payloads` above), so only
+    // the difference is new physical RAM.
+    check(full.allocation_bytes() - shared_payloads <= estimate,
+          "the fresh estimate admits the full capture's own physical allocation");
     ConversationKvReuse reuse{full.kv,9,9};
     size_t peak = 0, reused = 0;
     check(conversation_snapshot_capture_bytes(reuse,view,ss,g,draft.st,peak,error), "incremental capture admission without transfers");
+    // What the caller already holds: the retained K/V the capture adopts, and the checkpoints the copy
+    // adopts by reference.  Only the allocations on top of those are new physical RAM, and the admission
+    // (peak minus the retained capacity it already counts) has to cover them.
+    const size_t retained = reuse.bytes();
+    ConversationLedger held;
+    for (const auto& layer : full.kv) held.adopt(layer);
+    for (const auto& c : view.checkpoints) held.adopt(c);
     copied_bytes = 0;
     const bool saved_incrementally = conversation_snapshot_save(incremental,view,ss,g,draft.st,error,std::move(reuse),&reused);
     if (!saved_incrementally) std::fprintf(stderr,"capture error: %s\n",error.c_str());
     check(saved_incrementally, "incremental capture through host backend");
+    size_t fresh = 0;
+    incremental.visit_allocations([&](const void* allocation,size_t bytes){
+        if (!held.holds(allocation)) fresh += bytes; });
     check(reused > 0 && copied_bytes + reused == full_copies, "reused byte count measures transfers actually omitted");
-    check(incremental.bytes() <= peak && incremental.live.gdn == full.live.gdn, "running state refreshed within admitted allocation");
+    check(peak >= retained && fresh <= peak - retained && incremental.live.gdn == full.live.gdn,
+          "the capture's new physical allocation stays within the admitted bound");
     for (size_t i=0;i<full.kv.size();++i)
         check(incremental.kv[i].k==full.kv[i].k && incremental.kv[i].v==full.kv[i].v &&
               incremental.kv[i].k_scale==full.kv[i].k_scale && incremental.kv[i].v_scale==full.kv[i].v_scale &&

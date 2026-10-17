@@ -122,14 +122,27 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
 } // namespace
 
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                                   int64_t upto, bool index, size_t& bytes, std::string& error) {
+                                   int64_t upto, bool index, size_t& bytes, std::string& error,
+                                   int64_t unchanged_tokens) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    if (unchanged_tokens < 0 || unchanged_tokens > upto || unchanged_tokens > image.cells) {
+        error = "conversation snapshot: invalid unchanged prefix";
+        return false;
+    }
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<const ConversationBuffer*,5> buffers = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    // A save rewrites from `keep` on (conversation_kv_save's own boundary), and
+    // copies any segment still shared with another owner first: charge that copy,
+    // so a retained shared prefix is never counted as new physical RAM twice.
+    const size_t whole_cells = size_t(unchanged_tokens / l.page_size) * size_t(l.page_size);
+    std::array<size_t,5> keep{};
+    for (size_t i = 0; i < 4; ++i) keep[i] = l.cells ? (sizes[i] / size_t(l.cells)) * whole_cells : 0;
+    keep[4] = index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) *
+                          size_t(g.idx_key_dim) * 4 : 0;
     bytes = 0;
     for (size_t i = 0; i < buffers.size(); ++i) {
-        const size_t n = buffers[i]->allocation_peak(sizes[i]);
+        const size_t n = buffers[i]->allocation_peak(sizes[i], keep[i]);
         if (n == SIZE_MAX || !conversation_detail::add(bytes, n)) {
             error = "conversation snapshot: segmented K/V allocation overflow";
             return false;

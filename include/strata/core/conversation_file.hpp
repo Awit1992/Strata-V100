@@ -191,9 +191,10 @@ struct SessionSaveLive {
     uint64_t tokens = 0, images = 0;
     uint64_t kv_layers = 0;     // K/V sources (owned QSA layers + the draft)
 };
-// The peak, with saturating arithmetic: two copies of the deepest checkpoint (the list handed to the capture and the
-// one inside the captured image), the copied live state with its token and image lists, the K/V source directory,
-// the 16 MiB write buffer and 1 MiB for the small vectors.
+// The peak, with saturating arithmetic: the identity lists (ids and images) of the two copies of the deepest
+// checkpoint (the list handed to the capture and the one inside the captured image - both share the checkpoint's
+// running-state payloads, so a copy of those is never charged), the copied live state with its token and image
+// lists, the K/V source directory, the 16 MiB write buffer and 1 MiB for the small vectors.
 uint64_t session_save_peak_bytes(const ConversationCheckpoint* deepest, const SessionSaveLive& live);
 // The SAVE's RAM PREFLIGHT, BEFORE anything is copied: `admit` is asked for session_save_peak_bytes; only when it
 // agrees is the deepest checkpoint copied into `out`.  On a refusal nothing was allocated, `out` is empty, `chain`

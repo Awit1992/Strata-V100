@@ -644,10 +644,19 @@ int main() {
             check(session_deepest_checkpoint(pinned_chain) == &pinned_chain[0], "save: a pinned shared prefix beats a deeper checkpoint");
             check(session_deepest_checkpoint(chain) == &chain[1], "save: no pin, the deepest as before");
         }
+        // the two copies of the deepest checkpoint share its running-state payloads: the peak charges their
+        // identity lists (ids and images), never the state bytes themselves
+        const uint64_t lists = 2 * (uint64_t)(chain[1].ids.size() * sizeof(int32_t) +
+                                              chain[1].imgs.size() * sizeof(ConversationImageKey));
         const uint64_t need = session_save_peak_bytes(&chain[1], live);
-        check(need >= 2 * (uint64_t) chain[1].bytes() + 5000 + 4000 + (16u << 20) &&
-              need <= 2 * (uint64_t) chain[1].bytes() + 5000 + 4000 + (18u << 20),
-              "save: the peak counts two checkpoint copies, the live state, tokens and the buffer");
+        check(need >= lists + 5000 + 4000 + (16u << 20) && need <= lists + 5000 + 4000 + (18u << 20),
+              "save: the peak counts the two copies' identity lists, the live state, tokens and the buffer");
+        {
+            auto thin = chain;
+            thin[1].gdn.clear();   // the same checkpoint without its running state
+            check(session_save_peak_bytes(&thin[1], live) == need,
+                  "save: the shared running state of a copied checkpoint is not charged to the peak");
+        }
         SessionSaveLive huge = live;
         huge.state_bytes = UINT64_MAX;
         check(session_save_peak_bytes(&chain[1], huge) == UINT64_MAX, "save: the peak saturates");
@@ -667,8 +676,9 @@ int main() {
               same_checkpoint(out[0], chain[1]), "save: admitted, the deepest checkpoint is copied");
         check(session_save_checkpoints({}, live, agree, out, why) && out.empty(), "save: no checkpoints, none copied");
 #if defined(__linux__) && !defined(__SANITIZE_ADDRESS__) && !defined(STRATA_NO_RLIMIT_TEST)
-        // under a real address-space limit that cannot hold one more copy: the refusal comes first, no bad_alloc;
-        // and the same limit with an admitting preflight does fail at the copy (the test can see the difference)
+        // Under a real address-space limit that cannot hold the checkpoint's running state a second time: the
+        // refusal comes first, without an allocation, and the copy an admitting preflight then takes shares that
+        // state with the chain (ConversationPayload), so the tight limit never bites it.
         std::vector<ConversationCheckpoint> fat(1);
         fat[0].ids = {1, 2, 3};
         fat[0].gdn.assign(256u << 20, 0x22);
@@ -688,13 +698,17 @@ int main() {
             bool refused = false;
             try { refused = !session_save_checkpoints(fat, live, low, o2, w) && o2.empty(); } catch (...) { ::_exit(11); }
             if (!refused) ::_exit(12);
-            try { session_save_checkpoints(fat, live, agree, o2, w); } catch (const std::bad_alloc&) { ::_exit(0); }
-            ::_exit(13);   // the copy fitted: the limit did not bite, the test proves nothing
+            // admitted: the copy shares the 256 MiB running state instead of copying it, so it still fits
+            try { if (!session_save_checkpoints(fat, live, agree, o2, w) || o2.size() != 1) ::_exit(13); }
+            catch (...) { ::_exit(14); }
+            if (o2[0].gdn.size() != (256u << 20)) ::_exit(15);
+            ::_exit(0);
         }
         int status = 0;
         check(pid > 0 && ::waitpid(pid, &status, 0) == pid, "save: low-memory child ran");
         check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-              "save: under a low address-space limit the preflight refuses before the copy (an admitted copy fails)");
+              "save: under a low address-space limit the preflight refuses before the copy, and the copy it then "
+              "takes shares the checkpoint's running state instead of copying it");
         check(fat[0].gdn.size() == (256u << 20) && fat[0].gdn[12345] == 0x22 &&
               slurp(old_file) == std::vector<char>(9, 'o'), "save: live state and the old file intact");
 #endif

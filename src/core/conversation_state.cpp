@@ -11,13 +11,6 @@ namespace {
 using conversation_detail::add;
 using conversation_detail::product;
 
-std::array<int64_t, 18> geometry_key(const ModelGeometry& g) {
-    return {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_k_heads,
-            g.ssm_v_heads, g.ssm_d_conv, g.ssm_conv_channels, g.ssm_value_dim,
-            g.n_head, g.n_head_kv, g.head_dim, g.idx_q_heads, g.idx_key_dim,
-            g.hc, g.hc_lr, g.n_expert, g.n_ff};
-}
-
 bool fail(std::string& error, const char* message) {
     error = std::string("conversation snapshot: ") + message;
     return false;
@@ -85,7 +78,7 @@ bool view_validate(const ConversationView& view, const SessionState& ss,
         if (!c.stage_parts.empty() || c.ids.empty() || c.ids.size() > view.ids.size() ||
             !std::equal(c.ids.begin(), c.ids.end(), view.ids.begin()))
             return fail(error, "checkpoint is not a live token prefix");
-        if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
+        if (c.has_state() && !conversation_checkpoint_validate(c, ss, g, error)) return false;
         size_t image = 0;
         for (const auto& key : view.images) {
             if ((uint64_t) key.start >= c.ids.size()) break;
@@ -97,11 +90,14 @@ bool view_validate(const ConversationView& view, const SessionState& ss,
     return true;
 }
 
+// The private bytes one checkpoint copy adds: its ids and images.  Its five
+// running-state payloads are shared by the copy (ConversationPayload), so they
+// add no physical RAM and are charged only where a payload is captured fresh.
 bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
     size_t ids = 0, images = 0;
     if (!product(ids, {c.ids.size(), sizeof(int32_t)}) ||
         !product(images, {c.imgs.size(), sizeof(ConversationImageKey)})) return false;
-    for (size_t n : {ids, images, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size()})
+    for (size_t n : {ids, images})
         if (!add(total, n)) return false;
     return true;
 }
@@ -109,7 +105,7 @@ bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
 
 bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& z, std::string& error) {
     z = {};
-    const auto key = geometry_key(g);
+    const auto key = conversation_geometry_key(g);
     for (size_t i = 0; i < key.size(); ++i)
         if (key[i] < 0 || (i != 1 && key[i] == 0)) return fail(error, "invalid model geometry");
     size_t recurrence = 0, convolution = 0;
@@ -211,8 +207,13 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
         !product(layers, {qsa + (draft ? 1 : 0), sizeof(ConversationKv)}) ||
         !product(tails, {qsa, z.tail}) || !product(dead, {qsa, z.dead}) ||
         !product(positions, {qsa, z.block_pos})) return fail(error, "snapshot metadata byte count overflow");
-    for (size_t n : {ids, images, checkpoints, layers, tails, dead, positions, z.gdn, ss.ple_hist ? z.ple : 0})
+    for (size_t n : {ids, images, checkpoints, layers})
         if (!add(bytes, n)) return fail(error, "snapshot byte count overflow");
+    // The live checkpoint is captured fresh only without a live_state; with one it
+    // is a copy that shares its payloads, so those bytes are already held.
+    if (!view.live_state)
+        for (size_t n : {tails, dead, positions, z.gdn, ss.ple_hist ? z.ple : 0})
+            if (!add(bytes, n)) return fail(error, "snapshot byte count overflow");
     for (const auto& c : view.checkpoints)
         if (!metadata_bytes(c, bytes)) return fail(error, "checkpoint byte count overflow");
     const int64_t upto = (int64_t) view.ids.size(); // view_validate bounds this by signed max_cells
@@ -239,7 +240,13 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
         if (!conversation_kv_validate(reuse.kv[i], st, g, reuse.captured_tokens, index, error)) return false;
         const size_t fresh = conversation_kv_bytes(st, g, int64_t(view.ids.size()), index);
         size_t retained = 0;
-        if (!conversation_kv_capture_bytes(reuse.kv[i], st, g, int64_t(view.ids.size()), index, retained, error)) return false;
+        // The draft ring's final cell is refreshed on the next compute, so its save
+        // rewrites from one token earlier - conversation_snapshot_save passes it
+        // max(unchanged - 1, 0) - and its detach covers that longer tail.
+        const int64_t unchanged = index ? reuse.unchanged_tokens
+                                        : std::max<int64_t>(0, reuse.unchanged_tokens - 1);
+        if (!conversation_kv_capture_bytes(reuse.kv[i], st, g, int64_t(view.ids.size()), index, retained,
+                                           error, unchanged)) return false;
         bytes -= fresh;
         if (!add(bytes, retained)) return fail(error, "retained K/V allocation overflow");
     }
@@ -256,8 +263,11 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
     // Build into a new object so a failure cannot publish a partial snapshot.
+    // A capture never carries the caller's previous provenance: terminal_from
+    // starts unknown and the caller records the input boundary it just read.
     SavedConversation captured;
-    captured.geometry = geometry_key(g);
+    captured.terminal_from = 0;
+    captured.geometry = conversation_geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     if (view.live_state) captured.live = *view.live_state;
     else { captured.live.ids = view.ids; captured.live.imgs = view.images; }
@@ -284,7 +294,7 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const QsaState& draft, std::string& error) {
     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
     SavedConversation captured;
-    captured.geometry = geometry_key(g);
+    captured.geometry = conversation_geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
@@ -316,7 +326,7 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
     l.max_tokens = tokens;
     l.max_checkpoints = max_checkpoints;
     l.max_kv_layers = layers + 1;
-    l.geometry = geometry_key(g);
+    l.geometry = conversation_geometry_key(g);
     l.layer_range = std::make_pair(ss.layer_lo, ss.layer_hi);
     l.max_state_bytes = {z.gdn, ss.ple_hist ? z.ple : 0, tails, dead, block_pos};
     l.max_kv_bytes.assign(layers + 1, {});
@@ -335,7 +345,7 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
                                     const ModelGeometry& g, const QsaState* draft, std::string& error) {
     if (!image.live.stage_parts.empty())
         return fail(error, "a running checkpoint's stage parts belong in the stage images, not in live.stage_parts");
-    if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    if (image.geometry != conversation_geometry_key(g)) return fail(error, "incompatible runtime geometry");
     // an image holds exactly one carve's running state and K/V: same layer range or nothing
     if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
         return fail(error, "snapshot from another session layer range");
@@ -393,7 +403,7 @@ bool conversation_stage_save(SavedConversation& image, const ConversationView& v
     size_t estimate = 0;
     if (!conversation_stage_bytes(view, ss, g, estimate, error) || !sync(error)) return false;
     SavedConversation captured;
-    captured.geometry = geometry_key(g);
+    captured.terminal_from = 0;   // a fresh capture: the caller records its input boundary
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
@@ -410,7 +420,7 @@ bool conversation_stage_save(SavedConversation& image, const ConversationView& v
 bool conversation_stage_validate(const SavedConversation& image, const SessionState& ss,
                                  const ModelGeometry& g, std::string& error) {
     if (!image.live.stage_parts.empty()) return fail(error, "layer-split parking is not supported");
-    if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    if (image.geometry != conversation_geometry_key(g)) return fail(error, "incompatible runtime geometry");
     if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
         return fail(error, "snapshot from another session layer range");
     const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
@@ -480,7 +490,7 @@ bool conversation_disk_delta_save(SavedConversation& out, const ConversationView
         return fail(error, "invalid delta base");
     if (!sync(error)) return false;
     out = {};
-    out.geometry = geometry_key(g);
+    out.geometry = conversation_geometry_key(g);
     out.layer_lo = ss.layer_lo;
     out.layer_hi = ss.layer_hi;
     out.cvec = view.cvec;
@@ -490,7 +500,7 @@ bool conversation_disk_delta_save(SavedConversation& out, const ConversationView
     for (const auto& key : view.images)
         if (key.start >= first_token) out.live.imgs.push_back(key);
     for (const auto& c : view.checkpoints)
-        if ((int64_t) c.ids.size() > first_token) out.checkpoints.push_back(c);
+        if (c.pinned || (int64_t) c.ids.size() > first_token) out.checkpoints.push_back(c);
     const size_t layers = owned_qsa(ss);
     out.kv.resize(layers + (draft ? 1 : 0));
     if (!conversation_checkpoint_save(out.live, ss, g, error)) return false;

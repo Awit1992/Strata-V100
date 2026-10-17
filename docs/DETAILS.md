@@ -1369,14 +1369,26 @@ print(r.choices[0].message.content)
   own page (or no `Origin`), like `/settings`. `POST /slots/0?action=save|restore` keeps the Host and API-key checks
   and also takes only JSON from no `Origin`, Strata's own page or a trusted origin - also when an API key is set.
 
-**Conversation cache.** A request that continues a chat reads only the part after what the engine already holds: the
-live session, or one of the checkpoints it keeps in RAM (up to 6, ~118 MB each, taken at the start of each new
-assistant turn and every 16K prompt tokens). A checkpoint is used only when the prompt starts with exactly its tokens
-and pictures. The oldest checkpoint - in practice the end of the system prompt, which every chat of the same client
-shares - is kept for good while the rest rotates by least recent use, so a NEW chat that shares that prefix starts
-reading after it instead of from token 0. A prompt read from the start is also checkpointed at the end of its system
-prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so that root exists for agent clients with long
-system prompts and tool lists. Claude Code stamps its system prompt with a billing header that changes on every
+**Conversation cache.** A continuation uses the live session or a compatible saved checkpoint.
+The active checkpoint limit is 6 by default. Checkpoints contain recurrent state, PLE history,
+and indexer state. Their size depends on the model, not on the token count.
+The engine bounds ordinary archive history as well as the active checkpoint list. It keeps
+required prefix anchors and explicit pins. A checkpoint must match the prompt's tokens and pictures.
+A later recurrent state cannot substitute for an earlier checkpoint. The engine restores a retained
+anchor before the branch point and processes the remaining tokens.
+The active list also admits an anchor before the final input token. The first decode window
+processes that token. A reply rewrite can use this resident input anchor without loading a newer
+state from the obsolete generated tail.
+A bounded checkpoint archive does not remove a full parked source. Later archive compaction
+can thus discard temporary states without removing the original continuation's resume state.
+A branch inside the saved input also freezes its source archive. New archives can borrow its
+K/V, but they do not rotate the source's original resume state.
+
+L2 branches share their unchanged K/V allocations. An append or rewrite allocates only its new
+or changed ranges. The cache charges each shared payload allocation once. A short request that
+shares a long conversation's prefix does not remove the long continuation. A system-prompt
+checkpoint can also supply a common root for separate chats. Its threshold is set by
+`--prompt-cache-root`. Claude Code stamps its system prompt with a billing header that changes on every
 request (`cch=...`) and every session (the 4th part of `cc_version=`); the server pins both stamps (to `f`s, as
 llama.cpp does), so the system prompt and the tool list in front of it are the same prompt on every turn. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
 `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
@@ -1677,26 +1689,39 @@ The disk tier preserves parked conversations across alternation and across resta
 It does not itself add concurrent execution. Set `"parallel": N` to enable batch slots;
 see [BATCHING.md](BATCHING.md) for their memory costs and limits.
 
-**Disk endurance and sizing.** A conversation is an append-only CHAIN: one file, a fixed master
-header and one PANEL per park.  A park captures and appends only the DELTA the conversation
-gained since its last panel - the new token ids, new checkpoints, the current running state, and
-the new K/V pages (a full-snapshot store rewrote the whole record every turn).  A panel's seed
-(first park) writes through a temporary file and renames it into place; appends write at the end
-of the chain and patch the master header.  A torn append (a crash mid-panel) is detected by its
-payload checksum on the next read and truncated back to the last complete panel, so the
-conversation survives to its previous park.  A park with nothing new since the last panel writes
-nothing.
+**Disk endurance and sizing.** A conversation uses a `.conversation` chain for token metadata
+and K/V panels, and a `.states` sidecar for retained running states. A compatible append writes
+only the token and K/V delta. It can repeat a boundary page and the moving indexer row.
+New panels do not repeat full checkpoint token lists or inline running states.
+If the longest token prefix has different K/V bytes, the writer checks earlier input and checkpoint
+boundaries. A difference in reply cells must not force a second copy of an unchanged input prefix.
+Replay can also change the final input cells. A replacement before the saved input boundary must
+prove that the remaining original input tokens and image keys are unchanged. An input edit keeps
+the original branch.
 
-A park includes only checkpoints after the stored base. The engine excludes checkpoints at or
-before that base before it captures a delta. The disk store rejects a delta that includes these
-older checkpoints. This filter prevents repeated failed saves when a conversation has an early
-checkpoint before its shared system-prompt base.
+The sidecar has fixed state slots for ordinary anchors. New states replace anchors that the
+retention policy removes. Explicit pins can require extra slots. Ordinary turns do not add
+one permanent recurrent-state payload per turn. If state publication fails, the cache write
+fails; it does not use an unbounded inline-state fallback.
+When later input consumes a stored generated end, the sidecar can retain that original resume
+state in one ordinary slot. Dense input checkpoints do not rotate it away. The marker and state
+survive restart. This does not add a state slot on each turn.
 
-The engine checks the live GPU prefix before it selects a saved conversation. A disk record must
-provide a longer compatible prefix than the selected resident state before the engine reads it.
-A continuation that uses the live prefix or one of its own compatible checkpoints does not park
-the outgoing conversation. The K/V cells stay on the GPU. A conflicting request can cause a park
-before it replaces that state. A system-prompt record can also be saved for reuse by other chats.
+A seed uses a temporary chain file and a rename. Appends write a new panel and update the
+chain header. The reader checks panel checksums and truncates a torn tail to the last complete
+panel. A state-slot update writes its payload before its slot header. An invalid slot cannot
+supply a restore state. A torn sidecar header can make all its anchors unavailable.
+The engine then needs another valid anchor or a prompt read.
+
+Version-2 files with inline states remain readable. The loader selects retained states before
+it allocates their payloads. It verifies discarded payload bytes without retaining them.
+Legacy inline states remain on disk until their chain is evicted or replaced.
+
+The engine checks the live GPU prefix before it selects a saved conversation. A disk restore
+must offer a longer compatible state anchor than the selected resident state.
+A live continuation needs no conversation-cache transfer. Before a rewind overwrites a different
+continuation, the engine preserves its eligible checkpoints. This also applies to pinned-prefix
+requests. A pin does not authorize the engine to discard the rest of a long conversation.
 L2 can remain disabled while L3 is enabled.
 
 During decode, the engine keeps a checkpoint of the state before the latest decode window on each
@@ -1713,31 +1738,35 @@ that the drive is idle: the model's PLE table has a separate disk-read path. In 
 read and restore messages identify L3 loads. A conversation switch can still take seconds to load
 a large record.
 
-The delta's size grows with the new context, the KV format, the number of split stages, and the
-model's fixed running state (e.g. the SSM/gdn recurrence), not with the whole conversation, so
-frequent switching no longer flattens the drive a full record at a time.  One chain file per
-conversation grows in place; the 50 GiB budget holds ~20 distinct conversations instead of 20
-copies of one.  On a flash device this still consumes endurance in proportion to the deltas you
-write.  Use a directory on a device that you can write to, and stop the server before you delete
-the directory to clear the cache; the engine rebuilds an empty index at the next start.
+New K/V storage grows with the changed suffix, the KV format, and the number of split stages.
+Retained running-state storage is bounded separately. The byte budget includes both the chain
+and its sidecar. Cache size and write cost depend on the model and workload; a byte budget does
+not imply a fixed number of conversations. Flash endurance still depends on the bytes written.
+Stop the server before you clear the cache directory. The engine builds an empty index at its
+next start.
 
-The engine tracks the stored prefix that remains unchanged in the live session. If a restore
-selects a saved checkpoint inside a panel, the next park appends a replacement tail from that
-checkpoint to the same chain. It does not copy the unchanged prefix into a new full record.
-The new tail includes the overlap page, indexer rows, and current running state needed for a
-correct restore. This also permits a replacement that is shorter than the old tail.
+The store selects shared K/V backing separately from a recurrent-state restore anchor.
+A chain can lend a shorter prefix even when it has no running state at that exact position.
+The engine verifies retained K/V bytes and completed indexer rows before it borrows them.
+Equal token IDs alone are not proof of equal K/V payloads. Replayed boundary cells can require
+a shorter shared extent; the changed suffix then starts at that verified boundary.
 
-The existing file remains valid until the replacement append succeeds. During a load, later
-panels replace earlier token and image tails. The loader excludes checkpoints from discarded
-branches, limits older K/V payloads to the new buffer extent, and verifies payload checksums.
-After a restart, the index reconstructs the same replacement history from panel metadata.
-For a rewind position without a saved checkpoint, the store retains complete panels as before.
-If none can be retained, it preserves the old record and requests a separate seed.
+A branch references the unchanged prefix of an existing chain and stores its own suffix.
+It does not truncate the source chain's continuation. A reference can point to a prefix inside
+a panel or to another branch. The store checks content, image keys, stage layout, and base
+dependencies. It refuses a rewind or replacement that would strand a dependent branch.
+The finite cache budget can still evict a chain and its dependents.
 
-A chain's name comes from the token prefix at its seed. A new seed at the same name replaces the
-chain. During a load, each panel's checkpoint payload is restored to that panel's own checkpoint
-positions in every stage. This prevents a later panel from overwriting an earlier checkpoint.
-Unused chains remain until eviction.
+The engine records the input-prompt boundary separately from the generated reply.
+It can replace an obsolete reply tail after that boundary. This operation does not add a new
+conversation or a permanent state file on each turn. A branch before that boundary retains
+the source continuation. Pins and dependent prefix references still prevent destructive replacement.
+If the stored input boundary is unknown, the engine does not infer it from a nearby checkpoint.
+
+A prefix load skips panels that cannot contribute to the requested extent. It reads the panel
+that contains the cut in full to verify its checksum. Thus, a short load from a large legacy
+panel can still require a large disk read. A matching token position without a valid running
+state is not a restore point. Keep each chain and its sidecar together.
 
 Older duplicate records are not removed by a background deduplication operation. The store
 evicts least-recently-used conversation records when a save needs space within the byte budget,

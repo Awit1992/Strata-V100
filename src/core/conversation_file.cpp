@@ -682,7 +682,7 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.vec(c.ids);
     o.u64(c.imgs.size());
     for (const auto& k : c.imgs) { o.i64(k.start); o.u64(k.hash); }
-    o.vec(c.gdn); o.vec(c.ple); o.vec(c.tails); o.vec(c.dead); o.vec(c.block_pos);
+    o.vec(c.gdn.vec()); o.vec(c.ple.vec()); o.vec(c.tails.vec()); o.vec(c.dead.vec()); o.vec(c.block_pos.vec());
     o.u64(c.used);
 }
 
@@ -758,8 +758,8 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
     c.imgs.resize((size_t) n);
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
-    return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
-           in.vec(c.block_pos, m[4]) && in.u64(c.used);
+    return in.vec(c.gdn.vec(), m[0]) && in.vec(c.ple.vec(), m[1]) && in.vec(c.tails.vec(), m[2]) &&
+           in.vec(c.dead.vec(), m[3]) && in.vec(c.block_pos.vec(), m[4]) && in.u64(c.used);
 }
 
 bool get_payload(In& in, SavedConversation& s) {
@@ -1137,7 +1137,13 @@ const ConversationCheckpoint* session_deepest_checkpoint(const std::vector<Conve
 
 uint64_t session_save_peak_bytes(const ConversationCheckpoint* deepest, const SessionSaveLive& live) {
     uint64_t n = sat_add(kBlock, uint64_t(1) << 20);                          // write buffer, small vectors
-    if (deepest) n = sat_add(n, sat_mul(2, deepest->bytes()));                // the list and the image's copy
+    if (deepest) {                                                            // the list and the image's copy
+        // A copy shares the checkpoint's running-state payloads (ConversationPayload), so only its identity lists
+        // are new RAM: the state bytes are held once, however many copies of the checkpoint exist.
+        const uint64_t lists = sat_add(sat_mul(deepest->ids.size(), sizeof(int32_t)),
+                                       sat_mul(deepest->imgs.size(), sizeof(ConversationImageKey)));
+        n = sat_add(n, sat_mul(2, lists));
+    }
     n = sat_add(n, live.state_bytes);                                         // the live running state
     n = sat_add(n, sat_mul(live.tokens, sizeof(int32_t)));                    // its token list
     n = sat_add(n, sat_mul(live.images, sizeof(ConversationImageKey)));       // its images

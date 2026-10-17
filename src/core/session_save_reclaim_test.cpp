@@ -47,17 +47,18 @@ int main() {
         for (size_t i = 0; i < 4; ++i) chain.push_back(checkpoint(i == selected ? 300 : 100, pin && i == selected));
         if (pin) chain[(selected + 1) % 4].ids.resize(500); // deeper, unpinned
         auto before = *session_deepest_checkpoint(chain);
-        const auto* storage = session_deepest_checkpoint(chain)->gdn.data();
         ConversationCache cache(1u << 20, 10);
         park(cache, 10); park(cache, 20, true); park(cache, 30);
         std::vector<ConversationKv> kv(1); kv[0].k.resize(16384); cache.retain(std::move(kv), 100);
         const size_t bytes_before = cache.bytes();
         size_t chain_bytes = 0; for (const auto& c : chain) chain_bytes += c.bytes();
+        // The reclaim allocates nothing at all - a copy of the state bytes would - so the guarded allocator is
+        // what proves the selected checkpoint's storage is kept in place, not a pointer comparison (the payload's
+        // mutable data() would detach it).
         deny_alloc = true;
         auto freed = session_save_reclaim(chain, cache, live, floor, [] { return std::optional<uint64_t>(0); });
         deny_alloc = false;
         check(chain.size() == 1 && same(chain[0], before), "selected checkpoint unchanged under pressure");
-        check(chain[0].gdn.data() == storage, "checkpoint moved without copying storage");
         check(freed.checkpoints == 3 && freed.parked == 2 && cache.size() == 1, "pins survive, other entries reclaimed");
         check(cache.evictions() == 2 && cache.retained_bytes() == 0, "cache accounting and retained buffers");
         check(freed.bytes == bytes_before - cache.bytes() + chain_bytes - chain[0].bytes(), "released byte accounting");
