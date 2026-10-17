@@ -78,6 +78,9 @@ bool view_validate(const ConversationView& view, const SessionState& ss,
     if (view.ids.empty() || !image_keys(view.images, view.ids.size()) ||
         std::any_of(view.ids.begin(), view.ids.end(), [](int32_t id) { return id < 0; }))
         return fail(error, "invalid live token/image metadata");
+    if (view.live_state && (view.live_state->ids != view.ids || view.live_state->imgs != view.images ||
+        !conversation_checkpoint_validate(*view.live_state, ss, g, error)))
+        return fail(error, "invalid saved live checkpoint");
     for (const auto& c : view.checkpoints) {
         if (!c.stage_parts.empty() || c.ids.empty() || c.ids.size() > view.ids.size() ||
             !std::equal(c.ids.begin(), c.ids.end(), view.ids.begin()))
@@ -256,13 +259,14 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     SavedConversation captured;
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
-    captured.live.ids = view.ids; captured.live.imgs = view.images;
+    if (view.live_state) captured.live = *view.live_state;
+    else { captured.live.ids = view.ids; captured.live.imgs = view.images; }
     captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss);
     captured.kv.resize(layers + (draft ? 1 : 0));
-    if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+    if (!view.live_state && !conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,

@@ -210,3 +210,64 @@ profile. It reserves extra memory for a second verifier and stage snapshots.
 Do not apply it to a different machine without measurements. See the
 [local evaluation report](../benchmarks/v100-upstream-pr-evaluation-2026-10-15.md)
 for results, limits, and reproduction commands.
+
+## Historical checkpoint retention
+
+The conversation cache now preserves prompt checkpoints before the active
+retention policy removes them. A checkpoint archive has the recurrent state
+and its required KV backing. Compatible checkpoints share one backing image
+within each archive group. The L2 byte limit, slot limit, and free-RAM floor
+apply to these groups. L2 capacity victims move to L3 when L3 is enabled.
+An L3 restore can promote the complete archive to L2.
+
+A single-V100 smoke run used a 12,440-token synthetic prompt, eight short
+continuations, and edits before the active checkpoint window. The run used
+these limits:
+
+```text
+--prompt-cache 3 --prompt-cache-every 512
+--conversation-cache-mib 8192 --conversation-cache-slots 2
+--conversation-cache-min-tokens 0 --conversation-cache-min-free-mib 1024
+--conversation-cache-disk <scratch-directory>
+--conversation-cache-disk-gib 32
+--conversation-cache-disk-min-free-mib 128
+```
+
+The L2 archive retained 31 checkpoints after the eight continuations.
+An edit at token 6,144 restored the historical L2 checkpoint. The engine
+processed the remaining 6,296 tokens. Three unrelated requests then forced
+L2 evictions. An edit at token 7,168 restored an L3 checkpoint. The engine
+processed the remaining 5,272 tokens. Both requests produced the same output
+and main-model state hashes as their cold-reference requests. The logs showed
+L2-to-L3 spills and L3-to-L2 promotion. L2 occupancy stayed below 8 GiB and
+two slots.
+
+The installed service also passed an HTTP smoke check with its existing
+settings: a 524,288-token context, a 25 GiB L2, 32 cache slots, and the
+default active checkpoint count. Ten short chat turns completed. A change
+to the fifth user message then restored 124 tokens from L2 for a 293-token
+prompt. The earlier continuation reference reused 48 tokens. The runtime
+log confirmed an L2 restore, not an L3 restore.
+
+The first restart checks failed because of the host memory, not the cache
+code. The host uses non-ECC memory and has no error log, so the fault made
+no hardware record. A CPU-only pattern test found one bit that always read
+back wrong. Two cold engine runs of the same prompt then gave different
+model-state fingerprints, so no state comparison was possible.
+
+The operator removed the two 16 GB modules and kept the two 32 GB modules.
+A 54 GiB pattern scan of the 62.7 GiB of installed memory found no fault.
+Two cold engine runs then gave identical model-state fingerprints, and the
+restart and promotion parity checks passed:
+
+- the L3 restore after a full engine restart matched the cold reference;
+- the L2 promotion matched the cold reference;
+- the model-state fingerprints and the outputs were identical.
+
+The defective module is one of the two removed 16 GB modules. That pair
+carries no part number and serial number 00000000. Test each module alone to
+confirm which one is defective.
+
+Finite cache budgets still limit history. A checkpoint that both L2 and L3
+have evicted is not available for reuse. The engine must process that prefix
+again.

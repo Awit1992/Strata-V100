@@ -80,6 +80,10 @@ struct ConversationView {
     const std::vector<ConversationImageKey>& images;
     const std::vector<ConversationCheckpoint>& checkpoints;
     bool cvec;
+    // Capture K/V at an already saved checkpoint, not the session's newer
+    // recurrent state. The caller guarantees that its positional prefix is
+    // still authoritative. Used before active checkpoint eviction.
+    const ConversationCheckpoint* live_state = nullptr;
 };
 
 // ---- The L3 disk tier's delta image for one conversation (one layer-split stage).  The live checkpoint

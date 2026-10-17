@@ -111,6 +111,11 @@ std::string conversation_disk_prefix_name(const std::vector<int32_t>& ids,
 class ConversationDiskStore {
 public:
     static constexpr uint32_t format_version = 2;
+    static constexpr uint64_t max_metadata_bytes = 64ull << 20;
+    // Allocation-free sizes in the disk format. Archive growth uses the same
+    // limit as the writer, before it moves or discards any checkpoint state.
+    static size_t metadata_bytes(const SavedConversation& image);
+    static size_t metadata_bytes(const ConversationCheckpoint& checkpoint);
     static constexpr const char* file_suffix = ".conversation";
 
     ConversationDiskStore() = default;

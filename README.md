@@ -200,32 +200,29 @@ The server normally listens on localhost. If you expose it to other machines, co
 
 ### Conversation cache disk (opt-in)
 
-The conversation state has three tiers. Tier 1 (L1) is the live session in GPU memory; it always exists. Tier 2 (L2) is the optional host-RAM cache (`--conversation-cache-mib`). Tier 3 (L3) is an optional disk store that keeps parked conversations in files across restarts.
+The conversation state has three tiers. L1 is the active session and its resident prompt checkpoints. L2 is the optional host-RAM cache (`--conversation-cache-mib`). L3 is an optional disk store that keeps saved conversations and checkpoint groups across restarts. Streamed KV layers use their authoritative host pools when the engine captures state.
 
 To use the disk store, add `--conversation-cache-disk strata-conversations --conversation-cache-disk-gib 25` to the engine arguments. The path and a positive GiB budget are required together. The store is off by default, it needs `--serve`, it works with `--conversation-cache-mib 0`, and it supports `--layer-split` on multiple GPUs. Optional: `--conversation-cache-disk-slots N` caps the record count, and `--conversation-cache-disk-min-free-mib N` keeps free space on the filesystem.
 
-Every conversation is an append-only CHAIN: one file, a fixed master header followed by one PANEL
-per park.  A park writes only the DELTA the conversation gained since its last park - the new
-token ids, new checkpoints, the current running state, and the new K/V pages (a full-snapshot
-store rewrote the whole conversation every turn; this one never does).  A chain may instead
-reference a shared system-prompt ('p') record as its BASE, in which case the system prompt's K/V
-is stored once and every chat's file holds only the chat's tail.  A record/panel is reused only
-when the prompt starts with exactly its tokens and images and its control-vector mode matches.
-The engine picks the longest valid prefix across the live session, the RAM cache, the disk
-chains and the idle batch slots, so a shorter disk record never displaces a longer resident
-state.  Panels are checksummed and versioned; the seed (first panel) writes through a temporary
-file and renames it into place, and appends write at the end of the chain and patch the master
-header.  A torn append (a crash mid-panel) is recovered on the next read by truncating back to
-the last complete panel, so the conversation survives to its previous park - strictly better
-than a full-snapshot store, where a crash mid-write lost the whole record.  Invalid files from
-older formats are removed at startup.  The store evicts the least recently used chain when it
-reaches its byte budget, its record cap, or the free-space floor; a referenced system-prompt
-base is pinned while any chat chain lives.  A corrupt or incompatible chain is removed, and the
-request falls back to normal prompt processing.
+The engine preserves an active checkpoint before retention removes it or a request overwrites its branch. Each saved checkpoint includes the GDN state, PLE history, QSA indexer state, and the required KV backing. Token KV data alone is not sufficient to resume this model.
 
-A shared system prompt gets its own small record. When a fresh chat is first read from token 0, the engine checkpoints the end of the system prompt (the first turn boundary; `--prompt-cache-root`, default 2048 tokens) and captures that prefix once into each enabled tier as a **system-prompt root image**. The root is pinned: the RAM cache and the disk LRU evict it only after every parked conversation, and an equal-length match prefers it because restoring it reads only the shared prefix (the 24k) instead of the longer conversation record that contains it (the 80k). `--conversation-cache-keep-root` and `--conversation-cache-disk-keep-root` (both default on) pin the root per tier; their `--no-` variants turn that tier's pin off. The capture runs only when the prefix is missing from a tier, so the shared bytes are written once, not once per chat.
+Related checkpoints share one KV image per archive group. The engine moves and extends that image instead of copying the full prefix for each checkpoint. It copies only new or changed KV pages when the backing is still valid. A group stops growing before it reaches the disk metadata limit. A later group has its own backing. The engine does not combine a saved checkpoint with KV bytes from a different computation of the prefix.
 
-The disk tier accelerates conversation alternation and server restarts. It does not itself add concurrent execution. Use `"parallel": 2` for parallel requests; see [batch slots](docs/BATCHING.md) for memory costs and limits. GPU capture must complete before the active session is overwritten, but the file write runs asynchronously while the next request uses the GPUs; a park with nothing new since the last panel writes NOTHING (zero I/O). Restore is synchronous. Save and restore stage the delta in host RAM, and the engine releases that memory after the file operation. A park appends only the delta (plus the model's fixed running state), so frequent switching no longer flattens the drive a full record at a time; one chain file per conversation grows in place. Size the GiB budget for the number of conversations you keep, not for one conversation's repeated full snapshots. See [details](docs/DETAILS.md) and [the benchmark report](benchmarks/v100-l3-conversation-cache-2026-10-03.md) for measured numbers.
+Archive groups use the same L2 byte and slot limits as saved conversations. L2 capacity victims move to L3 when the disk tier is enabled. A successful L2 admission does not also write the image to disk. If an image cannot fit in L2, the engine attempts to store it in L3. Physical-RAM and disk free-space limits still apply. The minimum-token setting also applies to checkpoint archives.
+
+Preserving a checkpoint is an optimization, not a requirement. If the host RAM floor or the disk budget refuses the image, the engine drops the checkpoint, logs the drop, and continues serving. It does not stop the server. The session stays correct; only the reuse of that checkpoint is lost.
+
+Lookup selects the longest compatible prefix across the active session, L2, L3, and idle batch slots. Tokens, image identity, and control-vector mode must match. For an edit to an earlier message, reuse ends at a saved checkpoint before the first changed token. The engine must process the suffix again; it cannot resume at an arbitrary matching token without the recurrent state at that position. Increasing `--prompt-cache` is not a substitute for checkpoint preservation.
+
+An L2 archive remains available after restore. A valid L3 image is promoted to L2 when the byte budget and physical-RAM floor permit it. Only a bounded subset of its checkpoints becomes resident in the active session. Restoring one branch does not remove other checkpoints from the saved archive.
+
+The disk store supports append-only conversation chains. A continuing chain can append new token IDs, checkpoints, running state, and KV pages. An L2 eviction writes a complete seed image; it does not require a GPU capture. A rewind starts a separate branch instead of replacing the source chain. The file format does not change for checkpoint archives.
+
+Disk panels have checksums and version fields. A seed uses a temporary file and a rename. An incomplete append is recovered to the last complete panel. Invalid or incompatible records are removed. The disk store evicts least-recently-used chains to enforce its byte budget, record limit, and free-space floor. Thus, neither L2 nor L3 provides unlimited history. If both tiers have evicted the required checkpoint, the request must process the missing prefix again.
+
+The engine captures a shared system-prompt root once into L2 when root retention is enabled. L3 receives the root on L2 eviction or failed L2 admission. With L2 disabled, an enabled L3 can receive the root directly. `--conversation-cache-keep-root` and `--conversation-cache-disk-keep-root` control root retention in each tier. Their `--no-` variants disable it. Roots have lower eviction priority than ordinary images; explicit request checkpoint pins remain protected.
+
+The disk tier does not add concurrent execution. See [batch slots](docs/BATCHING.md) for concurrent-request memory costs. Capture must finish before a request overwrites the required session bytes. Restore is synchronous. L2 eviction writes use host snapshots and can add disk I/O latency. Size both cache budgets for the conversations and checkpoint history that you need. See [the V100 guide](docs/NVIDIA_V100.md) for the checkpoint-retention verification and [the disk benchmark report](benchmarks/v100-l3-conversation-cache-2026-10-03.md) for earlier measurements.
 
 #### Measured V100 result
 
