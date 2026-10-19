@@ -10,13 +10,19 @@ chunks interleaved with their windows), and a conversation's next turn continued
      valid slot with a shorter record (a performance bug the token parity cannot see)
  4. a long prompt D gives way (BYIELD) at a chunk boundary while its read is in flight: the BYIELD is sent after
     the first progress PP as the server sends it (a BYIELD before the read starts is dropped), D's part read waits
-    in its slot, a short E is then admitted, and D goes on from its slot: both equal their solo tokens
+    in its slot, a short E is then admitted, and D goes on from its slot: both equal their solo tokens.  On a
+    pipelined batch (a layer split, more than one group) a read never gives way: D is then read whole into slot 2
+    and E admitted into slot 1 beside it; both must still equal solo, only the give-way is not required (--yield
+    auto; --yield expect requires it anyway)
   6. A in a slot, stopped after 50 tokens and continued on the solo path (GEN of A + its tokens, from the slot): the
      whole equals solo A (what the server does with a request left alone in a slot)
   5. (a measurement, also a check) a solo next turn continued from slot 0: the drafts accepted, and the reuse must
      be the FULL resident slot-0 prefix again (the same L3-over-slot regression as step 3)
   7. F, A's history as a client sends it back without the reply's thinking, from slot 1's turn checkpoint: equal to
      F solo (which continues from the same checkpoint of the live chain)
+     (after step 6 the solo path holds A's start, so F's start comes from the live chain or the prompt cache here)
+  7b. A in slot 1 to its end, --flush unrelated solo GENs, then F2 (A's question, another reply) into slot 2: its
+     start can only come from slot 1's turn checkpoint; equal to F2 solo.  The engine log line says which source was used.
 
 Exact comparisons need the same settings as batch_test.py (this script sets STRATA_IQ_MT_MIN=1):
   python tools/batch_interleave_test.py --exe build/strata --config strata-<model>.json \\
@@ -24,7 +30,7 @@ Exact comparisons need the same settings as batch_test.py (this script sets STRA
 Without --no-prefill-borrow the slots decoding during C's read see the expert cache without the slots C's prompt
 borrowed (those experts run on the CPU, which rounds differently): A's and B's text may then drift from solo.
 """
-import argparse, atexit, json, os, sys, time
+import argparse, atexit, json, os, re, sys, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -74,6 +80,18 @@ def stop_engine(eng):
             pass
 
 
+def engine_pipelined(eng, extra):
+    """Does the engine run the batch in pipelined groups (a layer split, more than one group)?  Then a BYIELD is
+    dropped: a pipelined read never gives way."""
+    if "--batch-groups" in extra:
+        v = extra[extra.index("--batch-groups") + 1] if extra.index("--batch-groups") + 1 < len(extra) else ""
+        if v.isdigit():
+            return int(v) > 1
+    eng.log.flush()
+    m = re.search(r"--batch-groups auto: (\d+) groups? of", Path(eng.log_path).read_text(errors="replace"))
+    return bool(m) and int(m.group(1)) > 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
@@ -81,6 +99,13 @@ def main():
     ap.add_argument("--max-new", type=int, default=200)
     ap.add_argument("--long", type=int, default=5000, help="tokens of the long prompt C (several prompt chunks)")
     ap.add_argument("--extra", default="")
+    ap.add_argument("--yield", dest="yield_mode", choices=("auto", "expect", "skip"), default="auto",
+                    help="step 4's give-way: auto = expect a YIELDED unless the batch is pipelined (the engine log "
+                         "says '--batch-groups auto: N groups' with N > 1, or --extra has --batch-groups N > 1), "
+                         "where a read never gives way; expect = always required; skip = never required")
+    ap.add_argument("--flush", type=int, default=8,
+                    help="7b: unrelated solo GENs between A in slot 1 and F, so only the slot holds A's start (0: off)")
+    ap.add_argument("--dump", default="", help="write every solo and slot token list as JSON: an A/B of two builds")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     tok = tokenizer(cfg["tokenizer"])
@@ -114,6 +139,10 @@ def main():
     F = A[:turn_at] + tok.encode("<|im_start|>assistant\nA short answer.<|im_end|>\n", parse_special=True) + \
         chat("Now in Go.")
     sF, _ = run(eng, out, f"GEN {M} {ids(F)}")
+    # F2 (step 7b): another reply to A's question - it too shares A only up to A's turn checkpoint
+    F2 = A[:turn_at] + tok.encode("<|im_start|>assistant\nAnother short answer.<|im_end|>\n", parse_special=True) + \
+        chat("Now in C.")
+    sF2, _ = run(eng, out, f"GEN {M} {ids(F2)}") if a.flush > 0 else ([], None)
     sB, _ = run(eng, out, f"GEN {M} {ids(B)}")
     sC, _ = run(eng, out, f"GEN {M} {ids(C)}")
     sD, _ = run(eng, out, f"GEN {M} {ids(D)}")
@@ -190,8 +219,13 @@ def main():
     # otherwise hit an active slot), and the engine is stopped on it.  Until the engine fix that keeps the chunk
     # sweep live when a layer-split read starts with every slot idle (generate.cpp read_part), this step fails on
     # the old engine by design.
+    # On a pipelined batch (a layer split with more than one group) a read never gives way (generate.cpp: the BYIELD
+    # is dropped): D is then admitted whole into slot 2 and E goes into the free slot 1 while D decodes - both must
+    # still equal solo, only the give-way itself is not checked (--yield)
+    pipelined = engine_pipelined(eng, a.extra.split())
+    expect_yield = a.yield_mode == "expect" or (a.yield_mode == "auto" and not pipelined)
     eng.send(f"BGEN 2 {M} {ids(D)}")
-    yielded = done_cancel = None
+    yielded, done_cancel, firstD, contD = None, None, [], None
     sent_yield = False
     deadline = time.time() + 240
     while time.time() < deadline:
@@ -199,7 +233,9 @@ def main():
             l = eng.pending.pop(0) if eng.pending else next(out)
         except StopIteration:
             raise SystemExit(f"the engine ended during step 4 - see {eng.log_path}")
-        if l.startswith("YIELDED 2 "):
+        if l.startswith("T "):
+            firstD.append(int(l.split()[1]))
+        elif l.startswith("YIELDED 2 "):
             yielded = l
         elif l.startswith("DONE ") and yielded is not None:
             done_cancel = l
@@ -215,8 +251,12 @@ def main():
         elif l.startswith("ERR"):
             raise SystemExit("engine: " + l)
         elif l.startswith("BADM 2 "):
+            contD = l.split()[2] == "1"
             break
-    if yielded is None or done_cancel is None:
+    if yielded is not None and done_cancel is not None:
+        print(f"D gave way: {yielded} (DONE {done_cancel.split()[1]} generated, {done_cancel.split()[5]} finish)",
+              flush=True)
+    elif yielded is not None or expect_yield:
         print(f"D gave way: {yielded}", flush=True)
         print("step 4: FAILED - the engine did not preempt D's read (BYIELD 2 was sent after its first progress "
               "PP, while the read was in flight at a chunk boundary; it read D to BADM anyway)", flush=True)
@@ -226,13 +266,19 @@ def main():
                 if "gives way" in l or "not taken" in l:
                     print("  log:", l[:200], flush=True)
         raise SystemExit(2)
-    print(f"D gave way: {yielded} (DONE {done_cancel.split()[1]} generated, {done_cancel.split()[5]} finish)",
-          flush=True)
+    else:
+        print(f"D gave way: None - the batch is pipelined ({pipelined}), where a read never gives way; D stays in "
+              f"slot 2 ({len(firstD)} first tokens, {'continues' if contD else 'done'}), E goes into slot 1 beside it",
+              flush=True)
     got4 = {1: [], 2: []}
     first, cont1 = run(eng, out, f"BGEN 1 {M} {ids(E)}", slot=1)
     got4[1] += first
-    first, cont2 = run(eng, out, f"BGEN 2 {M} {ids(D)}", slot=2)
-    got4[2] += first
+    if yielded is not None:
+        first, cont2 = run(eng, out, f"BGEN 2 {M} {ids(D)}", slot=2)
+        got4[2] += first
+    else:   # D never left slot 2: its tokens so far are the read's first ones plus the BT 2 lines kept in pending
+        got4[2] += firstD
+        cont2 = contD
     done4 = {s for s, c in ((1, cont1), (2, cont2)) if not c}
     while len(done4) < 2:
         try:
@@ -241,13 +287,15 @@ def main():
             raise SystemExit(f"the engine ended during step 4 - see {eng.log_path}")
         if l.startswith("BT "):
             _, s, y = l.split()
-            if int(s) in got4:
+            if int(s) in got4 and int(s) not in done4:
                 got4[int(s)].append(int(y))
         elif l.startswith("BDONE "):
             s = int(l.split()[1])
             if s in got4:
                 done4.add(s)
-    for s, ref, name in ((1, sE, "E (short, admitted while D waited)"), (2, sD, "D (gave way, then went on)")):
+        elif l.startswith("ERR"):
+            raise SystemExit("engine: " + l)
+    for s, ref, name in ((1, sE, "E (short, admitted while D waited)"), (2, sD, "D (gave way, then went on)" if yielded else "D (read whole, E admitted beside it)")):
         same = got4[s] == ref
         ok &= same
         d = next((k for k in range(min(len(got4[s]), len(ref))) if got4[s][k] != ref[k]), None)
@@ -298,7 +346,8 @@ def main():
               f"re-read past the resident slot", flush=True)
         raise SystemExit(2)
     print(f"solo next turn: reused {A3_reused} cached tokens (the full slot-0 prefix is {a3_slot})", flush=True)
-    # 7. F from slot 1's turn checkpoint (slot 1 holds A since step 6): the engine log says "(its turn checkpoint)"
+    # 7. F, A's history without the reply's thinking, into slot 2 (its start comes from the live chain or the prompt
+    # cache: step 6's solo continuation took slot 1's contents back; 7b below makes a slot the only source)
     first, cont = run(eng, out, f"BGEN 2 {M} {ids(F)}", slot=2)
     got7 = list(first)
     while cont:
@@ -310,8 +359,54 @@ def main():
     same = got7 == sF
     ok &= same
     d = next((k for k in range(min(len(got7), len(sF))) if got7[k] != sF[k]), None)
-    print(f"F (A's history without the reply's thinking) from slot 1's turn checkpoint: {len(got7)} tokens, solo "
+    print(f"F (A's history without the reply's thinking) in slot 2: {len(got7)} tokens, solo "
           f"{len(sF)}: {'IDENTICAL' if same else f'DIFFERS at {d}'}", flush=True)
+    # 7b. step 7 where only a SLOT can give the start: after step 6 the solo path took slot 1's contents back, so the
+    # live chain (or the prompt cache) held A's start in step 7 and F came from there.  Here A runs to its end in
+    # slot 1, then --flush unrelated solo GENs push A out of the live session and the prompt cache's checkpoints; F2
+    # (A's question, another reply) into slot 2 can then only start from slot 1's turn checkpoint (slot 2 holds F,
+    # which shares no more with F2 than A does; the engine log line is printed) - its tokens must equal F2 solo
+    got7b = []
+    if a.flush > 0:
+        first, cont = run(eng, out, f"BGEN 1 {M} {ids(A)}", slot=1)
+        gotA = list(first)
+        while cont:
+            l = eng.pending.pop(0) if eng.pending else next(out)
+            if l.startswith("BT 1 "):
+                gotA.append(int(l.split()[2]))
+            elif l.startswith("BDONE 1 "):
+                break
+        same = gotA == sA
+        ok &= same
+        print(f"7b: A in slot 1 to its end: {len(gotA)} tokens, solo {len(sA)}: {'IDENTICAL' if same else 'DIFFERS'}",
+              flush=True)
+        for k in range(a.flush):
+            run(eng, out, f"GEN 8 {ids(chat(f'Unrelated question {k}: name one prime number above {100 * k}.'))}")
+        eng.log.flush()
+        mark = len(Path(eng.log_path).read_text(errors="replace"))
+        first, cont = run(eng, out, f"BGEN 2 {M} {ids(F2)}", slot=2)
+        got7b = list(first)
+        while cont:
+            l = eng.pending.pop(0) if eng.pending else next(out)
+            if l.startswith("BT 2 "):
+                got7b.append(int(l.split()[2]))
+            elif l.startswith("BDONE 2 "):
+                break
+        tail = Path(eng.log_path).read_text(errors="replace")[mark:]
+        src = [l for l in tail.splitlines() if "gave back" in l or "strata serve: prompt" in l][:2]
+        same = got7b == sF2
+        ok &= same
+        d = next((k for k in range(min(len(got7b), len(sF2))) if got7b[k] != sF2[k]), None)
+        print(f"7b: F2 after {a.flush} unrelated GENs, from slot 1: {len(got7b)} tokens, solo {len(sF2)}: "
+              f"{'IDENTICAL' if same else f'DIFFERS at {d}'}", flush=True)
+        for l in src:
+            print("  7b log:", l.split("strata ")[-1][:160], flush=True)
+    if a.dump:
+        Path(a.dump).write_text(json.dumps({
+            "solo": {"A": sA, "A2": sA2, "B": sB, "C": sC, "D": sD, "E": sE, "F": sF, "F2": sF2},
+            "slots": {"A": got[0], "B": got[1], "C": got[2], "A2": got2, "E": got4[1], "D": got4[2],
+                      "A_slot_then_solo": got6 + tail6, "F": got7, "F2": got7b},
+            "yielded": yielded is not None, "pipelined": pipelined}), encoding="utf-8")
     eng.send("QUIT")
     eng.p.wait(timeout=180)
     log = Path(eng.log_path).read_text(errors="replace")
