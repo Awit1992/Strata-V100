@@ -1,7 +1,7 @@
 # EXPDEC: the verify window's routed experts with the group's activations in shared memory (`STRATA_EXPDEC=1`, opt-in)
 
 Opt-in: `STRATA_EXPDEC=1`. Unset (or `0`) the engine launches exactly the kernels it launched before. CUDA only; the
-output is bitwise the default kernels' (see "Bit for bit" below; `expdec_bench` checks it).
+output is bitwise the default kernels' (see "Bit for bit" below).
 
 ## What it changes
 
@@ -49,42 +49,7 @@ sub-warp: calls t, t+32, t+64 into `s`, t+16, t+48 into `s16`, `s = __fadd_rn(s,
 `apply_u` is `apply` with the same integer and float operations in the same order on the same words (the q8_1 block
 read from shared memory instead of global). The group's entries are independent of each other, so how many are staged
 per pass does not matter; R rows per lane and `rb` rows per block only change which lane computes what. The FMA
-contraction of `s += d * sumi` is the same compiler decision on the same expression in both kernels. The bench
-confirms it: `identical` on every cell (10 format pairs x T 1-4 x 2 window shapes x every variant x 2 cards).
-
-## Micro-bench: `expdec_bench`
-
-Not in the default build: `cmake --build <dir> --target expdec_bench`.
-
-```
-expdec_bench [reps=300] [device=-1] [groups=20] [pairs=all] [choices=def,dec,dec:r2,dec:b4,dec:r2:b4] [shape=real]
-```
-
-Pairs: the model's 5 gate/up x 2 down formats or `21/20,16/42`. Choices: `def` (the reference) and
-`dec[:r<1|2>][:d<1|2|4>][:b<2|4>][:w<0|1>][:x<0|1>][:g<n>][:h<n>][:m<n>]` (rows per lane for gate/up and down, min blocks
-per SM, EXPDEC for the down too, also IQ4_NL, rows per block, min blocks; a missing field takes the engine's value).
-Shapes: `real` = every token picks 10 experts out of `groups` distinct ones (T=1: 10 groups x 1 entry; T=2: 20 x 1;
-T=4: 20 groups, 40 entries); `single` = 10 T groups of one entry; `both` also prints the per-expert / per-entry
-decomposition. One line per cell: `dev T shape gu/d choice all_us gu_us down_us GB/s pct identical|DIFFERENT` (the
-whole call, then the gate/up and down phases alone; memcmp of the output against `def`; exit 1 if anything differs).
-The blobs rotate over >= 96 MB so every call reads its weights cold from DRAM, as the decode does each layer.
-
-Gate/up phase, us per call, synthetic blobs, 20 distinct experts (shape `real`); `dec` = the defaults above:
-
-| card | format | T=1 def / dec | T=2 | T=3 | T=4 |
-|---|---|---|---|---|---|
-| RTX 2080 Ti | IQ3_S | 72 / 0.73x | 112 / 0.79x | 124 / 0.75x | 138 / 0.74x |
-| RTX 2080 Ti | IQ3_XXS | 61 / 0.79x | 95 / 0.84x | 107 / 0.79x | 119 / 0.77x |
-| RTX 2080 Ti | IQ2_XXS | 42 / 0.98x | 74 / 0.92x | 86 / 0.86x | 97 / 0.84x |
-| RTX 2080 Ti | IQ2_XS | 60 / 0.75x | 80 / 0.92x | 92 / 0.87x | 104 / 0.84x |
-| RTX 2080 Ti | IQ2_S | 62 / 0.75x | 83 / 0.92x | 96 / 0.86x | 109 / 0.84x |
-| RTX 3060 | IQ3_S | 74 / 1.09x | 144 / 0.99x | 154 / 0.89x | 174 / 0.87x |
-| RTX 3060 | IQ3_XXS | 78 / 0.89x | 132 / 0.92x | 143 / 0.90x | 162 / 0.82x |
-| RTX 3060 | IQ2_XXS / XS / S | 60-68 / 0.90-1.04x | 112-118 / 0.89-1.00x | 119-136 / 0.89-0.95x | 132-149 / 0.87-0.91x |
-
-Per-expert / per-entry cost (us per layer call, RTX 2080 Ti, IQ3_S gate/up): 5.20 / 1.26 default, 3.73 / 0.64 with
-EXPDEC. Down Q2_0 with `w1` (EXPDEC for the down): 0.65-0.85x in the bench on both cards; down IQ4_NL 0.95-1.07x
-(no gain, hence the default kernel).
+contraction of `s += d * sumi` is the same compiler decision on the same expression in both kernels.
 
 ## In the engine
 

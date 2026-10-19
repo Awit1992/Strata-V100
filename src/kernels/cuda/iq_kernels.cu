@@ -2136,7 +2136,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
 // and a block takes `rb` rows (auto: the most that keep ~STRATA_EXPDEC_MINBLK blocks in flight) instead of 16.
 // Each (row, entry) sum is the default kernel's sum tree (row_dot_80_sub16 / row_dot_40_sub8 / row_dot_20_sub16: the
 // same lane does the same calls in the same order with the same operations, `apply_u` = `apply` on the block's
-// words), so the output is bitwise the same (expdec_bench checks it; docs/EXPERTDEC.md).
+// words), so the output is bitwise the same (docs/EXPERTDEC.md).
 #ifndef STRATA_EXPDEC_MINB
 #define STRATA_EXPDEC_MINB 4   // gate/up __launch_bounds__ min blocks per SM by default (STRATA_EXPDEC_MINB at runtime): 4 = up to 64
                                // registers, as the default kernels (bench: equal on the 2080 Ti, 0.87-0.95 on the 3060); 2 = up to 128

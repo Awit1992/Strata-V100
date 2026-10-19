@@ -19,8 +19,6 @@ from pathlib import Path
 from unittest import mock
 
 from strata_cli.cli import main
-from strata_cli import bench
-from strata_cli.client import Endpoint
 from strata_control import calibration, journal, management, owner_transport, profiles, recipes, runtime
 
 
@@ -548,41 +546,6 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((code, stopped["state"]), (0, "stopped"))
         record = journal.load("local", stopped["operation_id"])
         self.assertEqual(record["intent"]["expected_owner_id"], preview["plan"]["owner_id"])
-
-    def test_managed_benchmark_binds_to_owned_launch(self):
-        with socket.socket() as reserved:
-            reserved.bind(("127.0.0.1", 0))
-            port = reserved.getsockname()[1]
-        cfg = json.loads(self.config.read_text(encoding="utf-8"))
-        cfg["port"] = port
-        self.config.write_text(json.dumps(cfg), encoding="utf-8")
-        started = runtime.start("local", wait=10, shutdown_timeout=2)
-        self.assertTrue(started["ok"])
-        identity = {"profile": "local", "revision": profiles.load("local")[1],
-                    "source_sha256": hashlib.sha256(self.config.read_bytes()).hexdigest()}
-        endpoint = Endpoint(started["api_url"])
-        output = self.root / "managed-bench"
-        with redirect_stdout(io.StringIO()):
-            result = bench.run(endpoint, endpoint, output, concurrency=1,
-                               profile_identity=identity, require_managed_match=True)
-        self.assertTrue(result["successful"])
-        self.assertEqual(result["profile_running_match"], "managed_launch_checked")
-        self.assertEqual(result["instance_id"], started["instance_id"])
-        self.assertTrue(result["profile_running_check"]["after"]["matched"])
-        output_json = io.StringIO()
-        with redirect_stdout(output_json):
-            code = main(["bench", "run", "--profile", "local", "--require-managed-match",
-                         "--concurrency", "1", "--out", str(self.root / "cli-managed"),
-                         "--output", "json"])
-        self.assertEqual(code, 0)
-        self.assertEqual(json.loads(output_json.getvalue())["summary"]["successful"], True)
-        self.assertEqual(json.loads(output_json.getvalue())["summary"]["profile_running_match"],
-                         "managed_launch_checked")
-        self.assertEqual(bench.load(self.root / "cli-managed")["profile_running_match"],
-                         "managed_launch_checked")
-        comparison = bench.compare(result, bench.load(self.root / "cli-managed"))
-        self.assertEqual(comparison["baseline"]["profile_running_match"], "managed_launch_checked")
-        self.assertFalse(any("running server config" in warning for warning in comparison["warnings"]))
 
     def test_owned_runtime_and_calibration_exclude_each_other_even_on_port_zero(self):
         first = runtime.start("local", wait=10, shutdown_timeout=2)

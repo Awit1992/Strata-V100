@@ -17,7 +17,6 @@ from unittest import mock
 
 from serve.frontend import ChatTemplate
 from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, parallel_args, serve
-from strata_cli import bench
 from strata_cli.client import Endpoint
 
 # The fake engine: one token every STEP seconds per active slot (a "window" serves every active slot at once);
@@ -517,53 +516,6 @@ class ParallelService(unittest.TestCase):
                 self.engine.slot_busy[:] = [False, False]
                 self.engine.slot_cv.notify_all()
         self.assertEqual(self.chat("slot freed")["choices"][0]["message"]["content"], "ok, done.")
-
-    def test_benchmark_overload_suite_preserves_batch_recovery(self):
-        self.start(2)
-        self.svc.max_queue = 0
-        self.svc.queue_timeout_s = 0.15
-        out = Path(self.tmp.name) / "overload"
-        report = bench.run(Endpoint(self.base, None), Endpoint(self.base, None), out,
-                           suite="parallel-overload-v1", concurrency=6)
-        self.assertTrue(report["successful"])
-        overload = report["phases"][1]
-        self.assertEqual(overload["kind"], "overload")
-        self.assertGreater(overload["summary"]["expected_overload"], 0)
-        self.assertEqual(overload["summary"]["failed"], 0)
-        self.assertTrue(report["phases"][2]["passed"])
-        self.assertEqual(self.get("/v1/telemetry")["work"]["admission_reserved"], 0)
-
-    def test_benchmark_cancel_suite_releases_batch_queue_and_slots(self):
-        self.start(2)
-        self.svc.max_queue = 1
-        self.svc.queue_timeout_s = 5
-        out = Path(self.tmp.name) / "cancel"
-        report = bench.run(Endpoint(self.base, None), Endpoint(self.base, None), out,
-                           suite="parallel-cancel-v1", concurrency=2, request_timeout=15)
-        self.assertTrue(report["successful"], bench.format_summary(bench.summary(report)))
-        self.assertEqual([row["kind"] for row in report["phases"]],
-                         ["warmup", "cancel_active", "cancel_queued", "recovery"])
-        self.assertEqual(report["phases"][2]["summary"]["companion_successful"], 2)
-        self.assertEqual(self.get("/v1/telemetry")["work"]["admission_reserved"], 0)
-
-    def test_benchmark_prefill_cancel_observes_progress_and_companion_completion(self):
-        self.start(2)
-        out = Path(self.tmp.name) / "prefill-cancel"
-        report = bench.run(Endpoint(self.base, None), Endpoint(self.base, None), out,
-                           suite="parallel-prefill-cancel-v1", concurrency=2, request_timeout=15)
-        self.assertTrue(report["successful"], bench.format_summary(bench.summary(report)))
-        self.assertEqual([row["kind"] for row in report["phases"]],
-                         ["warmup", "cancel_prefill", "recovery"])
-        phase = report["phases"][1]
-        self.assertTrue(phase["summary"]["prompt_read_seen"])
-        self.assertGreater(phase["requests"][0]["prompt_read_at_close"], 0)
-        self.assertLess(phase["requests"][0]["prompt_read_at_close"],
-                        phase["requests"][0]["prompt_tokens_at_close"])
-        self.assertEqual(phase["summary"]["client_disconnect_delta"], 1)
-        self.assertEqual(phase["summary"]["companion_successful"], 1)
-        self.assertEqual(self.get("/v1/telemetry")["work"]["admission_reserved"], 0)
-        data = (out / "results.json").read_text()
-        self.assertNotIn("Explain how a serving system", data)
 
     def test_telemetry_keeps_engine_waiting_age_visible(self):
         self.start(2)

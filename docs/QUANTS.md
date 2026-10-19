@@ -8,9 +8,6 @@ the Q8_0 reference. Setup and the per-file details: [UD-Q4_K_XL](UNSLOTH_Q4.md),
 
 ## What each file stores
 
-Read from the GGUF headers alone with `tools/quant_formats.py --hf unsloth/Qwen3.8-Flash-Next-GGUF 38bb39ee... <dir>`
-(HTTP range requests, nothing else is downloaded; on local shards: `tools/quant_formats.py <shard glob>`).
-
 The routed experts (gate, up, down; 512 per layer, 10 used per token) are where the files differ:
 
 | File | Download | Routed gate / up | Routed down | Routed experts | Per token (10 experts x 48 layers) |
@@ -53,48 +50,11 @@ SHA-256), so a PC that has one of them can link those two shards instead of down
 - `STRATA_MMQ_KQ=1` is opt-in because MMQ rounds the prompt's products differently from the FP16 path (the output
   differs at the rounding level); its speed and KL are measured before it becomes a default.
 
-## Quality: the yardstick
-
-`tools/quant_quality.py` scores a quant against Q8_0 on one fixed text set (`data/quant_quality/v1`: code, docs,
-English prose, German/French/Japanese/Chinese, an agent transcript; 5 x 1,000 tokens in `set.ids.json`). Every token
-is read through the decode windows (teacher-forced) with the experts on the CPU (one VRAM slot), no expert
-adaptation, no PCIe share, no route tail skip, FP16 K/V; per position the engine writes the log-probability of the
-text's next token and its 64 most likely tokens (`STRATA_LOGPOS`, `STRATA_LOGPOS_TOPK=64`). Top-1 agreement: the
-same most likely token as Q8_0. KL: KL(Q8_0 || quant) over Q8_0's 64 most likely tokens.
-
-```sh
-python tools/quant_quality.py run --config strata-<quant>.json --out <quant>.tsv
-python tools/quant_quality.py compare q8_0.tsv <quant>.tsv --segments
-```
-
-Measured on the AMD box (EPYC 7452, R9700, HIP, engine at 0601072d; 4,995 positions; Q8_0 against itself in a second
-run: byte-identical rows):
-
-| Quant | Same top token as Q8_0 | Mean KL | KL p99 | Perplexity (Q8_0: 4.052) |
-|---|---:|---:|---:|---:|
-| UD-Q6_K_XL | 94.61% | 0.033 | 0.494 | 4.020 |
-| UD-Q5_K_XL | 94.55% | 0.038 | 0.636 | 4.024 |
-| UD-Q4_K_XL | 93.09% | 0.056 | 0.829 | 4.068 |
-| UD-IQ4_XS | 88.91% | 0.101 | 1.596 | 4.120 |
-| IQ3_S | 87.69% | 0.144 | 1.975 | 4.097 |
-| IQ3_XXS | 84.46% | 0.202 | 2.433 | 4.119 |
-| Q2_0 | 80.60% | 0.315 | 3.643 | 4.475 |
-
-The same file on another backend is not the same answers: UD-Q4_K_XL on an RTX A4000 (CUDA, the RAM
-budget mode of a 62 GB PC) against UD-Q4_K_XL on the R9700 is 94.5% the same top token (KL 0.038), mostly near-ties.
-
-**The prompt path:** `tools/quant_quality.py prompt` / `pcompare` score the batched prompt path the same way (20 prompts
-of 256-1,000 tokens of the set, the full vocabulary's KL of the next token's distribution against Q8_0's): every
-quant above picks Q8_0's top token after all 20 prompts. The K-quants' MMQ kernels (`STRATA_MMQ_KQ=1`) against the FP16
-path on the R9700: UD-Q4_K_XL mean KL 0.095 / median 0.0027 (FP16: 0.081 / 0.0047), UD-Q5_K_XL 0.038 / 0.00055 (FP16:
-0.025 / 0.0016), UD-Q6_K_XL 0.028 / 0.00029 (FP16: 0.029 / 0.00069) - a better median everywhere, a worse mean on Q4/Q5
-(a few prompts), so it stays opt-in.
-
 ## Speed, and the bound
 
 Measured on the AMD box: one Radeon AI PRO R9700 (32 GB, capped at 225 W), EPYC 7452 (32 cores, 8 channels of
 DDR4-2400: 106 GB/s read by `rdbw` at 32 threads), every expert in RAM (setup's rule below), `--expert-cache auto`,
-40K context, 8-bit K/V, MTP drafts; `rbench.py` cases, the second of two requests; prompt speed varies between runs on
+40K context, 8-bit K/V, MTP drafts; the second of two requests; prompt speed varies between runs on
 this box by up to 2x (the range is given).
 
 | File | Short story (tok/s) | Code (tok/s) | After a 6K document | Prompt 32K (tok/s) | llama.cpp 8bb3cf0d2 (same card, `-ngl 99 --n-cpu-moe 38-48`): decode / prompt 4K |
@@ -114,20 +74,7 @@ bound, 3.7 measured), the head (1.05 bound, 1.26 measured), the CPU pool's exper
 the formats' own kernels are near their bandwidth (VRAM-resident experts ~70%, the CPU pool 84-97% of RAM bandwidth,
 the head 83%); the rest is the per-window latency of the small kernels and the draft, the same for every model.
 
-The CPU pool's expert rows (`kq_cpu_bench`, the engine's own calls on T threads over 4 GB of experts):
-
-| Pair | EPYC 7452, 32 threads, 1 token per expert | 3 tokens | Ryzen 5600X, 6 threads, 1 token | 3 tokens | Xeon E5-2643 v3, 12 threads, 1 token | 3 tokens |
-|---|---:|---:|---:|---:|---:|---:|
-| Q4_K / Q5_1 | 97% of RAM bandwidth | 80% | 100% | 85% | 94% | 36% |
-| Q5_K / Q8_0 | 97% | 89% | 100% | 95% | 98% | 47% |
-| Q6_K / Q8_0 | 97% | 93% | 100% | 100% | 99% | 63% |
-| Q8_0 / Q8_0 | 96% | 90% | 100% | 100% | 99% | 64% |
-
-One token per expert (most of decode) is at the RAM bound on all three; older CPUs fall behind with several tokens per
-expert (ggml's dot decodes the weights once per token; `STRATA_KQ256=1`, bit-exact, takes 11-20% off Q4_K at 3-4
-tokens).
-
-**Dense Q8_0 GEMVs** (`q8_gemv_bench`, the engine's shapes, 2-4 columns): one row per block where it was measured
+**Dense Q8_0 GEMVs** (the engine's shapes, 2-4 columns): one row per block where it was measured
 faster, the same bits as two (R9700: 2560 -> 10240 / 6144 / 12288 at 76-86% of 644 GB/s instead of 51-80%; RTX A4000:
 +1-4%, and 6144 -> 2560 at 6 columns 70% -> 76%). UD-Q4_K_XL decode +1.0-2.7% on the R9700, the same text.
 
@@ -156,14 +103,14 @@ story 39.5 -> 53.3 tok/s, code 60.1 -> 80.4, after a 6K document 49.0 -> 68.8, 5
 32K x1.03.
 
 **The route tail skip** (`STRATA_ROUTE_TAIL_SKIP=7`, the default since 0.1.42: a missed expert every token of a window
-routes at rank 7 or lower is skipped) costs these files more than the 2-3-bit packs: UD-Q4_K_XL's yardstick KL against
+routes at rank 7 or lower is skipped) costs these files more than the 2-3-bit packs: UD-Q4_K_XL's KL against
 Q8_0 goes from 0.056 to 0.086 with every expert in RAM (R9700, the auto cache) and from 0.053 to 0.115 in the RAM
 budget mode (A4000, 1,500 GPU slots), for +4-10% decode in RAM and +26-67% in the budget mode (5 pairs each).
 `STRATA_ROUTE_TAIL_SKIP=0` in a config's `"env"` turns it off.
 
 **The hyper-connections on NVIDIA:** the pack's `--compat-bf16` copy of the Q8_0 HC projections rounds them to BF16
 (and doubles their bytes). `STRATA_HC_Q8=1` reads the file's own Q8_0 instead (on AMD gfx12 it is the default): on the
-A4000 UD-Q4_K_XL then comes closer to Q8_0 (yardstick KL 0.0562 -> 0.0526, p99 0.925 -> 0.716) and to the same file on
+A4000 UD-Q4_K_XL then comes closer to Q8_0 (KL 0.0562 -> 0.0526, p99 0.925 -> 0.716) and to the same file on
 AMD (KL 0.038 -> 0.033). Opt-in until decided.
 
 ## Images

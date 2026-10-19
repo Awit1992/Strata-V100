@@ -160,8 +160,8 @@ the rest from the SSD while it answers (much slower), and for the bigger files i
 | **Q8_0** | 188 GB | 120 GiB | ~136 GB | 100% (the reference) | 53-57 / 66-74 / 1,230-1,300 |
 
 For comparison, IQ3_S on the same card: 75 / 95 tok/s, 87.7% the same top token as Q8_0. The speed figures come from
-engines older than 0.1.45.3 (the conditions are in [QUANTS.md](QUANTS.md)). The quality numbers, the
-speed bound and NVIDIA/AMD/Intel details: [QUANTS.md](QUANTS.md); the files: [UD-Q4_K_XL](UNSLOTH_Q4.md),
+engines older than 0.1.45.3 (the conditions are in [QUANTS.md](QUANTS.md)). The speed bound and the
+NVIDIA/AMD/Intel details: [QUANTS.md](QUANTS.md); the files: [UD-Q4_K_XL](UNSLOTH_Q4.md),
 [UD-Q6_K_XL](UNSLOTH_Q6.md).
 
 ```

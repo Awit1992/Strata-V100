@@ -1267,7 +1267,7 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
 
 // MODEL-UPDATE: the dense Q8_0 projections of Unsloth's files (all of attention, SSM and the shared expert are Q8_0
 // there) take one row per block where that was measured faster - the same per-row sums and reduction as two rows per
-// block (each row its own partials), so every output is the same bits.  q8_gemv_bench, 2-4 columns:
+// block (each row its own partials), so every output is the same bits.  Measured at 2-4 columns:
 //   gfx1201 (R9700): n_in <= 4096 with n_out >= 4096 (qkv 2560->10240 73-79% -> 83-84% of the 644 GB/s, gate 2560->6144
 //     51-68% -> 76-78%, q 2560->12288 74-80% -> 85-86%); 6144->2560 is slower there (79% -> 55-59%) and keeps two rows.
 //   sm_86 (RTX A4000): every n_out >= 2048 (+1-4% at 2-4 columns, 6144->2560 at 6 columns 70% -> 76%).
@@ -1452,7 +1452,7 @@ __global__ void b6_mmvq_rows_kernel(const typename F::Block* __restrict__ w, con
 }
 
 // the B6 launch for a format that has a B6X: true when it ran.  g_b6_rows: 1 = 2 rows per block (the fastest on both
-// cards in b6_mmvq_bench), else 2 / 4 / 8 rows.
+// cards), else 2 / 4 / 8 rows.
 template<typename F, int NCOLS>
 bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
     if constexpr (!B6X<F>::ok) {

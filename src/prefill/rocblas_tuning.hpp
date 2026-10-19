@@ -1,10 +1,10 @@
 // src/prefill/rocblas_tuning.hpp - the rocBLAS solution table of the prompt path's FP16-out GEMMs (HIP, gfx103x).
 //
 // rocBLAS picks a kernel per GEMM shape from its own table, and on gfx1030 that pick is up to 6x slower than the best
-// kernel the library holds for the same shape (N=10240 K=2560 below T=1152: tools/hip/tune_rocblas.cpp).  A table
-// made by that tool names, per shape and token bucket, the solution index to run instead; Gemm::f16_inplace reads it
-// through STRATA_ROCBLAS_TUNING.  Indices are valid for one architecture and one rocBLAS build (its full version
-// string), and the table carries both; any other pair is refused and the default kernels run.
+// kernel the library holds for the same shape (N=10240 K=2560 below T=1152).  A table names, per shape and token
+// bucket, the solution index to run instead; Gemm::f16_inplace reads it through STRATA_ROCBLAS_TUNING.  Indices are
+// valid for one architecture and one rocBLAS build (its full version string), and the table carries both; any other
+// pair is refused and the default kernels run.
 #pragma once
 
 #include <climits>

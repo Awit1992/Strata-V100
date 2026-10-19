@@ -276,39 +276,6 @@ def parser() -> argparse.ArgumentParser:
                               help="require the runtime instance shown in a restart recipe plan")
             item.add_argument("--if-source-sha256", metavar="SHA256",
                               help="require the candidate run-config bytes shown in a restart recipe plan")
-    bench = sp.add_parser("bench", help="explicit serving benchmark with local JSON evidence")
-    bench_sp = bench.add_subparsers(dest="bench_command", required=True)
-    bench_run = bench_sp.add_parser("run", help="measure streaming requests and sample serving telemetry")
-    bench_source = bench_run.add_mutually_exclusive_group(required=True)
-    bench_source.add_argument("--profile", help="saved serving profile or installed run config")
-    bench_source.add_argument("--url", help="server root; remote connections require HTTPS")
-    bench_run.add_argument("--suite", choices=("serving-smoke", "parallel-mixed-v1", "parallel-overload-v1",
-                                               "parallel-cancel-v1", "parallel-prefill-cancel-v1"),
-                           default="serving-smoke")
-    bench_run.add_argument("--concurrency", type=int, default=4,
-                           help="simultaneous requests (1..16, or 1..64 for parallel-overload-v1)")
-    bench_run.add_argument("--repeat", type=int, default=1, help="repeat measured phases (1..5)")
-    bench_run.add_argument("--condition", help="operator label for this run, e.g. baseline or monitor-default")
-    bench_run.add_argument("--require-managed-match", action="store_true",
-                           help="require the local owner host and current profile to match the serving instance")
-    bench_run.add_argument("--request-timeout", type=float, default=120)
-    bench_run.add_argument("--out", required=True, metavar="NEW_DIRECTORY")
-    bench_run.add_argument("--credential-env", default="STRATA_API_KEY")
-    bench_run.add_argument("--telemetry-credential-env", default=None)
-    bench_run.add_argument("--output", choices=("human", "json"), default="human")
-    bench_cancel = bench_sp.add_parser("cancel", help="stop the exact active saved-profile benchmark")
-    bench_cancel.add_argument("--profile", required=True, help="saved serving profile")
-    bench_cancel.add_argument("--path", required=True, help="absolute run directory or results.json")
-    bench_cancel.add_argument("--output", choices=("human", "json"), default="human")
-    bench_report = bench_sp.add_parser("report", help="summarize an existing benchmark report")
-    bench_report.add_argument("path")
-    bench_report.add_argument("--output", choices=("human", "json", "markdown"), default="human")
-    bench_report.add_argument("--out", metavar="NEW_FILE", help="write Markdown to a new file")
-    bench_compare = bench_sp.add_parser("compare", help="compare two saved runs with workload checks")
-    bench_compare.add_argument("baseline")
-    bench_compare.add_argument("candidate")
-    bench_compare.add_argument("--output", choices=("human", "json", "markdown"), default="human")
-    bench_compare.add_argument("--out", metavar="NEW_FILE", help="write Markdown to a new file")
     timeskip = sp.add_parser(
         "timeskip", help="retain a good result, try a bounded improvement, check it and decide")
     timeskip_sp = timeskip.add_subparsers(dest="timeskip_command", required=True)
@@ -473,7 +440,7 @@ def parser() -> argparse.ArgumentParser:
                      profile_source, profile_edit, profile_history, profile_rollback, doctor,
                      components_verify, models_list, models_inspect, models_import, calibrate,
                      runtime_start, runtime_status, runtime_verify, runtime_stop, runtime_cleanup, runtime_restart,
-                     *ops_items, bench_run, bench_report, bench_compare, code_sessions, *update_parsers):
+                     *ops_items, code_sessions, *update_parsers):
         one_shot.add_argument("--json", action="store_true", help="alias for --output json")
         one_shot.add_argument("--quiet", action="store_true", default=argparse.SUPPRESS,
                               help="suppress human informational output")
@@ -992,91 +959,6 @@ def _calibration(a: argparse.Namespace) -> int:
         if not components["ok"]:
             print("Required components are missing; run strata doctor --profile first.")
     return 0 if components["ok"] else 5
-
-
-def _bench(a: argparse.Namespace) -> int:
-    from strata_cli import bench
-    machine = a.output == "json"
-    if a.bench_command in ("report", "compare") and a.out and a.output != "markdown":
-        return _error("--out requires --output markdown", 2, machine)
-    if a.bench_command == "report":
-        report = bench.load(Path(a.path))
-        result = bench.summary(report)
-        if a.output == "markdown":
-            rendered = bench.markdown_report(report)
-            if a.out:
-                bench.write_markdown(Path(a.out), rendered)
-                print(f"Markdown report: {Path(a.out).resolve()}")
-            else:
-                print(rendered, end="")
-            return 0
-        return _success({"summary": result}, machine=machine,
-                        human=bench.format_summary(result))
-    if a.bench_command == "compare":
-        result = bench.compare(bench.load(Path(a.baseline)), bench.load(Path(a.candidate)))
-        if a.output == "markdown":
-            rendered = bench.markdown_comparison(result)
-            if a.out:
-                bench.write_markdown(Path(a.out), rendered)
-                print(f"Markdown comparison: {Path(a.out).resolve()}")
-            else:
-                print(rendered, end="")
-            return 0
-        return _success({"comparison": result}, machine=machine,
-                        human=bench.format_comparison(result))
-    if a.bench_command == "cancel":
-        from strata_control import benchmarking, profiles
-        if not Path(a.path).is_absolute():
-            return _error("benchmark cancel path must be absolute", 2, machine)
-        profiles.load(a.profile)
-        result = benchmarking.request_cancel(a.profile, Path(a.path))
-        return _success(result, machine=machine,
-                        human="Cancellation requested; check the saved report for the final outcome.")
-    if not a.credential_env.isidentifier() or (a.telemetry_credential_env and
-                                               not a.telemetry_credential_env.isidentifier()):
-        return _error("credential options must name environment variables", 2, machine)
-    maximum = 64 if a.suite == "parallel-overload-v1" else 16
-    if not 1 <= a.concurrency <= maximum or not 1 <= a.repeat <= 5 or not 1 <= a.request_timeout <= 600:
-        return _error(f"concurrency must be 1..{maximum}, repeat 1..5 and request timeout 1..600 seconds", 2,
-                      machine)
-    if a.require_managed_match and not a.profile:
-        return _error("--require-managed-match needs a saved --profile", 2, machine)
-    profile_identity = None
-    if a.profile:
-        path, saved, revision, cfg = _source(a.profile)
-        if a.require_managed_match and saved is None:
-            return _error("--require-managed-match needs a saved profile name", 2, machine)
-        plan, _ = _launch_plan(a.profile)
-        host = plan["effective"]["host"]
-        host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-        authority = f"[{host}]" if ":" in host and not host.startswith("[") else host
-        url = f"http://{authority}:{plan['effective']['port']}"
-        import hashlib
-        profile_identity = {"profile": saved["id"] if saved else None, "revision": revision,
-                            "source_config": str(path), "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                            "model_name": cfg.get("model_name"), "gpu": cfg.get("gpu")}
-    else:
-        url = a.url
-    key = os.environ.get(a.credential_env)
-    endpoint = Endpoint(url, key, timeout=10)
-    telemetry = Endpoint(url, os.environ.get(a.telemetry_credential_env) if a.telemetry_credential_env else key,
-                         timeout=3)
-    from strata_control.benchmarking import benchmark_lease
-    lease = benchmark_lease(saved["id"], Path(a.out)) if a.profile and saved else contextlib.nullcontext()
-    with lease, contextlib.redirect_stdout(sys.stderr):
-        report = bench.run(endpoint, telemetry, Path(a.out), suite=a.suite,
-                           concurrency=a.concurrency, repeat=a.repeat,
-                           request_timeout=a.request_timeout, profile_identity=profile_identity,
-                           condition=a.condition, require_managed_match=a.require_managed_match)
-    compact = bench.summary(report)
-    if machine:
-        print(json.dumps({"schema_version": 1, "ok": report["successful"],
-                          "path": str((Path(a.out) / "results.json").resolve()), "summary": compact},
-                         ensure_ascii=False, allow_nan=False))
-    else:
-        print(bench.format_summary(compact))
-        print(f"Evidence: {Path(a.out).resolve() / 'results.json'}")
-    return 0 if report["successful"] else 6
 
 
 def _runtime(a: argparse.Namespace) -> int:
@@ -1887,8 +1769,6 @@ def _run(a: argparse.Namespace) -> int:
             return _models(a)
         if a.command == "engine":
             return _calibration(a)
-        if a.command == "bench":
-            return _bench(a)
         if a.command == "timeskip":
             return _timeskip(a)
         if a.command == "presets":

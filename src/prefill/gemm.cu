@@ -432,7 +432,7 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
 #if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
 // The rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING: a table file, or a directory holding
 // <arch>-rocblas-<version>.txt for this card and rocBLAS build; src/prefill/rocblas_tuning.hpp).  rocBLAS's own
-// pick for some shapes is up to 6x slower than the best kernel it holds for them (gfx1030: tools/hip/tune_rocblas.cpp).
+// pick for some shapes is up to 6x slower than the best kernel it holds for them (gfx1030).
 struct RocBlasState {
     rocblas_handle handle = nullptr;
     strata::prefill::rocblas_tuning::Table table;

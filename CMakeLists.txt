@@ -482,14 +482,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME qsa_scores_parity COMMAND qsa_scores_parity)
     set_tests_properties(qsa_scores_parity PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "STRATA_SCORES_THREAD=1")
   endif()
-  # QSAROWS (docs/QSAROWS.md): what the T rows of a verification window cost in a QSA layer's decode kernels at a long
-  # context (block scores, top-k, attention over each row's selection, indexer append), row by row; GPU, synthetic, no
-  # model.  Not in the default build: `cmake --build <dir> --target qsa_rows_bench`.
-  if(STRATA_ENABLE_CUDA)
-    add_executable(qsa_rows_bench EXCLUDE_FROM_ALL src/kernels/qsa_rows_bench.cpp)
-    target_include_directories(qsa_rows_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(qsa_rows_bench PRIVATE strata_kernels CUDA::cudart)
-  endif()
   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a
   # 262144-cell capacity (the top-k dispatch follows the capacity) and exits non-zero on a failed gate
@@ -511,11 +503,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME qsa_select_bench COMMAND qsa_select_bench 32768 256 3 262144)
     add_test(NAME qsa_select_bench_fp32_tiled COMMAND qsa_select_bench 131072 256 3 262144)
     set_tests_properties(qsa_select_bench_fp32_tiled PROPERTIES ENVIRONMENT "STRATA_QSA_WARP=1;STRATA_SELECT_SIMT=1")
-  endif()
-  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)   # the prompt attention on a recorded selection (STRATA_QSA_DUMP)
-    add_executable(pa_bench tests/cuda/pa_bench.cpp)
-    target_include_directories(pa_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(pa_bench PRIVATE strata_kernels CUDA::cudart)
   endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
@@ -751,12 +738,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
   endif()
   if(STRATA_ENABLE_HIP AND STRATA_ROCBLAS_AVAILABLE)
-    # the prompt path's rocBLAS solution table (STRATA_ROCBLAS_TUNING; tools/hip/tune_rocblas makes one)
+    # the prompt path's rocBLAS solution table (STRATA_ROCBLAS_TUNING; src/prefill/rocblas_tuning.hpp reads one)
     target_compile_definitions(strata_prefill PRIVATE STRATA_ROCBLAS_AVAILABLE=1)
     target_link_libraries(strata_prefill PRIVATE roc::rocblas)
-
-    add_executable(tune_rocblas tools/hip/tune_rocblas.cpp)
-    target_link_libraries(tune_rocblas PRIVATE hip::host roc::rocblas)
   endif()
 
   add_executable(prefill_gemm_parity tests/prefill_gemm_parity.cpp)
@@ -786,11 +770,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
-  # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
-  # against llama.cpp by tools/qwen35/; the engine itself does not run the family yet
-  add_executable(strata-q36ref src/qwen35/q36ref.cu)
-  target_include_directories(strata-q36ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
-  target_link_libraries(strata-q36ref PRIVATE strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   # the engine path for the same family (serve protocol, prompt chunks, decode graph): src/qwen35/q36_engine.cu, a
   # library that `strata` switches to for a qwen35moe model (the family switch at the top of its main) and that
   # strata-q36 wraps on its own
@@ -883,9 +862,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME hip_prefill_hcd_exact_parity COMMAND hip_prefill_hcd_exact_parity)
     set_tests_properties(hip_prefill_hcd_exact_parity PROPERTIES SKIP_RETURN_CODE 77)
     list(APPEND _strata_hip_tests hip_prefill_hcd_exact_parity)
-    # the HC write-back kernel timed at the prompt path's shapes with an output checksum (not a ctest; STRATA_GRW_V picks a variant)
-    add_executable(hip_prefill_gr_write_bench tests/hip/prefill_gr_write_bench.cpp)
-    target_link_libraries(hip_prefill_gr_write_bench PRIVATE strata_prefill strata_hip_runtime)
     # S6: the AMD fast router against the portable kernel, bitwise
     add_executable(hip_router_fast tests/hip/router_fast.cpp)
     target_link_libraries(hip_router_fast PRIVATE strata_kernels strata_hip_runtime)
@@ -1124,9 +1100,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_source_files_properties(src/kernels/router_chain_bench.cpp PROPERTIES LANGUAGE CUDA)
     target_include_directories(router_chain_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(router_chain_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-    add_executable(b6_mmvq_bench src/kernels/b6_mmvq_bench.cpp)
-    target_include_directories(b6_mmvq_bench PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(b6_mmvq_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
   add_executable(gr_parity src/kernels/gr_parity.cpp)
   target_include_directories(gr_parity PRIVATE ${_strata_gpu_include_directories})
@@ -1147,11 +1120,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(gdn_chunk_parity PRIVATE strata_prefill ${_strata_gpu_runtime_target})
     add_test(NAME gdn_chunk_parity COMMAND gdn_chunk_parity --selftest)
     set_tests_properties(gdn_chunk_parity PROPERTIES SKIP_RETURN_CODE 77)
-
-    # v100/gdn-chunk: the micro benchmark (CUDA events, real GDN shapes): chunked vs recurrent prompt path.
-    add_executable(gdn_chunk_bench bench/gdn_chunk_bench.cpp)
-    target_include_directories(gdn_chunk_bench PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(gdn_chunk_bench PRIVATE strata_prefill ${_strata_gpu_runtime_target})
   endif()
 
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
@@ -1678,9 +1646,6 @@ if(STRATA_NATIVE_EXPERTS)
   # against ggml-cpu's dot, on random blocks; --bench: ms per expert on one thread, the weights streamed from DRAM
   add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
   target_link_libraries(iq_avx2_parity PRIVATE strata_kernels_cpu)
-  # MODEL-UPDATE: the pool's expert rows per format on T threads against the RAM bandwidth (a benchmark, no test)
-  add_executable(kq_cpu_bench src/kernels/cpu/kq_cpu_bench.cpp)
-  target_link_libraries(kq_cpu_bench PRIVATE strata_kernels_cpu)
   if(STRATA_BUILD_TESTS)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
@@ -1948,9 +1913,6 @@ if(STRATA_NATIVE_EXPERTS)
     if(NOT MSVC)   # its FP16 rounding helper uses the F16C intrinsics (GCC/Clang need the target flag)
       target_compile_options(mmq_nvfp4_parity PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mf16c>)
     endif()
-    # the routed-expert products (MMQ) timed at the prompt path's shapes (16 experts a launch)
-    add_executable(mmq_expert_bench src/prefill/mmq_expert_bench.cpp)
-    target_link_libraries(mmq_expert_bench PRIVATE strata_mmq ggml-base CUDA::cudart)
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
     # common.cuh's native HIP path without enabling a second GGML HIP backend.
@@ -2050,9 +2012,6 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_ENABLE_CUDA)   # the NVFP4 decode kernels vs ggml's reference
     add_executable(nvfp4_expert_gpu_parity src/kernels/nvfp4_expert_gpu_parity.cpp)
     target_link_libraries(nvfp4_expert_gpu_parity PRIVATE strata_kernels ggml-base CUDA::cudart)
-    # the decode experts' weight bandwidth on random blobs of a format pair, and an output hash (bit-for-bit checks)
-    add_executable(nvfp4_decode_bench src/kernels/nvfp4_decode_bench.cpp)
-    target_link_libraries(nvfp4_decode_bench PRIVATE strata_kernels CUDA::cudart)
   endif()
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
@@ -2062,17 +2021,6 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(native_expert_bench src/kernels/native_expert_bench.cpp)
     target_include_directories(native_expert_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(native_expert_bench PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
-    # MODEL-UPDATE: the dense Q8_0 GEMVs at the engine's shapes against the memory bandwidth (a benchmark, no test)
-    add_executable(q8_gemv_bench src/kernels/q8_gemv_bench.cpp)
-    target_include_directories(q8_gemv_bench PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(q8_gemv_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-    if(STRATA_ENABLE_CUDA)
-      # EXPDEC (docs/EXPERTDEC.md): the grouped experts' default kernels against STRATA_EXPDEC=1 at T = 1..4, bit for bit
-      # and in microseconds, on synthetic blobs read cold from DRAM
-      add_executable(expdec_bench EXCLUDE_FROM_ALL src/kernels/expdec_bench.cpp)
-      target_include_directories(expdec_bench PRIVATE ${_strata_gpu_include_directories})
-      target_link_libraries(expdec_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-    endif()
     if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
       # Unsloth UD-Q4_K_XL's three expert pairs (and Q8_0 alone, its embedding) on synthetic ggml-quantized weights
       # at 2560/640: GPU and CPU experts against the float reference, GPU dequantizers against to_float.

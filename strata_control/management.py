@@ -22,17 +22,6 @@ from strata_control.profiles import ProfileError
 
 MAX_REQUEST_BYTES = 64 * 1024
 _ACTIONS = {
-    "bench.run.plan": {"path", "suite", "concurrency", "repeat", "request_timeout", "condition"},
-    "bench.run": {"path", "suite", "concurrency", "repeat", "request_timeout", "condition",
-                  "if_profile_revision", "if_source_sha256", "if_owner_id", "if_instance_id"},
-    "bench.job.create": {"job_id", "path", "suite", "concurrency", "repeat", "request_timeout",
-                         "condition", "if_profile_revision", "if_source_sha256",
-                         "if_owner_id", "if_instance_id"},
-    "bench.job": {"job_id"},
-    "bench.progress": {"path"},
-    "bench.cancel": {"path"},
-    "bench.report": {"path"},
-    "bench.compare": {"baseline", "candidate"},
     "calibration.plan": set(),
     "calibration.job.create": {"job_id", "action", "path", "exclusive_ack",
                                "if_profile_revision", "if_source_sha256", "if_report_sha256"},
@@ -348,62 +337,12 @@ def dispatch(request: object) -> dict:
     if not isinstance(profile, str) or not profiles.PROFILE_ID.fullmatch(profile):
         raise ProfileError("management profile name is invalid")
     if not isinstance(params, dict) or (set(params) != _ACTIONS[action] and
-            not (action == "bench.run" and set(params) == _ACTIONS[action] | {"job_id"}) and
             not (action in ("calibration.measure", "calibration.apply", "calibration.rollback") and
                  set(params) == _ACTIONS[action] | {"job_id"})):
         raise ProfileError("management action parameters are invalid")
     if action in ("calibration.measure", "calibration.apply", "calibration.rollback") and "job_id" in params:
         from strata_control import calibration_jobs
         result = calibration_jobs.execute(profile, action.removeprefix("calibration."), params)
-    elif action in ("bench.run.plan", "bench.run"):
-        from strata_control import benchmarking
-        checked = {**params, "path": str(_local_report_path(params["path"], "benchmark output path"))}
-        if action == "bench.run":
-            identities = (_profile_revision(checked["if_profile_revision"]),
-                          _optional_revision(checked["if_source_sha256"], "if_source_sha256"),
-                          _optional_identity(checked["if_owner_id"], "if_owner_id"),
-                          _optional_identity(checked["if_instance_id"], "if_instance_id"))
-            if any(identity is None for identity in identities):
-                raise ProfileError("benchmark execution needs reviewed profile, source, owner and instance IDs")
-            result = benchmarking.run(profile, checked)
-        else:
-            result = {"ok": True, "plan": benchmarking.plan(profile, checked)}
-    elif action == "bench.job.create":
-        from strata_control import benchmarking
-        checked = {**params, "path": str(_local_report_path(params["path"], "benchmark output path"))}
-        result = benchmarking.create_job(profile, checked)
-    elif action == "bench.job":
-        from strata_control import benchmarking
-        result = benchmarking.job_status(profile, params["job_id"])
-    elif action == "bench.progress":
-        from strata_cli import bench
-        from strata_control import benchmarking
-        profiles.load(profile)
-        target = _local_report_path(params["path"], "benchmark progress path")
-        progress = bench.progress(target)
-        directory = target.parent if target.name in ("results.json", "progress.json") else target
-        result = {"ok": True, "progress": progress,
-                  "activity": benchmarking.benchmark_activity(profile, directory),
-                  "cancel_requested": benchmarking.cancel_requested(directory)}
-    elif action == "bench.cancel":
-        from strata_control import benchmarking
-        profiles.load(profile)
-        result = benchmarking.request_cancel(
-            profile, _local_report_path(params["path"], "benchmark cancel path"))
-    elif action == "bench.report":
-        from strata_cli import bench
-        profiles.load(profile)
-        report = bench.load(_local_report_path(params["path"], "benchmark report path"))
-        result = {"ok": True, "summary": bench.summary(report),
-                  "markdown": bench.markdown_report(report)}
-    elif action == "bench.compare":
-        from strata_cli import bench
-        profiles.load(profile)
-        baseline = bench.load(_local_report_path(params["baseline"], "baseline report path"))
-        candidate = bench.load(_local_report_path(params["candidate"], "candidate report path"))
-        comparison = bench.compare(baseline, candidate)
-        result = {"ok": True, "comparison": comparison,
-                  "markdown": bench.markdown_comparison(comparison)}
     elif action == "calibration.plan":
         from strata_control import calibration
         result = {"ok": True, "plan": calibration.preview(profile)}

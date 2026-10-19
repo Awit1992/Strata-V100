@@ -48,7 +48,7 @@ bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead
 /// QSAROWS (docs/QSAROWS.md): block_scores_multi_kernel's scores for a call of up to 4 queries, bit for bit, with the
 /// queries in registers and the four heads reduce-scattered (six shuffles instead of twenty a block and query).
 /// qsa_block_scores takes it with STRATA_QSA_ROWS=1; false (nothing launched) above 4 queries or on another geometry.
-/// For qsa_rows_bench's parity and timing it is callable on its own.
+/// Callable on its own as well, not only through qsa_block_scores' dispatch.
 bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
 

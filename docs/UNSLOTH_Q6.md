@@ -11,7 +11,7 @@ below). UD-Q4_K_XL's manual workflow asks nothing of setup, and neither does thi
 > **Status (MODEL-UPDATE Phase 1).** The Q6_K gate/up kernels are part of every build now (they were the opt-in
 > `-DSTRATA_Q6K_EXPERTS=ON`): measured to leave other models' expert-cache slots unchanged ([QUANTS.md](QUANTS.md)). The
 > MMQ prompt kernels for Q6_K come with the K-quant library and `STRATA_MMQ_KQ=1`; without it the prompt takes the FP16
-> path. The file runs on the standard engine (AMD R9700: the quality yardstick in [QUANTS.md](QUANTS.md)).
+> path. The file runs on the standard engine (AMD R9700: the measurements are in [QUANTS.md](QUANTS.md)).
 
 ## What is in the file
 

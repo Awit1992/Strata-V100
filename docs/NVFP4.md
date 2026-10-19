@@ -19,7 +19,7 @@ python tools/iq_pack.py --gguf <model>.gguf --out <pack dir>
 
 - `nvfp4_convert.py` runs llama.cpp's own converter (`third_party/llama.cpp`, the commit setup pins) with the type
   policy the engine needs. The experts are repacked without loss: `tools/nvfp4_verify.py` compares them with the
-  checkpoint bit for bit, and `tools/nvfp4_verify_gguf.py` checks the GGUF.
+  checkpoint bit for bit.
   - The small projections the BF16 kernels read (routers, SSM gates, indexer, PLE and hyper-connection projections)
     are written as BF16.
   - Everything served natively goes to Q8_0: attention, `ssm_out`, the shared experts, the output head, and the
@@ -73,35 +73,13 @@ following decode rates:
 The numbers above are the fork author's, on his RTX 5090 and 128 GB. These were measured here, on the ready-made GPTQ
 pack (`--family nvfp4 --model NVFP4`).
 
-Quality, the quant yardstick (`tools/quant_quality.py`, 4,995 teacher-forced positions of code, docs, English, other
-languages and an agent transcript, against Unsloth's Q8_0; RTX 3060 box):
-
-| | same top token as Q8_0 | mean KL | KL p99 |
-| --- | ---: | ---: | ---: |
-| NVFP4 GPTQ, experts on the CPU | 92.09% | 0.070 | 1.12 |
-| NVFP4 GPTQ, 1,500 experts on the GPU | 91.79% | 0.069 | 1.07 |
-| the same with `STRATA_ROUTE_TAIL_SKIP=7` | 88.59% | 0.118 | 1.76 |
-| NVFP4 GPTQ with the GSQ-RCO IQ4_NL n-gram table instead of the FP8 one | 92.15% | 0.069 | 1.07 |
-| for comparison, the same tool: Unsloth UD-Q5_K_XL | 94.55% | 0.038 | 0.64 |
-| Unsloth UD-Q4_K_XL | 93.09% | 0.056 | - |
-| Unsloth UD-IQ4_XS | 88.91% | 0.101 | 1.60 |
-| GSQ-RCO IQ3_S | 87.69% | 0.144 | 1.98 |
-
 The route tail skip moves the answers by more than the quantization itself, so it is off by default for NVFP4
 experts. `STRATA_ROUTE_TAIL_SKIP=7` turns it on: +7-25% decode on the RTX 3060, +47-55% on the RTX 5070 (64 GB).
 
-Decode experts (`nvfp4_decode_bench`, 64 distinct experts per call, the share of the card's DRAM bandwidth):
+In the decode kernel each weight is decoded once for all the tokens of a verify window (before the port's kernel work:
+2.26 ms on the 3060 at 4 tokens), bit for bit the same results.
 
-| tokens per expert | RTX 5070 | RTX 3060 | Tesla P100 |
-| --- | ---: | ---: | ---: |
-| 1 | 0.294 ms (89%) | 0.554 ms (89%) | 0.910 ms |
-| 2 | 0.298 ms (88%) | 0.596 ms | 1.247 ms |
-| 4 | 0.335 ms (79%) | 0.766 ms | 1.954 ms |
-
-Each weight is decoded once for all the tokens of a verify window (before the port's kernel work: 2.26 ms on the 3060
-at 4 tokens), bit for bit the same results.
-
-Prompt experts on the RTX 5070 (`mmq_expert_bench`, one launch of 16 experts with 625 rows each, gate/up + down): w4a8
+Prompt experts on the RTX 5070 (one launch of 16 experts with 625 rows each, gate/up + down): w4a8
 1.52 ms, w4a4x2 (`STRATA_PREFILL_NVFP4=w4a4x2`) 1.13 ms, w4a4x2 with down too (`STRATA_PREFILL_X2_MIN_K=640`)
 0.995 ms, UD-IQ4_XS's experts 1.20 ms. First-token KL against the exact FP16 path (24 prompts, 1.5-8K tokens): w4a8
 0.0068, w4a4x2 0.0056, w4a4x2 with down 0.0044. On a 64 GB PC the prompt waits for the experts read from the SSD,
@@ -222,7 +200,7 @@ guarded (`GGML_USE_HIP`). Neither was built for HIP here.
 - `nvfp4_expert_gpu_parity`: the decode kernels against ggml's reference.
 - `nvfp4_avx512_parity`: the CPU rows against ggml-cpu (with `--expert`: one whole expert).
 - `mmq_nvfp4_parity`: the prompt path's products against FP64 (with `--real`: rows dumped by `STRATA_DUMP_MOE_INPUT`).
-- `tools/nvfp4_verify.py` and `tools/nvfp4_verify_gguf.py`: the conversion, bit for bit.
+- `tools/nvfp4_verify.py`: the conversion, bit for bit.
 
 ## NVIDIA's FP4-Local checkpoint
 
@@ -245,8 +223,8 @@ table, the dense GGUF (no experts), the pack (experts written straight from the 
 about 110 GB of free disk beside the 102 GB download, which can be deleted afterwards. On a Threadripper PRO with the files
 on NVMe it took about 12 minutes.
 
-Measured on an RTX PRO 5000 72 GB (Blackwell), 128K context, int8 KV, every expert in VRAM (`tools/strata_bench.py`):
+Measured on an RTX PRO 5000 72 GB (Blackwell), 128K context, int8 KV, every expert in VRAM:
 decode 159 tokens/s (median of chat answers, 137-216), 4K prompt 3,981 tokens/s, 16K 4,813, 32K 4,916 (first token 6.6 s),
-agent session 151 tokens/s; the engine holds 69 GB of RAM beside 72 GB of VRAM. Quality is in the table below
-(`tools/quant_quality.py`, set v1, against Unsloth's Q8_0): top-1 90.5%, mean KL 0.085, perplexity 3.95 (Q8_0: 4.05).
+agent session 151 tokens/s; the engine holds 69 GB of RAM beside 72 GB of VRAM. Against Unsloth's Q8_0 (set v1): top-1
+90.5%, mean KL 0.085, perplexity 3.95 (Q8_0: 4.05).
 This is a retrained model, so its distance to the original's Q8_0 includes real weight changes, not only rounding.

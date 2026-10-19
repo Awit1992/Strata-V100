@@ -150,18 +150,8 @@ decodes alone.
 | `STRATA_TRACE=1` | one line per admission with its phases (drain, prompt, first window, slot copy, checkpoint copy) |
 | `STRATA_MMQ_DIRECT=1`, `STRATA_MMQ_GROUP_SORT=1` | CUDA, needs the build option `-DSTRATA_MMQ_TAB=ON`: the prompt MMQ reads resident experts in their cache slots; full MMQ groups sorted by row count (docs/DETAILS.md) |
 
-Measured (4x R9700 32 GB, HIP, IQ3_S all experts resident, layer split 12,25,37, 3 interleaved rounds per arm, 0.1.44.1
-with 8 slots against the same build with 16 slots and the switches above; aggregate output tok/s, TTFT p50 in seconds):
-
-| users (prompt) | 0.1.44.1, 8 slots | 16 slots, no switch | 16 slots, all switches |
-|---|---|---|---|
-| 8 (147 tokens) | 209 / 2.70 s | 209 / 2.72 s | 251 / 1.82 s |
-| 16 (147 tokens) | 208 / 20.6 s | 252 / 5.4 s | 324 / 2.0 s |
-| 16 (1.2K tokens) | 145 / 23.9 s | 167 / 10.6 s | 204 / 5.3 s |
-| 16 agents x 3 turns, follow-up TTFT | 50 tok/s / 21.2 s | 53 / 7.1 s | 56 / 5.7 s |
-
-One user alone is unchanged (73-74 tok/s). Each slot's session takes VRAM from the expert cache, so on a card or split
-where the experts do not all fit, 16 slots cost the single-user speed (see docs above on what a slot costs).
+Each slot's session takes VRAM from the expert cache, so on a card or split where the experts do not all fit, 16 slots
+cost the single-user speed (see the sections above on what a slot costs).
 
 ### What a slot costs, and what setup recommends
 
@@ -259,66 +249,6 @@ One log line per read (`strata batch: read N tokens on a thread of its own in X 
 decoded R rows meanwhile (S rows/s; stage k: W windows, H ms host each)`). Built for CUDA and HIP (HIP keeps the default
 stream priority, and is not run on a GPU here); SYCL does not have it.
 
-Measured on 2x RTX 5090 (Swift 1.5 IQ3_S, split 25, `--batch 6 --batch-groups 2`, resident experts, k8v4, 262K,
-`--kv-resident 32768`, the engine-default decode share): main (`a0116b27`) against this mode, a fresh engine per arm in
-the order main, this mode, this mode, main (`tools/piped_read_join_bench.py`; the fixed-prompt rows send the same four
-stream prompts every run, so the streams' answers and work are the same):
-
-| | main | `STRATA_PIPED_CONCURRENT=1` |
-| --- | ---: | ---: |
-| 64K + 32K cold prompts beside four streams: longest stop of a stream | 11.9 s | 0.77-0.84 s |
-| ... the streams' tokens meanwhile | 289-291 | 1,411-1,679 |
-| ... the prompts' TTFT | 6.8 / 5.8-5.9 s | 8.1-8.2 / 8.2-8.3 s |
-| the same with fixed stream prompts: the streams' rate while the prompts are read | 2-3 tok/s | 85-92 tok/s |
-| ... the streams finish at | 26.1-27.1 s | 24.6-25.3 s |
-| ... GPU utilization while the prompts are read | 75-86% | 85-91% |
-| a one-line question 1 s into a cold 45K read, nothing decoding: its TTFT | 5.7-5.9 s | 1.9 s |
-| ... and the 45K prompt's own TTFT | 6.2-6.4 s | 7.4-7.5 s |
-
-The joining prompts pay for the GPU time the streams now get. Over a whole run with the same work, the streams
-finished 5-8% sooner (6.4% on average); with prompts that change from run to run (the bench's), the run's token rate
-varies more than that between runs. Between windows the doorbell thread first slept 50 us, which is a whole timer
-tick on Windows: the same build with `STRATA_TEST_BELL_SLEEP_US=50` gave the streams 64-67 tok/s during the reads
-instead of 85-92.
-
-The same randomised load (`soak`: three streams, cold joins of 4-64K, short questions, follow-ups of earlier joins,
-clients leaving mid-read and mid-answer; 5 minutes, the same seed) on main and in this mode: 167 and 180 requests
-answered; the longest gap inside a stream 9.8 and 1.0 s (90th percentile 8.5 and 0.7 s); the joins' TTFT median 3.8
-and 4.6 s. A request that comes during a read still waits for it, unless its prompt is under half as long (`BYIELD`).
-
-A 16 GB card on each side (`--vram-reserve-mib 16600 --kv-resident 16384`, the same flags otherwise):
-
-| | main | this mode |
-| --- | ---: | ---: |
-| fixed stream prompts, 64K + 32K joining: the streams' rate while the prompts are read | 0.9 tok/s | 52.9 tok/s |
-| ... the streams finish at | 70.6 s | 63.8 s |
-| ... the prompts' TTFT | 9.5 / 10.1 s | 15.8 / 21.1 s |
-| a one-line question 1 s into a cold 45K read: its TTFT | 7.3 s | 3.8 s |
-| the 45K prompt read alone | 7.33 s | 7.25 s |
-
-A weaker host as well (16 GB cards, the experts from the mapped file, AVX2 expert kernels, 6 pool workers), in #1906's
-shape (`--batch 2 --batch-groups 2`): one stream decoding while another's cold prompt is read:
-
-| cold prompt | main: the stream's longest stop / tok/s meanwhile / the prompt's TTFT | this mode |
-| --- | ---: | ---: |
-| 64K | 11.1 s / 2.4 / 10.9 s | 0.41 s / 25.7 / 11.7 s |
-| 127K | 20.3 s / 1.5 / 19.9 s | 0.64 s / 32.7 / 20.7 s |
-
-So the cost is the joining prompt's: +4-7% beside one stream, +20-45% beside four on these cards, and +67-109% beside
-four on 16 GB cards, where the streams' windows take a larger share of the GPU.
-
-**Checked:** with the variable unset this build gives main's tokens (six greedy answers' SHA-256 equal in two engine
-starts each, `--prompt-cache 0 --adapt-swaps 0 --pcie-frac 0`) at main's speed. In this mode, 25 minutes of the
-randomised load above (also on `--batch 2`): about 760 requests, 340 concurrent reads and 88 give-ways, with no hang, no
-error and no stall report.
-
-**Text equality** (`batch_interleave_test.py --long 40000` with its exact settings, `--batch 4 --batch-groups 2`, no
-conversation cache): this test is not reproducible run to run on this PC even for main (A differed from its solo tokens
-at token 142 in one run of two). In this mode every request equaled its solo tokens in two runs of three - D giving way
-at its first chunk (`YIELDED 2 2048`), E admitted meanwhile, D going on and A going back to the solo path included,
-which main does not do on this path (D never gives way there); the third run had B off at token 74, a near tie that
-flips on main as well. Greedy only; other GPU pairs, three or more stages and sampled decoding not measured.
-
 ## A prompt read beside pipelined groups (opt-in)
 
 With a layer split and `--batch-groups` above 1 a prompt is read in one run: every decoding slot stops until it is read,
@@ -349,43 +279,6 @@ since the pieces are what lets a short request in - and the decoding streams get
 latency choice, not a throughput gain: leave it off where throughput or the long prompt's own TTFT matters most, use it
 where a stream that stops for several seconds, or a short question stuck behind a long read, is worse than a long prompt
 that waits a little longer.
-
-Measured on 2x RTX 5090 (Swift 1.5 IQ3_S, `--layer-split 25 --trim-stage-weights --batch 6 --batch-groups 2
---resident-experts`, k8v4 KV, 262K context, `--kv-resident 32768`, `STRATA_ARENA_PIN_GIB=24`, Windows 11; a CUDA 13.0
-sm_120 build of this change on 0.1.43, "release" = 0.1.43 built the same way; a fresh engine for every run, all from one
-window, `tools/piped_read_join_bench.py`). Four streams decode greedy coding answers (thinking off, up to 2048 tokens)
-when cold prompts of this repository's own source text join. "Longest stop": the longest time any stream received no
-token, from the first prompt's arrival to the last one's first token + 1 s (client-side, SSE); "stream tokens": what the
-four streams received in that window; "token rate": the streams' tokens over the run's wall time.
-
-Two cold prompts, 64K then 32K, arriving 6 s apart (`--scenarios two_joiners`; release and 32K pieces: median of 5 runs
-each, interleaved; 16K pieces: one run):
-
-| arm | prompts' TTFT | longest stop of a stream | stream tokens | token rate |
-| --- | ---: | ---: | ---: | ---: |
-| release (one run per prompt) | 6.9 s / 6.1 s | 12.2 s | 289 | 173 tok/s |
-| `PIECE=32768 DECODE_MAX_MS=400` | 8.1 s / 8.5 s | 4.2 s | 527 | 166 tok/s |
-| `PIECE=16384 DECODE_MAX_MS=400` | 10.5 s / 12.0 s | 2.6 s | 793 | 154 tok/s |
-
-The longest stop was 12.16-12.23 s for the release in all five runs and 4.19-4.22 s for 32K pieces in four; in the fifth
-the first 32K piece of the 64K prompt took 9.3 s instead of 3.95 s (one uninterrupted run before any slot decoded),
-which made that run's stop 9.5 s. The token rate varied 169-180 tok/s (release) and 136-174 tok/s (32K) between runs.
-
-A short request behind a long read, nothing decoding (#1504's test, `--scenarios followup,read_alone --repeat 3`, median
-of 3): a one-line question sent 1 s after a cold 45K prompt, and the same 45K prompt read alone:
-
-| arm | the question's TTFT | the 45K prompt's TTFT | the 45K prompt alone |
-| --- | ---: | ---: | ---: |
-| release | 5.4 s | 6.0 s | 5.7 s |
-| `PIECE=32768 DECODE_MAX_MS=400` | 3.6 s | 7.3 s | 6.4 s |
-| `PIECE=16384 DECODE_MAX_MS=400` | 1.8 s | 8.0 s | 7.1 s |
-
-With the variables unset this change ran as the release in the same window (the 45K read alone 5.66 vs 5.69 s, the two
-joiners' longest stop 12.2 s on both) and gave the same SHA-256 for six greedy answers under `--prompt-cache 0
---adapt-swaps 0 --pcie-frac 0`. For reference, one RTX 5090 (the same model and flags without the split, 6 slots) with
-one cold 64K prompt joining four streams: `STRATA_BATCH_DECODE_SHARE=2.0` 2.4 s longest stop and 37.2 s TTFT, `=0` 14.0
-s and 13.8 s. Pieces of one chunk (`PIECE=8192`) cost the long prompt the most. Not measured: other GPU pairs, three or
-more stages, HIP and SYCL (built for CUDA only), sampled decoding, prompts with pictures.
 
 ## The VRAM expert tier keeps adapting in batch windows
 
@@ -527,22 +420,6 @@ params, so the graph captured per row layout stays valid):
 
 Both are off by default; off, the engine runs the same launches as before. On, the arithmetic per row is the same:
 4 concurrent prompts at temperature 0 gave the same bytes as without them, with `--batch 4` and `--batch 8`.
-
-One RTX PRO 6000 Blackwell (96 GB), IQ3_S, all 24,576 experts in VRAM, `--kv int8`, 262144 context, `--mtp`,
-`--spec 4`, through the HTTP server: C different stories sent at once, 1024 tokens each, temperature 0.7, mean of
-2 rounds, total tok/s (engine a0116b2, same day):
-
-| Concurrent | `--batch 4` | with both switches | `--batch 8` (reserve 6144 MiB) | with both switches |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 179.2 | 179.4 | 186.6 | 179.7 |
-| 2 | 204.1 | 218.7 | | |
-| 3 | 243.2 | 276.6 | | |
-| 4 | 268.4 | 311.7 | 267.7 | 311.6 |
-| 6 | | | 297.7 | 354.8 |
-| 8 | | | 308.4 | 374.8 |
-
-The window (`strata batch:` in the engine log) costs 14.3 ms for 4 rows and 24.6 ms for 8 rows without them, and
-12.2 ms and 19.9 ms with them: about 1.7-1.9 ms per added row instead of 2.4 ms.
 
 ## Together with conversation parking
 

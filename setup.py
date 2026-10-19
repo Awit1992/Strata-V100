@@ -2832,9 +2832,9 @@ GFX1150_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1150") == "1"
 AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151") \
             + (("gfx1103",) if GFX1103_OPT_IN else ()) + (("gfx1150",) if GFX1150_OPT_IN else ())
 # The exact (bit-identical) speed switches the engine turns on by default on gfx1151 (src/core/arch_defaults.cpp), less
-# STRATA_HCD_EXACT: that one copies the gfx1151 hipBLASLt table's solutions 1176 / 1177, and the gfx1103 table
-# (tools/hip/gfx1103-hipblaslt-100401.txt) picks others, so it would only report that it cannot run.  A gfx1103 install
-# takes them from here (setup writes them into the config's "env"), the same way the table is written: one 780M measured
+# STRATA_HCD_EXACT: that one copies the gfx1151 hipBLASLt table's solutions 1176 / 1177.
+# A gfx1103 install uses separate speed switches because its tuning solutions can differ.
+# Setup writes the switches below into the config's "env": one 780M measured
 # the same greedy answers with all 17 on and with all 17 off, +13% to +15% prompt and decode +3.2% (the decode half
 # alone).  The engine keeps gfx1103 out of its own arch defaults (src/core/arch_defaults_test.cpp asserts it stays
 # empty), so this keeps the default path byte-identical.
@@ -8177,7 +8177,7 @@ def main() -> int:
             # for gfx1150, so setup writes them into the config.  They are setup's own (SETUP_ENV), so a re-run refreshes
             # them and turning the opt-in off takes them out again.
             cfg.setdefault("env", {}).update(GFX1150_SWITCHES)
-        # RDNA2 (gfx103x): the prompt's FP16 GEMMs through rocBLAS's best kernel per shape (tools/hip/tune_rocblas;
+        # RDNA2 (gfx103x): the prompt's FP16 GEMMs through rocBLAS's best kernel per shape (src/prefill/rocblas_tuning.hpp
         # the GDN input projection 6x faster below 1,152 tokens on a 6900 XT).  The ids are valid for one rocBLAS
         # build, which only the engine can read, so setup points it at the directory and the engine picks the file
         # <arch>-rocblas-<version>.txt for its own library, or runs the default kernels and says so in its log.
@@ -8308,11 +8308,6 @@ def main() -> int:
             f"{'START-HERE.bat' if WIN else './setup.sh'} --calibrate tries again")
     if a.no_start:
         return 0
-    # offered only when someone answers (--yes asks nothing), default no; the benchmark starts its own server and stops it
-    if not a.yes and sys.stdin.isatty() and ask(
-            "Run a quick benchmark now? It measures this install for about 10 minutes and writes a report you can share "
-            f"(later: {'BENCH.bat' if WIN else './bench.sh'})", ["y", "n"], "n", a.yes) == "y":
-        subprocess.call([sys.executable, str(ROOT / "tools" / "strata_bench.py"), "--config", str(cfg_path), "--port", str(port)])
     return start(cfg_path, port)
 
 

@@ -77,14 +77,13 @@ separate dependency overlay with `rich` and `textual`, a normal `TERM`, and
 no `NO_COLOR`. Tests for excluded desktop and distribution packages are not
 part of this sync.
 
-The imported minimal-server smoke parser did not accept the successful unittest
-summary when platform checks were skipped. It now accepts `OK (skipped=N)`,
-reports the skip count, and still requires exit code zero and at least 32 tests.
-The actual transport smoke passed after this repair.
+The minimal-server transport smoke passed before scope reduction. The temporary
+development smoke scripts are not retained in this PR. The underlying server
+transport correctness tests remain.
 
 ## Native and GPU suite
 
-The final build completed. CTest ran 168 checks in 504.55 seconds:
+Before scope reduction, the build completed and CTest ran 168 checks in 504.55 seconds:
 158 passed, 10 skipped, and none failed. The new FP16 activation-image
 regression, K/V gather parity, GDN chunk parity, PLE reader self-test,
 conversation cache tests, and ISA audit passed.
@@ -158,3 +157,26 @@ The authenticated `/v1/models` response reported a loaded model. An
 authenticated chat request returned `2 + 2 equals 4.`. The three speech services
 remained inactive and disabled. No private configuration or credential is part
 of this PR.
+
+## Benchmark scope correction
+
+At the user's request, remove the new standalone timing targets, community
+benchmark clients, quantization corpora, profile-mixing tools, model-development
+harnesses, and development smoke scripts. Remove the new CLI benchmark command
+and its benchmark-only management actions and tests. Remove new AMD tuning data
+and restore the unrelated HIP packaging scripts to the fork baseline.
+Remove benchmark result tables and instructions for the excluded tools.
+
+Keep existing fork benchmark tools and results. Keep the numeric correctness
+checks, including `bench/micro/fusions_parity.cu`: that file tests kernel parity,
+not timing. Keep calibration used by model setup.
+
+After this reduction, the CUDA build completed and all 20 selected CPU/cache/ISA
+checks passed. The engine help command ran successfully. The reduced tools suite
+ran 984 tests and passed with two skips in a temporary pytest dependency overlay.
+The retained terminal suite ran 687 tests and passed with 14 skips. The ordinary
+parallel-request server suite passed all 39 tests. CLI help no longer lists the
+removed benchmark command. The terminal suite emitted resource warnings and a
+Textual event-loop-close exception from a background teardown thread; unittest
+reported no failures. This correction does not change that UI lifecycle code.
+No daily runtime configuration or installed binary changed during this correction.

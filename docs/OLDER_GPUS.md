@@ -121,9 +121,8 @@ and i-quant blocks (Q6_K, IQ4_XS, Q4_K, IQ3_S, ...) one int at a time. Two chang
   copies cost their size in VRAM beside the GGUF layout the prompt path reads (Flash-Next: 2.9 GiB of dense
   projections over the stages and 0.6 GiB for the head).
 - The GSQ-RCO packs have no Q8_0 dense matrices, so the kernel needs a copy of the model whose dense projections and head are
-  Q8_0: `python tools/q8_dense_gguf.py <model>-00001-of-00002.gguf <new folder>` writes one: every shard that holds
-  such matrices is converted (Swift 1.5 keeps them in both of its shards) and the rest are hard-linked beside them
-  (+3.5 GiB; the experts keep their offsets, so the native pack is reused). Point `--native` and
+  Q8_0: every shard that holds such matrices is converted (Swift 1.5 keeps them in both of its shards) and the rest are
+  hard-linked beside them (+3.5 GiB; the experts keep their offsets, so the native pack is reused). Point `--native` and
   `--ple-gguf` at the new folder. Requantizing costs at most 0.4% of a tensor's |w|max (Q8_0 is finer than the
   sources).
 - **Opt-in `STRATA_IQ_STAGE_TABLES=1`**: IQ3_XXS's and IQ3_S's codebooks and sign-mask tables are staged in shared memory by
@@ -137,9 +136,8 @@ and i-quant blocks (Q6_K, IQ4_XS, Q4_K, IQ3_S, ...) one int at a time. Two chang
   for compute capability 6.0). On an RTX 3090 Ti, forced on, the same IQ3_S layers took 3-13% longer (those kernels already
   read at 490-665 GB/s there).
 - Neither change is measured on compute capability 6.1 (P40, P4, GTX 10 series), which has `__dp4a`. Both build for
-  sm_61, and on a card with `__dp4a` the Q8_0 kernel's dot is the hardware instruction (`tools/q8_sm60_check.cu`
-  passes on an RTX 3090 Ti); numbers from a 6.1 card with `STRATA_Q8_SM60=1` or `STRATA_IQ_STAGE_TABLES=1` would
-  show whether either helps there.
+  sm_61, and on a card with `__dp4a` the Q8_0 kernel's dot is the hardware instruction; numbers from a 6.1 card with
+  `STRATA_Q8_SM60=1` or `STRATA_IQ_STAGE_TABLES=1` would show whether either helps there.
 
 Measured on a PH402 SKU 200 (two boards, four GP100 dies of 48 SMs and 32 GB HBM2), application clocks locked at
 1050 MHz, Windows 11, driver 581.80 (TCC), CUDA 12.9, engine 0.1.40.2; Flash-Next IQ3_XXS, 32K, `--layer-split 12,24,36
@@ -153,7 +151,7 @@ Measured on a PH402 SKU 200 (two boards, four GP100 dies of 48 SMs and 32 GB HBM
 
 GPU time per verify window (`STRATA_VERIFY_PROFILE`): dense projections 19.2 -> 11.2 ms, head 4.25 -> 2.1 ms; the
 draft policy then picks longer windows (2.10 -> 2.31 tokens per window). Prompt reads are unchanged (437-438 tok/s at
-10.7K). `tools/q8_sm60_check.cu` checks the kernel against a CPU reference on these shapes (1-8 columns) and times it.
+10.7K).
 
 Two things that mattered as much on this card: its default application clock is 759 MHz, and a layer split leaves
 each die idle most of a window, so the dies decode below 1050 MHz unless the clocks are locked

@@ -7,14 +7,14 @@ dependencies are imported only by ``monitor``.
 import importlib.util
 import sys
 
-#: What the API server (serve, bench) imports. Everything else in the CLI is standard library.
+#: What the API server (serve) imports. Everything else in the CLI is standard library.
 SERVER_PACKAGES = ("jinja2", "yaml", "regex", "psutil", "requests", "numpy", "PIL")
 
 
 def _preflight(argv):
     """A missing package is a typed, actionable error, never an install: starting does not run pip."""
     command = next((a for a in argv if not a.startswith("-")), "")
-    if command not in ("serve", "bench"):
+    if command != "serve":
         return 0
     missing = [m for m in SERVER_PACKAGES if importlib.util.find_spec(m) is None]
     if not missing:

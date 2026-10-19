@@ -3683,7 +3683,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // STRATA_QSA_DUMP_LAST (4096) positions - records of int32 {qsa layer, pos0, T, cap} + T*cap cells,
                     // for tools/qsa_locality.py (how local the sparse attention's reads are: the KV-streaming question).
                     // STRATA_QSA_DUMP_LAYER=i: QSA layer i only; STRATA_QSA_DUMP_STEPS=1: each record then ends with the
-                    // T * kStepCount steps too (tests/cuda/pa_bench.cpp replays such a record)
+                    // T * kStepCount steps too
                     if (static const char* dump = std::getenv("STRATA_QSA_DUMP"); dump != nullptr) {
                         static const long long last = std::getenv("STRATA_QSA_DUMP_LAST")
                                                           ? std::atoll(std::getenv("STRATA_QSA_DUMP_LAST")) : 4096;

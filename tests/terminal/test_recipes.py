@@ -4,7 +4,6 @@ import io
 import json
 import os
 import stat
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -43,26 +42,6 @@ class RecipeTests(unittest.TestCase):
         with redirect_stdout(output):
             code = main(["ops", *args, "--profile", "local", "--output", "json"])
         return code, json.loads(output.getvalue())
-
-    def test_benchmark_job_receipt_is_readable_by_new_owner_bridge_process(self):
-        _, revision = profiles.load("local")
-        job_id = "a" * 32
-        intent = {"path": str(self.root / "future-benchmark"), "suite": "serving-smoke",
-                  "concurrency": 2, "repeat": 1, "request_timeout": 30,
-                  "condition": "baseline", "if_profile_revision": revision,
-                  "if_source_sha256": "b" * 64,
-                  "if_owner_id": "c" * 32, "if_instance_id": "d" * 32}
-        journal.begin_direct("local", "bench.run", revision, intent, operation_id=job_id)
-        request = {"schema_version": 1, "action": "bench.job", "profile": "local",
-                   "params": {"job_id": job_id}}
-        process = subprocess.run([sys.executable, "-m", "strata_control.management"],
-                                 input=json.dumps(request), text=True, capture_output=True,
-                                 cwd=Path(__file__).resolve().parents[2], timeout=10, check=True)
-        response = json.loads(process.stdout)
-        self.assertTrue(response["ok"])
-        self.assertEqual(response["job"]["job_id"], job_id)
-        self.assertEqual(response["job"]["state"], "launching")
-        self.assertIsNone(response["job"]["result"])
 
     def test_init_set_plan_and_run_are_typed_and_machine_clean(self):
         self.assertEqual(self._cli("list")[1]["recipes"], [])
