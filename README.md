@@ -17,6 +17,17 @@ Strata is an open-source local runtime for [Qwen3.8-Flash-Next](https://huggingf
 
 Support for V100 does not imply that every upstream feature or every other GPU configuration has been tested on V100. Check the relevant code, release notes, and measurement reports before relying on a hardware-specific feature.
 
+## Selected upstream sync — 19 October 2026
+
+This branch imports shared CUDA engine and server changes from upstream
+commit `3d1fb480`. It keeps the fork's Volta kernels, pipeline K/V growth,
+and conversation-cache changes. It excludes unrelated desktop packages and
+separate Metal, AMD, and Intel backend updates. See the
+[sync scope](improvements/RELEASE-2026-10-19-V100.md).
+Use CUDA 12.8 with `sm_70`. An imported option does not establish a V100
+performance gain.
+
+
 ## Upstream v0.1.39 integration
 
 This update integrates [Strata v0.1.39](https://github.com/Niko1221/Strata/releases/tag/v0.1.39), including the intervening releases. It keeps the fork's V100 tensor-core experts, attention changes, asymmetric GPU split, and disk conversation cache.

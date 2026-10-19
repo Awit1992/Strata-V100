@@ -842,6 +842,42 @@ int main() {
         check(segments <= 4,"thousands of small turns do not create thousands of restore transfers");
     }
     {
+        // a parked conversation's K/V buffer (16 MiB, as captured) grows by one turn: the reserve for later turns is
+        // an eighth of the buffer at most, not another 16 MiB segment
+        ConversationBuffer bytes;
+        bytes.resize(ConversationBuffer::segment_bytes, 3);
+        const size_t captured = bytes.bytes();
+        check(captured - bytes.size() < 1024, "a fresh capture reserves nothing");
+        const size_t turn = 1 << 20;
+        const size_t peak = bytes.allocation_peak(bytes.size() + turn);
+        bytes.resize(bytes.size() + turn, 4);
+        check(bytes.bytes() <= peak, "a turn's growth stays within the predicted allocation peak");
+        check(bytes.bytes() - captured <= turn + ConversationBuffer::segment_bytes / 8 + 1024,
+              "the reserve for later turns is at most an eighth of the buffer");
+        const size_t reserved = bytes.bytes();
+        bytes.resize(bytes.size() + turn / 2, 5);
+        check(bytes.bytes() == reserved, "the next small turn fills the reserve instead of allocating");
+        size_t segments = 0;
+        bytes.visit(0, bytes.size(), [&](const uint8_t*, size_t, size_t) { ++segments; return true; });
+        check(segments == 2, "the reserve extends the turn's segment");
+    }
+    {
+        // many turns of 1 MiB onto a 16 MiB buffer: the reserve grows with the buffer, so the segments do not
+        // multiply one per turn, and the reserve never exceeds an eighth of the buffer
+        ConversationBuffer bytes;
+        bytes.resize(ConversationBuffer::segment_bytes, 1);
+        for (int k = 0; k < 256; ++k) {
+            const size_t before = bytes.size();
+            const size_t peak = bytes.allocation_peak(before + (1 << 20));
+            bytes.resize(before + (1 << 20), 2);
+            check(bytes.bytes() <= peak, "each turn stays within the predicted allocation peak");
+            check(bytes.bytes() - bytes.size() <= before / 8 + 4096, "the reserve stays within an eighth");
+        }
+        size_t segments = 0;
+        bytes.visit(0, bytes.size(), [&](const uint8_t*, size_t, size_t) { ++segments; return true; });
+        check(segments <= 64, "256 turns of 1 MiB take far fewer than 256 segments");
+    }
+    {
         ConversationKv layer;
         layer.k.resize(400);
         std::vector<ConversationKv> layers;
@@ -911,6 +947,17 @@ int main() {
         cache.put(image({9, 8, 7}));
         check(cache.evict_oldest() && cache.size() == 1, "the oldest unpinned conversation went (the pinned one is older)");
         check(!cache.evict_oldest() && cache.size() == 1, "only a pinned one is left: nothing more can go");
+        // #879: after non-finite logits every parked conversation goes, the pinned one too
+        cache.put(image({4, 5, 6}));
+        std::vector<ConversationKv> kv(1);
+        kv[0].cells = 3;
+        kv[0].k.resize(64, 1);
+        cache.retain(std::move(kv), 3);
+        check(cache.retained_bytes() > 0, "a retained K/V before clear()");
+        check(cache.clear() == 2, "clear() reports how many were parked");
+        check(cache.size() == 0 && cache.bytes() == 0 && cache.retained_bytes() == 0, "clear() leaves nothing parked");
+        check(cache.best(std::vector<int64_t>{1, 2, 3, 4}, {}, true).tokens == 0, "a cleared cache matches nothing");
+        check(cache.clear() == 0, "clear() on an empty cache");
     }
     {
         auto s = image({1, 2, 3});
@@ -1016,6 +1063,33 @@ int main() {
         huge.live.gdn.resize(2 << 20);
         check(!cache.put(std::move(huge)) && cache.size() == 5 && cache.superseded() == 1,
               "an oversized put drops nothing");
+    }
+    {
+        // --conversation-cache-park-gain N: parked_prefix_tokens reports what a park now would supersede, so a
+        // conversation that advanced fewer than N tokens since that copy keeps it instead of writing the whole
+        // snapshot again for the next turn to drop.  It must name exactly the entries drop_superseded() would remove.
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        ConversationCache cache(1 << 20, 8);
+        check(cache.parked_prefix_tokens({1, 2, 3}, {}, {}, true) == 0, "an empty cache supersedes nothing");
+
+        const std::vector<int32_t> live_ids = {1, 2, 3, 4, 60, 70};
+        const std::vector<ConversationCheckpoint> chain = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 60})};
+        SavedConversation same = image({1, 2, 3, 4, 60, 70});
+        same.checkpoints = chain;
+        check(cache.put(std::move(same)), "park a conversation with a checkpoint chain");
+        check(cache.parked_prefix_tokens(live_ids, {}, chain, true) == 5,
+              "the entry the outgoing chain supersedes is reported by its deepest checkpoint");
+
+        const std::vector<ConversationCheckpoint> other_chain = {cp({1, 2, 3})};
+        check(cache.parked_prefix_tokens({1, 2, 3, 40, 50}, {}, other_chain, true) == 0,
+              "a conversation sharing only the root supersedes nothing");
+        check(cache.parked_prefix_tokens(live_ids, {}, chain, false) == 0,
+              "the other steering mode is a different entry");
+        check(cache.parked_prefix_tokens({1, 2, 3, 4, 60, 70, 71}, {}, chain, true) == 5,
+              "an appended tail keeps the reported depth at the parked one");
+        SavedConversation no_cp = image({1, 2, 3, 9});
+        check(cache.put(std::move(no_cp)) && cache.parked_prefix_tokens({1, 2, 3, 9}, {}, {}, true) == 0,
+              "an entry without checkpoints is never reported");
     }
     {
         ConversationCache disabled(0,4), no_slots(1024,0);

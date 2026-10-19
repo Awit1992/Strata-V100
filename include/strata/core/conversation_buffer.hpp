@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strata/core/progress.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -99,7 +101,7 @@ public:
             if (!add(total, full * segment_bytes)) return SIZE_MAX;
             if (tail && !add(total, segment_capacity(tail, full ? segment_bytes :
                     pieces_.empty() || !pieces_.back().seg.unique() ? 0 : pieces_.back().seg->capacity(),
-                    size_ != 0))) return SIZE_MAX;
+                    size_ != 0, size_))) return SIZE_MAX;
             if (!add(count, full + (tail != 0))) return SIZE_MAX;
             if (count > pieces_.capacity() &&
                 (count > SIZE_MAX / sizeof(Piece) || !add(total, count * sizeof(Piece)))) return SIZE_MAX;
@@ -205,9 +207,14 @@ private:
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.
-    static size_t segment_capacity(size_t count, size_t previous, bool growing) {
+    // The reserve is also bounded by an eighth of what the buffer held before
+    // the append (at least 64 KiB): a parked conversation carries it in every
+    // K/V buffer, and at up to 16 MiB each it came to 0.4-0.5 GB of a ~1 GB
+    // conversation (Qwen3.8-Flash-Next), counted against the cache's budget.
+    static size_t segment_capacity(size_t count, size_t previous, bool growing, size_t held) {
         if (!growing) return count;
-        return std::max(count, std::min(segment_bytes, std::max<size_t>(65536, std::min(previous, segment_bytes/2)*2)));
+        const size_t geometric = std::min(segment_bytes, std::max<size_t>(65536, std::min(previous, segment_bytes/2)*2));
+        return std::max(count, std::min(geometric, std::max<size_t>(65536, held / 8)));
     }
     static bool add(size_t& n, size_t extra) {
         if (extra > SIZE_MAX - n) return false;
@@ -261,6 +268,7 @@ private:
     }
     void grow(size_t n, uint8_t value) {
         const bool growing = size_ != 0;
+        const size_t held = size_;
         size_t extend = 0;
         if (!pieces_.empty() && pieces_.back().seg.unique()) {
             Piece& last = pieces_.back();
@@ -281,7 +289,7 @@ private:
             const size_t previous = pieces_.empty() || !pieces_.back().seg.unique() ?
                 0 : pieces_.back().seg->capacity();
             auto segment = std::make_shared<Segment>();
-            segment->reserve(segment_capacity(count, previous, growing));
+            segment->reserve(segment_capacity(count, previous, growing, held));
             segment->resize(count, value);
             pieces_.push_back(Piece{std::move(segment), 0, count});
             size_ += count;

@@ -12,6 +12,9 @@ In this V100 fork, setup writes `"parallel": 2` for a new Volta configuration. I
 setting. Use `--parallel 1` to disable it. The engine can fall back to one request if two slots do not fit in
 GPU memory; check `concurrency.serving` in `/v1/status`. Extra slots can reduce single-request speed.
 
+**Qwen3.6-35B-A3B** has the same option on its own engine path (`"parallel": N`, `--batch N`, `--batch-mtp`, up to 8 slots, the same
+engine protocol and the same server): its numbers, what a slot costs and where setup recommends it are in [QWEN36.md](QWEN36.md).
+
 ## Turning it on
 
 One GPU: add `"parallel": 2` to the model's config (`strata-<model>.json`) and restart, or run setup with
@@ -38,7 +41,7 @@ drafter's does). A window carries two rows per active slot (its token and its pr
 four slots are in one window; more slots (`--batch` up to what fits) rotate through. The windows run through the stages
 one after the other (`--batch-groups 1`): on 0.1.41 a layer split with `--batch` 2 or more pipelines the slots in groups
 by default, and the pipelined path does not run the slots' MTP drafts, so with `--batch-mtp` and no `--batch-groups` the
-engine runs one group and says so; `--batch-groups G` (G above 1) or `--batch-groups auto` given on the command line
+engine (0.1.43.1) pipelines and leaves `--batch-mtp` off, and says so (0.1.42/0.1.43 ran one serial group with it: 4 streams on 2x A4000 aggregated 63.9 tok/s against 91.8 pipelined, 85.8 pipelined without `--batch-mtp`; #2038). `--batch-groups 1` or `STRATA_BATCH_MTP_SERIAL=1` keeps `--batch-mtp` with serial windows, which is the better choice for about two streams as measured below; `--batch-groups G` (G above 1) or `--batch-groups auto` given on the command line
 keeps the pipeline and turns `--batch-mtp` off. Only a layer split of two stages on two GPUs has been run.
 
 Measured on a layer split of 2x RTX 3080 20 GB (220 W cap) with a Xeon E5-2696 v4, UD-Q4_K_XL, `"layer_split": "23"`,
@@ -87,13 +90,13 @@ With a layer split, the engine options go into the config's `args`:
 
 | Option | What it does |
 | --- | --- |
-| `"parallel": N` / `--batch N` / `--slots N` (2..8 normally) | up to N conversations have batch slots; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. With grouped MTP, more than 8 slots can rotate through eight-row windows if memory permits. |
+| `"parallel": N` / `--batch N` / `--slots N` (2..8 normally; with a layer split up to 8 per group, see below) | up to N conversations have batch slots; more requests wait for a free slot. Each slot gets its own state (a session carved like the stage's own: GDN recurrence, QSA K/V and indexer, PLE history) on every GPU of the split. With grouped MTP, more than 8 slots can rotate through eight-row windows if memory permits. |
 | `--batch-groups G` | with a layer split (default: auto, below): the N slots in G groups that flow through the GPUs as a pipeline (GPU k runs one group while GPU k+1 runs another). G must divide N. 1 = all slots in one window, GPU after GPU. |
-| `--batch-groups auto` | the default on a layer split since 0.1.41 (give no `--batch-groups`): the engine pipelines one group per GPU stage (the most that divide the slots; 8 slots on 4 GPUs = 4 groups of 2) and says so (`INFO batch_groups=G`). `--batch-groups 1` turns it off (all slots in one window, GPU after GPU). Measured, 8 clients, total tok/s against one group: 4 x R9700 166 against 86, 2 GPUs 109 against 78, 3 GPUs 110 against 78. With `--batch-mtp` or `--adapt-async 1` and no `--batch-groups` the default is one group (the slots' MTP drafts and the adaptive tier between batch windows do not run in pipelined groups) and the log says so; `--batch-groups G` or `--batch-groups auto` given with `--batch-mtp` pipelines the groups and turns `--batch-mtp` off, and given with `--adapt-async 1` pipelines the groups and turns `--adapt-async` off (the pipelined path does not adapt). |
-| `--trim-stage-weights` | with a layer split: every GPU loads only the dense weights of its own layers instead of the whole model's (the same as `STRATA_STAGE_TRIM=1`, PR #639). In the CUDA/HIP engine this is automatic for explicit split points (e.g. `12,24,36`), not `auto`; the switch is what asks for it under `--layer-split auto`. The VRAM this frees goes to the expert cache. Useful without `--batch` too. |
+| `--batch-groups auto` | the default on a layer split since 0.1.41 (give no `--batch-groups`): the engine pipelines one group per GPU stage (the most that divide the slots; 8 slots on 4 GPUs = 4 groups of 2) and says so (`INFO batch_groups=G`). `--batch-groups 1` turns it off (all slots in one window, GPU after GPU). Measured, 8 clients, total tok/s against one group: 4 x R9700 166 against 86, 2 GPUs 109 against 78, 3 GPUs 110 against 78. With `--adapt-async 1` and no `--batch-groups` the default is one group (the adaptive tier between batch windows does not run in pipelined groups) and the log says so; with `--batch-mtp` and no `--batch-groups` the pipeline wins and `--batch-mtp` is left off (`--batch-groups 1` or `STRATA_BATCH_MTP_SERIAL=1` keeps it); `--batch-groups G` or `--batch-groups auto` given with `--batch-mtp` pipelines the groups and turns `--batch-mtp` off, and given with `--adapt-async 1` pipelines the groups and turns `--adapt-async` off (the pipelined path does not adapt). |
+| Explicit `--layer-split` | Each GPU loads only the dense weights for its own layers. This is automatic. The memory that this releases is available to the expert cache. |
 
-The engine never refuses a count it cannot run: it says so in its log and runs what it can - at most 8 slots by
-default (a window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit. The server reads
+The engine never refuses a count it cannot run: it says so in its log and runs what it can - at most 8 slots without a
+layer split (a window holds 8 rows; with a layer split and pipelined groups, 8 per group), as many as fit in VRAM, or none (one request at a time) when not two fit. The server reads
 the count the engine reports (`INFO batch_slots=N`), and `GET /v1/status` says it (`concurrency.serving`).
 
 The slot sessions are carved **after** the main session, the native head, the logits buffer
@@ -116,6 +119,39 @@ ownership; the final numbers are in the benchmark report.
 The fork makes upstream stage-weight trimming automatic for explicit CUDA/HIP splits. Remove
 `--trim-stage-weights` and `STRATA_STAGE_TRIM` from those configurations; they are no longer accepted
 or needed. The separate experimental Intel (SYCL) engine retains its own opt-in path.
+
+## More than 8 slots on a layer split, and the opt-in admission and decode switches
+
+(From havok2-htwo's patch series, PR #2364.)
+
+**More than 8 slots.** With a layer split a pipelined window holds at most 8 rows, but each group of the pipeline is its
+own window, so `--batch 16` on 4 GPUs runs 4 groups of 4 slots (`--batch-groups auto`), `--batch 32` runs 4 groups of 8.
+Until 0.1.44.1 the engine cut such a request down to 8 slots and said so; it now runs what is asked for, as many slots
+as fit in VRAM and at most 8 per group (`INFO batch_slots=N`). `--batch-mtp` keeps its limit (rows per window are
+doubled by the proposals). Nothing changes for 8 slots or fewer. Every slot of a 16-slot pipelined batch decodes
+exactly the tokens it decodes alone (`tools/batch_test.py --n 16`, which now takes up to 32 prompts).
+
+**Opt-in switches** (environment of the engine, i.e. `"env"` in the config; none is on by default). Each one changes
+how the work is scheduled or copied, not what is computed; `tools/batch_test.py` checks that every slot decodes the tokens it
+decodes alone.
+
+| Switch | What it does |
+|---|---|
+| `STRATA_SLOT_COPY_DIRECT=1` | an admission (and a slot's resume) copies the running state and the QSA K/V device to device, instead of through host images |
+| `STRATA_SLOT_COPY_BATCHSYNC=1` | with the above: queue the ~116 copies and synchronize each device once |
+| `STRATA_SLOT_CKPT_MOVE=1` | the admission's turn checkpoint moves into the slot (no 112 MB copy); it also keeps the dropped checkpoints' storage, as `STRATA_CKPT_POOL` does; a session SAVE or parked conversation taken right after an admission lacks the moved checkpoint (the slot holds it) |
+| `STRATA_CKPT_POOL=1`, `STRATA_CKPT_THREADS=1` | a checkpoint is saved into the vectors of a dropped one; a split's stage parts are saved at once |
+| `STRATA_ADMIT_MERGE_FIRST=1` | an admission reads its last prompt tokens and its first token in one window (all experts resident only) |
+| `STRATA_PIPE_BYIELD_NODRAIN=1` | a BYIELD that reaches a pipelined batch is dropped without draining the groups |
+| `STRATA_BATCH_SELF_COMMIT=1` | a one-row-per-slot window advances the GDN state itself, no commit graph |
+| `STRATA_QSA_SLOTS=1` | a window's QSA block scores, top-k and attention run as one launch over its rows |
+| `STRATA_HANDOFF_PIPE=P` | a layer split hands a prompt chunk to the next card in P pieces (2..16), gated by events, on a persistent thread |
+| `STRATA_ADMIT_SHORT_FIRST=N` (server) | a new prompt of at most N tokens takes the control lines before longer ones (a longer one that waited `STRATA_ADMIT_MAX_WAIT_S`, default 30, counts as short) |
+| `STRATA_TRACE=1` | one line per admission with its phases (drain, prompt, first window, slot copy, checkpoint copy) |
+| `STRATA_MMQ_DIRECT=1`, `STRATA_MMQ_GROUP_SORT=1` | CUDA, needs the build option `-DSTRATA_MMQ_TAB=ON`: the prompt MMQ reads resident experts in their cache slots; full MMQ groups sorted by row count (docs/DETAILS.md) |
+
+Each slot's session takes VRAM from the expert cache, so on a card or split where the experts do not all fit, 16 slots
+cost the single-user speed (see the sections above on what a slot costs).
 
 ### What a slot costs, and what setup recommends
 
@@ -176,6 +212,73 @@ about 10-25% speed per request on this card". `--parallel N` is honoured as aske
   299-token one.
 - Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`).
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
+
+## Reading a prompt beside pipelined groups (experimental, opt-in)
+
+With a layer split and `--batch-groups` above 1 a prompt is read in one run: every decoding slot stops until it is
+read, however long it is (#1906). One GPU does not have this problem: there the slots decode between the prompt's
+chunks for `STRATA_BATCH_DECODE_SHARE` x the chunk's time.
+
+`STRATA_PIPED_CONCURRENT=1` reads a prompt on a thread of its own while the slot groups keep decoding through the
+pipeline, instead of stopping them: the prompt's chunks and the slots' windows run on the same GPUs at once, on their
+own streams (the windows' at the device's highest priority on CUDA; `STRATA_PIPED_CONCURRENT_PRIO=0` keeps the default),
+so the slots never wait for the read and the read is one run with no drain inside it.
+
+- The prompt's K/V goes to the main sessions and the slots' to their own, so they do not touch each other's state. The
+  n-gram (PLE) table both of them read is locked. The adaptive VRAM tier stands still during the read: its round lands
+  before the read and none starts while it runs.
+- The VRAM expert slots the prompt path borrows are lent before the read and refilled after it, with nothing in flight;
+  in between the slots' windows compute those experts on the CPU.
+- The slots' doorbells are served on a thread of their own during the read, which makes no CUDA call. A CUDA call can
+  wait for the driver's lock while its holder waits for the GPU - a free, or the module the first kernel of a new shape
+  loads - and a window on that GPU waits for its doorbell (issue #31's pattern: two such hangs were found and read from
+  the engine's stall dumps while this was built). The MTP drafter's prompt buffers and the prompt path's pinned upload
+  slots are sized before the read, so its thread allocates and frees nothing. Between windows the doorbell thread waits
+  for the next launch, which wakes it (a timed sleep is a whole timer tick on Windows, up to 15.6 ms). A window that
+  will not finish is still found (its graph ended with a layer still to ring, or no layer rang for 20 s), and the stall
+  watchdog stays on for the whole read.
+- A waiting shorter request takes over at the read's next chunk (`BYIELD`), also when no slot decodes: the run ends
+  there, the pipeline is drained and the part read waits in a slot, as off the pipeline. A read nobody waits for is not cut.
+- Off, said once, where the read's thread would allocate or free (`STRATA_PREFILL_HELP=1`, `STRATA_SPLIT_MTP_BATCH=1`),
+  where serving a doorbell makes a CUDA call (`--pcie-mode dma`, `STRATA_FS_SLOTS`, the helper caches
+  `--expert-cache-device1..3`), and with an expert source that hands out buffers it recycles (the GGUF in place, an
+  unbuffered source, `STRATA_IO_PREFETCH`): the experts come from the RAM arena or the mapped file. A prompt with
+  pictures is read the usual way.
+
+One log line per read (`strata batch: read N tokens on a thread of its own in X ms (concurrent, to Q of T); the slots
+decoded R rows meanwhile (S rows/s; stage k: W windows, H ms host each)`). Built for CUDA and HIP (HIP keeps the default
+stream priority, and is not run on a GPU here); SYCL does not have it.
+
+## A prompt read beside pipelined groups (opt-in)
+
+With a layer split and `--batch-groups` above 1 a prompt is read in one run: every decoding slot stops until it is read,
+however long it is, `STRATA_BATCH_DECODE_SHARE` does not apply and no `BYIELD` is taken (`batch_read_piece` returns 0
+for the pipelined groups; #1906). One GPU does not have this problem: there the slots decode between the prompt's chunks
+for `STRATA_BATCH_DECODE_SHARE` x the chunk's time. These variables give the pipelined groups the same choice:
+
+- `STRATA_PIPED_READ_PIECE=N`: a prompt read on the pipelined groups goes in pieces of N tokens, rounded down to whole
+  chunks (at least one, at most 32), so a piece reads exactly the chunks a single run would, the two stages stay
+  overlapped inside it and only the piece's end drains the pipeline. Between two pieces the slot groups decode through
+  the pipeline for `STRATA_BATCH_DECODE_SHARE` x the piece's time, at most `STRATA_PIPED_DECODE_MAX_MS` and at least
+  `STRATA_PIPED_DECODE_MIN_MS`, and every group in flight finishes before the next piece, as before any prompt read.
+- At a piece's end the pipeline is drained, so a waiting request with a prompt under half as long can take over there
+  (`BYIELD`, as between the chunks of a read off the pipeline): the part read waits in a slot and the read goes on from
+  it after the short request is in. The pieces are also taken when no slot decodes, for this reason (off the pipeline
+  the same read goes in `STRATA_BATCH_YIELD_CHUNKS` pieces then).
+- A read that starts within a second (plus the decode budget) of the previous such read's end - prompts arriving back to
+  back - first gives the slots one decode budget (the same rule, from the previous read's last full piece); otherwise
+  the slots would stop for both reads.
+
+With the variables unset the read is one run as before. One log line per piece (`strata batch: piped read N tokens in X
+ms (to Q of T)`, with `, then the slots decoded R rows in Y ms` when slots decode), per give-way (`the prompt read gives
+way at Q of T tokens; slot S holds it`) and per lead-in (`a read right after a read: the slots decoded R rows in Y ms
+first`).
+
+**What it trades.** Every piece ends by draining the pipeline, so a long read takes longer - also on an idle server,
+since the pieces are what lets a short request in - and the decoding streams get tokens where they had none. It is a
+latency choice, not a throughput gain: leave it off where throughput or the long prompt's own TTFT matters most, use it
+where a stream that stops for several seconds, or a short question stuck behind a long read, is worse than a long prompt
+that waits a little longer.
 
 ## The VRAM expert tier keeps adapting in batch windows
 
@@ -303,6 +406,21 @@ tok/s, at 0.7 -> 358 tok/s.
 Stage-weight trimming alone raised the share of experts held in GPU memory on that machine from
 76-85 % to 84-100 % per card. This is an upstream measurement, not a V100 measurement.
 
+### One launch for all slots (opt-in)
+
+In a batch window, QSA block scoring, top-k and decode attention ran as one launch per row, and the GDN recurrence
+(in the window and in the 1-row commit) as one launch per slot. Two switches run each of them as one launch for all
+rows, every row still reading its own slot's indexer keys, K/V pools and GDN state (passed by value as kernel
+params, so the graph captured per row layout stays valid):
+
+| Switch | What it does |
+| --- | --- |
+| `STRATA_BATCH_ATTN_ROWS=1` | block scores, top-k and decode attention of all the window's rows (up to 8) in one launch each. Not with KV streaming (a slot with `kv_mode` 1 keeps the per-row launches). |
+| `STRATA_BATCH_GDN_GROUPS=1` | the GDN recurrence in the window, and the commit of 1-row groups, for all slots in one launch. The conv commits stay per slot. |
+
+Both are off by default; off, the engine runs the same launches as before. On, the arithmetic per row is the same:
+4 concurrent prompts at temperature 0 gave the same bytes as without them, with `--batch 4` and `--batch 8`.
+
 ## Together with conversation parking
 
 `--conversation-cache-mib N --conversation-cache-slots K` (DETAILS.md) works with the layer split too: a request
@@ -328,7 +446,7 @@ tests the server's side with a scripted engine (no GPU).
 | Script | What it checks |
 | --- | --- |
 | `tools/batch_test.py` | the same prompts alone (`GEN`) and together in the batch slots (`BGEN`): every slot's greedy tokens equal its solo tokens; prints the aggregate rate. `--batch-groups` in `--extra` tests the pipeline, `--keys "temperature=0.7"` the sampled rows. |
-| `tools/batch_interleave_test.py` | a long prompt read while two slots decode, a prompt that gives way (`BYIELD`) and goes on, and a next turn continued from its slot: each equal to its solo tokens. |
+| `tools/batch_interleave_test.py` | a long prompt read while two slots decode, a prompt that gives way (`BYIELD`) and goes on, and a next turn continued from its slot: each equal to its solo tokens. On a two-stage layer split with pipelined groups add `--batch 4 --batch-groups 2` to `--extra` (its 3 slots do not divide into two groups) and set `STRATA_PIPED_READ_PIECE`; run it without a conversation cache, or step 4 restores the prompt instead of reading it. |
 | `tools/parking_test.py` | a follow-up to a conversation decodes the same tokens whether its state stayed live or came back from the parking cache (with a layer split: every stage's image). |
 | `tools/early_close_test.py` | a client that stops reading a streamed answer early (alone, and with a second request running) does not leave its tokens to the next request (server). |
 

@@ -59,6 +59,11 @@ const char* name_of(int t) {
         case 23: return "IQ4_XS";
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
+        case 12: return "Q4_K";
+        case 13: return "Q5_K";
+        case 14: return "Q6_K";
+        case 7: return "Q5_1";
+        case 8: return "Q8_0";
         default: return "?";
     }
 }
@@ -77,9 +82,15 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
             const uint8_t nib = (uint8_t) ((sgn(rng) ? 0x8 : 0x0) | (1 + (byte(rng) & 1)));
             w[o + 55] = (uint8_t) ((w[o + 55] & 0x0F) | (nib << 4));
         } else {   // the other formats start their block with the fp16 scale: 2^-13 .. 2^-6
-            const int e = ex(rng);
+            // (Q4_K / Q5_K: 2^-14 .. 2^-11, their 6-bit sub-scales multiply it by up to 63)
+            const int e = (t == 12 || t == 13) ? 1 + ex(rng) % 4 : ex(rng);
             const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (e << 10) | man(rng));
             std::memcpy(&w[o], &h, 2);
+            if (t == 12 || t == 13 || t == 7) {   // Q4_K / Q5_K: dmin, Q5_1: m - the second fp16, as small
+                const int em = (t == 7) ? ex(rng) : 1 + ex(rng) % 4;
+                const uint16_t m = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (em << 10) | man(rng));
+                std::memcpy(&w[o + 2], &m, 2);
+            }
         }
     }
     return w;
