@@ -19,11 +19,11 @@
 //     y        = mlp_conv.finish(h3, mlp_conv.prepare(h2).co)
 //   out = norm(y + res)[1:]  -> target lm_head -> top-k -> selector lattice -> one path -> tokens + q
 //
-// Precision matches the reference exactly: fp16 weights (the checkpoint is bf16, and bf16 -> fp16 is
-// exact inside fp16's range - the loader refuses a tensor that would saturate), a cuBLAS fp16 matmul
-// with fp32 accumulation and an FP32 output, and fp32 for every activation, the residual stream, the
-// context K/V and every elementwise step.  Only a matmul's operand is rounded to fp16.  An fp16
-// activation path cannot work here: with the real weights the residual reaches RMS ~4e4.
+// Native precision: BF16 checkpoint weights are rounded to FP16 at load time. Tiny values can round
+// or underflow; the loader rejects non-finite weights and magnitudes above 65504. cuBLAS uses FP16
+// operands with FP32 accumulation and FP32 outputs. Activations, residuals, context K/V, and
+// elementwise steps use FP32. This is not bitwise equivalent to the reference's BF16 compute.
+// FP16 activation outputs can overflow here: the real checkpoint's residual reaches RMS ~4e4.
 
 #include "strata/core/dflash2.hpp"
 

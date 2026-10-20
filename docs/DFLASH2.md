@@ -102,6 +102,8 @@ or change its attention mask.
 - On V100, projection weights and matrix-multiplication inputs use FP16.
   Matrix-multiplication outputs, other activations, residuals, and draft K/V use
   FP32. FP16 outputs can overflow with this checkpoint and must not replace them.
+  Conversion from BF16 to FP16 can round or underflow small weights.
+  This path is not bitwise equivalent to the reference's BF16 compute.
 
 Keep the daily service configuration unchanged during comparisons. Restore its
 approved model and pipeline settings after the test.

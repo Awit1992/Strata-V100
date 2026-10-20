@@ -22,9 +22,9 @@
 // Nothing here verifies or commits tokens: the caller runs the target over the block and applies the
 // greedy / rejection-sampling rule (core/verify.hpp, core/spec_prob.hpp).
 //
-// Native precision: the checkpoint is bf16, so the weights are stored fp16
-// (exact for every bf16 value in fp16's range - the loader checks that) and each projection is a
-// cuBLAS fp16 matmul with fp32 accumulation and an FP32 OUTPUT.  Every activation, the residual
+// Native precision: BF16 checkpoint weights are rounded to FP16 at load time.
+// Tiny values can round or underflow; non-finite values and magnitudes above 65504 are rejected.
+// cuBLAS uses FP16 operands, FP32 accumulation, and FP32 outputs. Every activation, the residual
 // stream, the context K/V and every elementwise step (norms, RoPE, conv, attention, softmax, silu,
 // the selector) are fp32; only the operand that enters a matmul is rounded to fp16.  That matters:
 // with the real weights the residual reaches RMS ~4e4 and the sublayer outputs far more, which an
