@@ -30,6 +30,7 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/coupled_draft.hpp"
+#include "strata/core/spec_prob.hpp"   // kSpecQStride / kSpecCtrDraft / spec_min_temp: the DFlash2 drafts' q lists
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
@@ -66,6 +67,8 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
+#include "strata/core/dflash2.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/vram_plan.hpp"
 #if defined(STRATA_PREFILL_MMQ)
@@ -207,6 +210,581 @@ std::string vram_free_note() {
                   (unsigned long long) (total_b >> 20));
     return buf;
 }
+
+// ============================== DFlash2 (--dflash2) ==============================
+// include/strata/core/dflash2.hpp: a DRAFT-ONLY block model for Qwen3.8-Flash-Next that reads the TARGET's own
+// hidden states at five layers and proposes up to block_size - 1 tokens per verify window.  Everything it produces
+// is a draft: the verify window still decides every token, so a missing, stale or wrong proposal changes speed
+// only, never the output.
+//
+// THE TAPS.  What the drafter's encoder consumes is the COMPLETED residual of the target layer `tap_layers[k]`.
+// A residual is complete where its successor folds the layer's pending write into R (Verifier::set_dflash2_taps),
+// so the verifier that RUNS layer `tap_layers[k] + 1` captures it - with a layer split the taps are therefore split
+// across the stages, and each verifier writes its own share into a device buffer of its own.  After a window this
+// driver copies the rows the window ACCEPTED (and only those) into one buffer on the drafter's device and appends
+// them to the drafter's feature ring; rows captured on another card cross PCIe (through the host when the cards
+// cannot peer). Capture buffers retain their fixed capacity; the appended rows
+// are packed at the accepted row count before the backend reads them.
+//
+// THE RING.  The drafter attends over a 2048-cell window of its own (the checkpoint's sliding_window), so only the
+// last 2047 positions matter. Both prompt paths append completed target features.
+// A conversation resumed from a cache starts a fresh draft ring at the first
+// newly processed position. Missing cached draft features can reduce acceptance;
+// the target session still determines every emitted token.
+//
+// THE DRAFTS.  Greedy by default: a point-mass proposal, which the verify window judges by exact match.  With
+// STRATA_SPEC_COUPLED / STRATA_SPEC_PROB the proposal is SAMPLED from the selector's conditional distribution q
+// with the drafter's own Philox draw (`--spec-min-p` gates a further slot on that draw's probability, as it does
+// for the MTP), and under STRATA_SPEC_PROB the window judges each draft against that q with rejection sampling
+// (core/spec_prob.hpp): the emitted token's distribution is then exactly the target's, whatever q is.
+
+/// Philox 4x32-10, host side: a transcription of the sampler kernel's `philox_uniform` (sampler.cu), so a draft's
+/// sampling draw is a function of (seed, position) exactly as the target's own draws are.  `__umulhi(a, b)` is the
+/// high half of the 64-bit product.
+inline float dflash2_philox_uniform(uint64_t seed, uint64_t counter) {
+    uint32_t c0 = (uint32_t) counter, c1 = (uint32_t) (counter >> 32);
+    uint32_t c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
+    for (int i = 0; i < 10; ++i) {
+        const uint32_t hi0 = (uint32_t) (((uint64_t) 0x9E3779B9u * c0) >> 32);
+        const uint32_t hi1 = (uint32_t) (((uint64_t) 0xBB67AE85u * c2) >> 32);
+        const uint32_t lo0 = 0x9E3779B9u * c0;
+        const uint32_t lo1 = 0xBB67AE85u * c2;
+        const uint32_t n0 = hi1 ^ c1 ^ (uint32_t) i;
+        const uint32_t n2 = hi0 ^ c3;
+        c0 = n0; c1 = lo1; c2 = n2; c3 = lo0;
+    }
+    return (float) (c0 >> 8) * (1.0f / 16777216.0f);
+}
+
+// The checkpoint's config.json, read for the numbers the drafter's geometry needs.  The document is flat scalars and
+// one integer array, so a key is found by name and the value after its colon is parsed; a key that is absent leaves
+// the backend's own default (the geometry its header documents) in place.
+inline const char* dflash2_json_value(const std::string& text, const char* key) {
+    const std::string pat = std::string("\"") + key + "\"";
+    const auto skip = [&](size_t i) {
+        while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\n' || text[i] == '\r')) ++i;
+        return i;
+    };
+    for (size_t at = text.find(pat); at != std::string::npos; at = text.find(pat, at + 1)) {
+        const size_t i = skip(at + pat.size());
+        if (i < text.size() && text[i] == ':') return text.c_str() + skip(i + 1);
+    }
+    return nullptr;
+}
+inline bool dflash2_json_int(const std::string& text, const char* key, long long& out) {
+    const char* v = dflash2_json_value(text, key);
+    if (v == nullptr) return false;
+    char* end = nullptr;
+    const long long n = std::strtoll(v, &end, 10);
+    if (end == v) return false;
+    out = n;
+    return true;
+}
+inline bool dflash2_json_float(const std::string& text, const char* key, float& out) {
+    const char* v = dflash2_json_value(text, key);
+    if (v == nullptr) return false;
+    char* end = nullptr;
+    const double n = std::strtod(v, &end);
+    if (end == v) return false;
+    out = (float) n;
+    return true;
+}
+inline bool dflash2_json_ints(const std::string& text, const char* key, std::vector<int>& out) {
+    const char* v = dflash2_json_value(text, key);
+    if (v == nullptr || *v != '[') return false;
+    ++v;
+    std::vector<int> got;
+    while (*v != '\0' && *v != ']') {
+        while (*v == ' ' || *v == ',' || *v == '\t' || *v == '\n' || *v == '\r') ++v;
+        if (*v == ']') break;
+        char* end = nullptr;
+        const long n = std::strtol(v, &end, 10);
+        if (end == v) return false;
+        got.push_back((int) n);
+        v = end;
+    }
+    if (got.empty()) return false;
+    out = got;
+    return true;
+}
+
+/// One capture point's share of the drafter's feature taps: a verify window's (kind 0) or a batched prompt chunk's
+/// (kind 1).
+struct Dflash2TapOwner {
+    int kind = 0;                   ///< 0: a verifier's window rows, 1: a Prefill's chunk rows
+    int parity = 0;                 ///< the window parity this capture point serves (0: even, 1: odd)
+    strata::core::Verifier* ver = nullptr;
+    strata::prefill::Prefill* pf = nullptr;
+    int device = -1;
+    int stride = 0;                 ///< rows the buffer holds per tap (the window cap / the chunk's tap cap)
+    int capture_slots = 1;          ///< prompt chunks in flight: buf is [capture_slots][layers][stride][row] (1: a window)
+    std::vector<int32_t> layers;    ///< the completed target layers this capture point holds (its buffer's order)
+    std::vector<int> slot;          ///< ... and the drafter's tap index of each
+    float* buf = nullptr;           ///< device (this capture point's): [capture_slots][layers.size()][stride][hc * n_embd]
+};
+
+/// The DFlash2 block drafter and everything the engine hands it: the tap buffers, the drafter's device copy of the
+/// rows a window accepted, the block's input embeddings and the target's head.
+struct Dflash2Driver {
+    strata::core::DFlash2Backend d2;
+    strata::core::DFlash2Config cfg;
+    bool on = false;
+    int device = -1;
+    int64_t hc = 0, n_embd = 0, n_vocab = 0;
+    int staging_rows = 256;          ///< bounded prompt-feature batches; also holds a verify window
+    int64_t n_layers = 0;           ///< the target's layer count (a tap on the last layer is written by its post)
+    int slots = 0;                  ///< the drafts one block proposes (block_size - 1)
+    int mask_id = 248077;           ///< the checkpoint's mask token (dflash_config.mask_token_id)
+    std::vector<Dflash2TapOwner> owners;
+    float* gather = nullptr;        ///< device staging: [n_taps][staging_rows][hc * n_embd]
+    cudaStream_t cs = nullptr;      ///< the driver's copies and gathers
+    const strata::core::WeightTable* wt = nullptr;
+    const strata::core::NativeHead* head = nullptr;
+    uint8_t* head_xq = nullptr;     ///< the head callback's q8_1 scratch (its blocks, for the head's own MMVQ)
+    // the block the drafter denoises: the target's token embedding of the anchor and of the mask, [block_size, n_embd]
+    float* block_embeds = nullptr;
+    int32_t* block_ids = nullptr;   ///< device: block_size token ids (row 0 is the anchor)
+    // the last block's proposal, in the shape the decode loops and the verify window take
+    std::vector<int32_t> tokens;    ///< one token per slot
+    std::vector<float> probs;       ///< each token's probability under the drafter's q
+    std::vector<float> uniforms;    ///< the sampled mode's draws, one per slot
+    std::vector<int32_t> q_rows;    ///< the slots' q lists, kSpecQStride int32 each (core/spec_prob.hpp)
+    int n_q = 0;
+    strata::core::DFlash2Proposal prop;
+
+    Dflash2Driver() = default;
+    ~Dflash2Driver() { free_device(); }
+    Dflash2Driver(const Dflash2Driver&) = delete;
+    Dflash2Driver& operator=(const Dflash2Driver&) = delete;
+
+    void free_device() {
+        const strata::core::OnDevice on_dev(device);
+        for (Dflash2TapOwner& o : owners)
+            if (o.buf != nullptr) { (void) cudaFree(o.buf); o.buf = nullptr; }
+        owners.clear();
+        if (gather != nullptr) { (void) cudaFree(gather); gather = nullptr; }
+        if (block_embeds != nullptr) { (void) cudaFree(block_embeds); block_embeds = nullptr; }
+        if (block_ids != nullptr) { (void) cudaFree(block_ids); block_ids = nullptr; }
+        if (head_xq != nullptr) { (void) cudaFree(head_xq); head_xq = nullptr; }
+        if (cs != nullptr) { (void) cudaStreamDestroy(cs); cs = nullptr; }
+        on = false;
+    }
+
+    /// The target's output projection over the drafter's rows, the callback include/strata/core/dflash2.hpp asks
+    /// for.  The rows arrive after the draft model's own final norm, so nothing else is applied: quantize them to
+    /// q8_1 and run the head's own multi-column MMVQ - the same kernels the verify window's head uses.
+    static bool head_run(void* ctx, const float* rows, int n_rows, float* logits, void* stream, std::string& err) {
+        Dflash2Driver& d = *static_cast<Dflash2Driver*>(ctx);
+        if (d.head == nullptr || !d.head->loaded()) { err = "dflash2: no target head is bound"; return false; }
+        if (n_rows <= 0) return true;
+        const strata::core::OnDevice on_dev(d.device);
+        cudaStream_t cs = stream != nullptr ? (cudaStream_t) stream : d.cs;
+        try {
+            strata::kernels::native_quantize_q8_1(rows, d.head_xq, (int) d.n_embd, n_rows, cs);
+            strata::kernels::native_mmvq(d.head->type(), d.head->weights(), d.head_xq, logits, (int) d.n_embd,
+                                         (int) d.n_vocab, n_rows, cs);
+        } catch (const std::exception& e) {
+            err = std::string("dflash2: the target head: ") + e.what();
+            return false;
+        }
+        return true;
+    }
+
+    /// The checkpoint's config.json, when it is there: the geometry this driver and the drafter's buffers are sized
+    /// from.  A missing file keeps the backend's defaults (its header documents the same values).
+    bool read_config(const std::string& dir, std::string& err) {
+        const std::string path = dir + "/config.json";
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (f == nullptr) return true;
+        std::string text;
+        char buf[4096];
+        for (size_t n = 0; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+        std::fclose(f);
+        if (text.empty()) return true;
+        long long n = 0;
+        std::vector<int> ids;
+        if (dflash2_json_int(text, "block_size", n)) {
+            // the head callback scores `block_size` rows through native MMVQ (at most kVerifyMaxT) and the window
+            // verifies at most kVerifyMaxT: a checkpoint outside that fails here, not at its first draft
+            if (n < 2 || n > (long long) strata::kernels::kVerifyMaxT + 1) {
+                err = "dflash2: the checkpoint's block_size (" + std::to_string(n) + ") is outside [2, " +
+                      std::to_string(strata::kernels::kVerifyMaxT + 1) + "]";
+                return false;
+            }
+            cfg.block_size = (int) n;
+        }
+        if (dflash2_json_int(text, "mask_token_id", n) && n >= 0) mask_id = (int) n;
+        if (dflash2_json_ints(text, "target_layer_ids", ids)) {
+            cfg.tap_layers = ids;
+            cfg.n_taps = (int) ids.size();
+        }
+        if (dflash2_json_int(text, "selector_top_k", n) && n > 0) cfg.top_k = (int) n;
+        if (dflash2_json_int(text, "sliding_window", n) && n > 1) {
+            cfg.sliding_window = (int) n;
+            cfg.max_context = (int) n - 1;
+        }
+        if (dflash2_json_int(text, "hidden_size", n) && n > 0) cfg.draft_hidden = (int) n;
+        if (dflash2_json_int(text, "vocab_size", n) && n > 0 && n > cfg.vocab) cfg.vocab = n;
+        float eps = 0.0f;
+        if (dflash2_json_float(text, "rms_norm_eps", eps) && eps > 0.0f) cfg.rms_eps = eps;
+        if (dflash2_json_float(text, "rope_theta", eps) && eps > 0.0f) cfg.rope_theta = eps;
+        if (cfg.tap_layers.size() != (size_t) cfg.n_taps || cfg.n_taps <= 0) {
+            err = "dflash2: the checkpoint's target_layer_ids list is empty";
+            return false;
+        }
+        return true;
+    }
+
+    /// Load the checkpoint on `dev` and size the buffers the engine hands it.  Call before the VRAM expert tier is
+    /// sized (the backend allocates ~1.26 GB: 884 MB of fp16 weights, 254 MB of selector codebooks, its 42 MB
+    /// context ring and its logits buffer).
+    bool init(const std::string& dir, int dev, const strata::core::ModelGeometry& g, int64_t model_vocab,
+              int block_override, int max_rows, std::string& err) {
+        cfg.model_dir = dir;
+        cfg.device = dev < 0 ? 0 : dev;
+        device = cfg.device;
+        hc = g.hc;
+        n_layers = g.n_layers;
+        n_embd = g.n_embd;
+        staging_rows = std::max(256, max_rows);
+        if (!read_config(dir, err)) return false;
+        if (block_override >= 2) cfg.block_size = block_override;   // --dflash2-block wins over the checkpoint's
+        {
+            std::error_code ec;
+            if (!std::filesystem::exists(std::filesystem::path(dir) / "model.safetensors", ec)) {
+                err = "dflash2: " + dir + "/model.safetensors is missing";
+                return false;
+            }
+        }
+        // the drafter reads the target's own hidden states, so its two hidden sizes ARE the target's
+        cfg.target_hidden = (int) n_embd;
+        cfg.hc_streams = (int) hc;
+        if (cfg.draft_hidden != (int) n_embd) {
+            err = "dflash2: the checkpoint's hidden_size (" + std::to_string(cfg.draft_hidden) +
+                  ") is not the target's n_embd (" + std::to_string(n_embd) + ")";
+            return false;
+        }
+        // The candidates are ids below the checkpoint's own vocab_size, and the backend checks that number against
+        // config.json; the target's head must be at least that wide for the callback to score them.
+        n_vocab = cfg.vocab;
+        if (model_vocab < cfg.vocab) {
+            err = "dflash2: the model's vocabulary (" + std::to_string(model_vocab) +
+                  ") is smaller than the checkpoint's (" + std::to_string(cfg.vocab) + ")";
+            return false;
+        }
+        const strata::core::OnDevice on_dev(device);
+        if (!d2.load(cfg, err)) return false;
+        slots = d2.slots();
+        if (d2.mask_token_id() >= 0) mask_id = d2.mask_token_id();   // the backend's own reading of the checkpoint
+        if (slots < 1) {
+            err = "dflash2: the checkpoint's block_size is 1: it proposes nothing";
+            return false;
+        }
+        if (cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) != cudaSuccess) {
+            err = "dflash2: cannot create its copy stream";
+            return false;
+        }
+        const size_t rows = (size_t) staging_rows * (size_t) (hc * n_embd);
+        if (cudaMalloc((void**) &gather, rows * (size_t) cfg.n_taps * sizeof(float)) != cudaSuccess) {
+            err = "dflash2: its tap buffer does not fit on CUDA" + std::to_string(device);
+            return false;
+        }
+        if (cudaMalloc((void**) &block_embeds, (size_t) cfg.block_size * (size_t) n_embd * sizeof(float)) !=
+                cudaSuccess ||
+            cudaMalloc((void**) &block_ids, (size_t) cfg.block_size * sizeof(int32_t)) != cudaSuccess) {
+            err = "dflash2: its block buffers do not fit on CUDA" + std::to_string(device);
+            return false;
+        }
+        on = true;
+        return true;
+    }
+
+    /// The target's embedding and head.  `w`/`h` are the ones the drafter's card holds (with a layer split the last
+    /// stage's, as the MTP's bind takes them).
+    bool bind(const strata::core::WeightTable& w, const strata::core::NativeHead* h, std::string& err) {
+        if (!on) return true;
+        wt = &w;
+        head = h;
+        const strata::core::OnDevice on_dev(device);
+        if (h == nullptr || !h->loaded()) {
+            err = "dflash2: it needs the target's head (--native-head): the selector's candidates are scored by it";
+            return false;
+        }
+        const size_t xq = (size_t) cfg.block_size * (size_t) (n_embd / 32) * 36;
+        if (cudaMalloc((void**) &head_xq, xq) != cudaSuccess) {
+            err = "dflash2: the head callback's scratch does not fit";
+            return false;
+        }
+        // the mask rows never change: gather them once (row 0 is the anchor, gathered per block)
+        std::vector<int32_t> ids((size_t) cfg.block_size - 1, mask_id);
+        if (cudaMemcpyAsync(block_ids + 1, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, cs) !=
+                cudaSuccess ||
+            !gather_rows(block_ids + 1, (int) ids.size(), block_embeds + (size_t) n_embd, err)) {
+            return false;
+        }
+        if (cudaStreamSynchronize(cs) != cudaSuccess) {
+            err = "dflash2: the mask rows could not be gathered";
+            return false;
+        }
+        d2.set_target_head(&Dflash2Driver::head_run, this);
+        return true;
+    }
+
+    /// Rows of the target's token embedding for `n` device token ids into `out` (n rows of n_embd floats).
+    bool gather_rows(const int32_t* dev_ids, int n, float* out, std::string& err) {
+        if (const strata::core::NativeEmbed* ne = strata::core::native_embed()) {
+            ne->gather_dev(dev_ids, n, out, cs);
+            return true;
+        }
+        const strata::core::WeightRef* w = wt != nullptr ? wt->find("token_embd.weight") : nullptr;
+        if (w == nullptr || w->codebook_iq4nl || (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8)) {
+            err = "dflash2: token_embd.weight is missing or not an S2/S4/S8 tensor";
+            return false;
+        }
+        const auto* codes = (const uint8_t*) w->data;
+        const auto* scales = (const float*) (codes + w->codes_bytes);
+        const auto* offsets = w->has_offset ? (const float*) (codes + w->codes_bytes + w->scales_bytes) : nullptr;
+        const uint64_t row_codes = (uint64_t) (w->ne0 / (8 / w->code_bits));
+        const uint64_t row_groups = (uint64_t) (w->ne0 / w->group_elems);
+        strata::kernels::embedding_gather_dev(codes, scales, offsets, dev_ids, n, w->ne0, w->code_bits, w->code_bias,
+                                              w->group_elems, row_codes, row_groups, out, cs);
+        return true;
+    }
+
+    /// Hand `v` (which runs layers [lb, le)) the taps it owns.  `parity` is the window parity it serves: the two
+    /// parities of one stage hold their own buffers, and a tap index belongs to the FIRST capture point of a
+    /// (kind, parity) that can see it - so no index is ever read from a capture point that did not produce it (a
+    /// second verifier covering the same layers, as --pipeline-windows' odd windows and split_same's stand-in do,
+    /// then owns only what the first one does not).  Call after its init and before its first window.
+    bool install(strata::core::Verifier& v, int64_t lb, int64_t le, int parity, std::string& err) {
+        if (!on) return true;
+        Dflash2TapOwner o;
+        o.kind = 0;
+        o.parity = parity;
+        o.ver = &v;
+        o.device = v.device();
+        o.stride = std::max(1, v.max_t());
+        if (!pick_layers(o, lb, le)) return true;
+        {
+            const strata::core::OnDevice on_dev(o.device);
+            const size_t row = (size_t) (hc * n_embd);
+            if (cudaMalloc((void**) &o.buf, row * (size_t) o.stride * o.layers.size() * sizeof(float)) != cudaSuccess) {
+                err = "dflash2: a stage's tap buffer does not fit on CUDA" + std::to_string(o.device);
+                return false;
+            }
+        }
+        owners.push_back(std::move(o));
+        owners.back().ver->set_dflash2_taps(owners.back().layers.data(), (int) owners.back().layers.size(),
+                                            owners.back().buf);
+        return true;
+    }
+
+    /// The same for the BATCHED prompt path: `p` (which runs layers [lb, le)) captures the chunk's tail rows of the
+    /// taps it owns, up to `cap` rows (the newest positions).  Call after its init and before its first chunk.  The
+    /// chunks overlap on the stages, so each stage's buffer holds one capture slot per chunk the pipeline can still
+    /// have in flight through it - its own stage count (Prefill::set_dflash2_taps / dflash2_tap_ordinal).
+    bool install_prefill(strata::prefill::Prefill& p, int64_t lb, int64_t le, int64_t cap, int dev, std::string& err) {
+        if (!on) return true;
+        Dflash2TapOwner o;
+        o.kind = 1;
+        o.parity = 0;
+        o.pf = &p;
+        o.device = dev;   // the Prefill's own card: its tap copy writes there
+        o.stride = (int) std::max<int64_t>(1, std::min<int64_t>(cap, (int64_t) cfg.max_context));
+        o.capture_slots = std::max(1, p.stage_count());
+        if (!pick_layers(o, lb, le)) return true;
+        {
+            const strata::core::OnDevice on_dev(o.device);
+            const size_t row = (size_t) (hc * n_embd);
+            const size_t bytes = row * (size_t) o.stride * o.layers.size() * (size_t) o.capture_slots * sizeof(float);
+            if (cudaMalloc((void**) &o.buf, bytes) != cudaSuccess) {
+                err = "dflash2: the prompt path's tap buffer does not fit on CUDA" + std::to_string(o.device);
+                return false;
+            }
+        }
+        owners.push_back(std::move(o));
+        owners.back().pf->set_dflash2_taps(owners.back().layers.data(), (int) owners.back().layers.size(),
+                                           owners.back().buf, owners.back().stride, (int64_t) (hc * n_embd));
+        return true;
+    }
+
+    /// Is `slot` already owned by a capture point of the same kind and parity?  A capture point that cannot be the
+    /// one that produced a window's (or a chunk's) rows must not claim them.
+    bool slot_taken(int kind, int parity, int slot) const {
+        for (const Dflash2TapOwner& o : owners) {
+            if (o.kind != kind || o.parity != parity) continue;
+            for (int s : o.slot)
+                if (s == slot) return true;
+        }
+        return false;
+    }
+
+    /// The taps whose COMPLETED residual this capture point writes: for a verifier the layer it runs, `done + 1`
+    /// (and the model's last layer, which no successor folds, is written by that layer's own post() - hence the
+    /// clamp); for a Prefill the layer itself, `done` (its own layer loop writes it).  A tap another capture point
+    /// of the same kind and parity already owns is skipped.  False: none of them.
+    bool pick_layers(Dflash2TapOwner& o, int64_t lb, int64_t le) {
+        for (int k = 0; k < cfg.n_taps; ++k) {
+            const int64_t done = (int64_t) cfg.tap_layers[(size_t) k];
+            const int64_t capture_layer =
+                o.kind == 1 ? done : std::min<int64_t>(done + 1, std::max<int64_t>(0, n_layers - 1));
+            if (capture_layer < lb || capture_layer >= le) continue;
+            if (slot_taken(o.kind, o.parity, k)) continue;
+            o.layers.push_back(cfg.tap_layers[(size_t) k]);
+            o.slot.push_back(k);
+        }
+        return !o.layers.empty();
+    }
+
+    /// Every tap index must be produced by some capture point of the decode path (kind 0) and by one of the prompt
+    /// path (kind 1): a slot no owner writes would be appended as uninitialised memory.
+    bool check_coverage(std::string& err) const {
+        for (int kind = 0; kind < 2; ++kind) {
+            for (int k = 0; k < cfg.n_taps; ++k) {
+                bool seen = false;
+                for (const Dflash2TapOwner& o : owners) {
+                    if (o.kind != kind) continue;
+                    for (int s : o.slot)
+                        if (s == k) seen = true;
+                }
+                if (!seen) {
+                    err = "dflash2: tap " + std::to_string(k) + " (completed target layer " +
+                          std::to_string(cfg.tap_layers[(size_t) k]) + ") has no " +
+                          (kind == 0 ? "verifier" : "prompt path") +
+                          " to capture it: the layer split's stages do not cover every tap layer's successor";
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// After a capture point of `kind` and `parity` produced rows: its first `n_rows` are positions
+    /// [base_pos, base_pos + n_rows) of the drafter's feature history.  Only the capture points that served that
+    /// window parity are read (see install), and nothing is appended when the drafter has no taps of that kind.
+    /// `ordinal` names the prompt chunk the rows came from (0: a verify window, whose capture buffers hold the
+    /// single slot 0 - see append_chunk): a prompt capture point's rows live in slot `ordinal % o.capture_slots`
+    /// of its buffer, so the chunks that are still in flight on the stages never overwrite one another.  `captured`
+    /// is the chunk's own row count (kind 1 only; 0: a verify window): a prompt capture point holds that chunk's
+    /// newest min(captured, its own cap) rows at the FRONT of its slot, and the caps need not be equal (a stage
+    /// whose chunk grew back keeps the smaller buffer it was installed with), so its rows for `base_pos` start
+    /// `min(captured, o.stride) - n_rows` rows into the slot.
+    bool append(int n_rows, int64_t base_pos, int kind, int parity, std::string& err, int64_t ordinal = 0,
+                int64_t captured = 0) {
+        if (!on || n_rows <= 0) return true;
+        const size_t row = (size_t) (hc * n_embd);
+        const strata::core::OnDevice on_dev(device);
+        // Pack each batch at its actual row count. Capture buffers have a fixed
+        // capacity, but append_features reads tightly packed [tap][row][HC*hidden].
+        // Bound staging even when a prompt chunk holds thousands of rows.
+        for (int first = 0; first < n_rows; first += staging_rows) {
+            const int count = std::min(staging_rows, n_rows - first);
+            for (const Dflash2TapOwner& o : owners) {
+                if (o.kind != kind || o.parity != parity) continue;
+                const int64_t slot = o.capture_slots > 0 ? ordinal % o.capture_slots : 0;
+                // kind 1: this owner's copy of the newest `n_rows` rows (kind 0 reads its rows from row 0)
+                const int64_t skip = captured > 0 ? std::min<int64_t>(captured, o.stride) - n_rows : 0;
+                for (size_t k = 0; k < o.layers.size(); ++k) {
+                    const float* src =
+                        o.buf + (((size_t) slot * o.layers.size() + k) * (size_t) o.stride + (size_t) skip +
+                                 (size_t) first) * row;
+                    float* dst = gather + (size_t) o.slot[k] * (size_t) count * row;
+                    if (cudaMemcpyAsync(dst, src, (size_t) count * row * sizeof(float), cudaMemcpyDefault, cs) !=
+                        cudaSuccess) {
+                        err = "dflash2: the tap rows could not be copied to the drafter's card";
+                        return false;
+                    }
+                }
+            }
+            if (cudaStreamSynchronize(cs) != cudaSuccess) {
+                err = "dflash2: the tap copy failed";
+                return false;
+            }
+            // the staging buffer holds exactly `count` packed rows per tap (stride 0 = packed at n_rows)
+            if (!d2.append_features(gather, count, 0, base_pos + first, err)) return false;
+        }
+        return true;
+    }
+
+    /// A batched prompt chunk of `n_rows` positions [p0, p0 + n_rows): the ring takes the newest rows EVERY capture
+    /// point holds - `n_rows` capped by the SMALLEST owner cap, so no owner is read past the rows it wrote (the caps
+    /// differ when a stage's chunk grew back into a buffer installed for a smaller one).  `ordinal` is the chunk's
+    /// ordinal on the prompt path (the reporting stage's Prefill::dflash2_tap_ordinal): it names the capture slot
+    /// every stage wrote this chunk's rows into, so the stages' overlap cannot be mistaken for another chunk's rows.
+    bool append_chunk(int64_t n_rows, int64_t p0, int64_t ordinal, std::string& err) {
+        if (!on || n_rows <= 0) return true;
+        int64_t cap = 0;
+        for (const Dflash2TapOwner& o : owners) {
+            if (o.kind != 1 || o.parity != 0 || o.stride <= 0) continue;
+            cap = cap == 0 ? o.stride : std::min(cap, (int64_t) o.stride);
+        }
+        if (cap <= 0) return true;
+        const int64_t n = std::min<int64_t>(n_rows, cap);
+        const int64_t base_pos = p0 + n_rows - n;
+        // A chunk larger than the sliding window omitted only obsolete rows.
+        // Discard the preceding ring before starting this contiguous tail.
+        if (d2.ctx_len() > 0 && base_pos > d2.next_pos()) d2.reset();
+        return append((int) n, base_pos, 1, 0, err, ordinal, n_rows);
+    }
+
+    /// One block for the window that starts at `start_pos`, whose row 0 is the committed token `anchor`: fill
+    /// `tokens`/`probs` (one entry per slot) and, under STRATA_SPEC_PROB, the slots' q lists.  Greedy unless the
+    /// caller asked for the sampled mode.
+    bool propose(int32_t anchor, int64_t start_pos, float temperature, bool greedy, uint64_t seed, std::string& err) {
+        if (!on) return true;
+        const strata::core::OnDevice on_dev(device);
+        // the block's row 0: the anchor's embedding (the mask rows were gathered once at bind)
+        const int32_t a32 = anchor;
+        if (cudaMemcpyAsync(block_ids, &a32, sizeof a32, cudaMemcpyHostToDevice, cs) != cudaSuccess ||
+            !gather_rows(block_ids, 1, block_embeds, err)) {
+            return false;
+        }
+        if (cudaStreamSynchronize(cs) != cudaSuccess) {   // the drafter's own stream reads it
+            err = "dflash2: the anchor's embedding failed";
+            return false;
+        }
+        const float* uni = nullptr;
+        if (!greedy) {
+            uniforms.resize((size_t) slots);
+            for (int j = 0; j < slots; ++j)
+                uniforms[(size_t) j] =
+                    dflash2_philox_uniform(seed, (uint64_t) (start_pos + 1 + j) | strata::core::kSpecCtrDraft);
+            uni = uniforms.data();
+        }
+        if (!d2.propose(anchor, start_pos, block_embeds, temperature, greedy, uni, prop, err)) return false;
+        const int n = std::max(0, std::min(prop.n_slots, slots));
+        tokens.resize((size_t) n);
+        probs.assign((size_t) n, 1.0f);
+        n_q = 0;
+        q_rows.clear();
+        const int nc = std::max(0, std::min(prop.n_cand, strata::core::kSpecQEntries));
+        if (!greedy && n > 0 && nc > 0) {
+            q_rows.assign((size_t) n * strata::core::kSpecQStride, -1);
+            n_q = n;
+        }
+        for (int j = 0; j < n; ++j) {
+            tokens[(size_t) j] = prop.tokens[j];
+            if (n_q == 0) continue;
+            int32_t* row = q_rows.data() + (size_t) j * strata::core::kSpecQStride;
+            float* pr = (float*) (row + strata::core::kSpecQEntries);
+            for (int i = 0; i < nc; ++i) {
+                const size_t at = (size_t) j * (size_t) prop.n_cand + (size_t) i;
+                row[i] = prop.cand[at];
+                pr[i] = prop.q[at];
+                if (row[i] == prop.tokens[j]) probs[(size_t) j] = prop.q[at];
+            }
+        }
+        return true;
+    }
+
+    /// Drop the feature ring: the next append starts a new history at its own position (a conversation resumed from
+    /// a cache, a new request).  The weights and the buffers stay.
+    void reset() {
+        if (!on) return;
+        const strata::core::OnDevice on_dev(device);
+        d2.reset();
+    }
+};
 
 // STRATA_PIPE_BYIELD_NODRAIN=1 (read once; off by default): with the pipelined groups, a BYIELD that reaches the main
 // loop is dropped without draining the groups first.  A pipelined read never gives way (batch_read_piece), so the
@@ -705,6 +1283,13 @@ struct Options {
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
+    /// --dflash2 DIR (opt-in): the DFlash2 block drafter's checkpoint directory (config.json + model.safetensors).
+    /// It reads the target's own hidden states at five layers and proposes up to `block_size - 1` tokens per window;
+    /// the verify window still decides every token (see Dflash2Driver above).
+    std::string dflash2;
+    /// --dflash2-block N: the block size (0 = the checkpoint's, 8).  The block proposes N - 1 slots, so --spec must
+    /// be N or more for every slot to be verified.
+    int dflash2_block = 0;
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
@@ -987,6 +1572,11 @@ void usage() {
                  "                       (default) or one per stream (llama.cpp's MTP graph)\n"
                  "  --mtp-q4 all|proj|head  opt-in: the draft layer's projections and/or draft head as 4-bit copies\n"
                  "  --mtp-draft-vocab FILE  opt-in: the draft head's token subset (default <mtp>/draft_vocab.bin)\n"
+                 "  --dflash2 DIR        opt-in: the DFlash2 block drafter (a checkpoint directory with config.json and\n"
+                 "                       model.safetensors).  It reads the target's own hidden states at five layers and\n"
+                 "                       proposes up to 7 tokens per window; the verify window still decides every token.\n"
+                 "                       Needs --spec 2 or more, the native head, and --pipeline-windows 0 or 1.\n"
+                 "  --dflash2-block N    the block size (default: the checkpoint's, 8): it proposes N - 1 tokens\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -1912,6 +2502,11 @@ std::string conversation_disk_identity_key(const Options& o, const strata::core:
     put_path("mtp", o.mtp);
     putn("mtp_on", o.mtp.empty() ? 0 : 1);
     putn("mtp_window", (long long) o.mtp_window);
+    // --dflash2: the drafter's checkpoint and block size are part of the run's identity (a different drafter changes
+    // the drafts, never the tokens, but a cache built beside another one must not be reused blindly)
+    put_path("dflash2", o.dflash2);
+    putn("dflash2_on", o.dflash2.empty() ? 0 : 1);
+    putn("dflash2_block", (long long) o.dflash2_block);
     put("kv", o.kv);
     const char* kv_rot = std::getenv("STRATA_KV_ROT");   // the opt-in Hadamard rotation over int8 K/V
     putn("kv_rot", kv_rot != nullptr && kv_rot[0] == '1' ? 1 : 0);
@@ -2735,6 +3330,8 @@ int main(int argc, char** argv) {
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
         else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
+        else if (a == "--dflash2") o.dflash2 = next("--dflash2");
+        else if (a == "--dflash2-block") o.dflash2_block = std::atoi(next("--dflash2-block"));
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") o.adapt_every = std::atoi(next("--adapt-every"));
@@ -4308,6 +4905,35 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // --dflash2's OWN CONTRACT, BEFORE ANY NORMALIZATION.  The DFlash2 block drafter is a SECOND drafter (never a
+    // complement of the MTP), it needs the window path, and its block is bounded by the verify window.  Every one of
+    // these is a hard start-up refusal (exit 2), and it is checked on the RAW flags: the pipeline normalization below
+    // (and every later one) would otherwise turn the offending option off first and leave a run that looks like a
+    // DFlash2 run and is not one.  The checkpoint/config/backend checks stay with the load.
+    if (!o.dflash2.empty()) {
+        const char* batch_mtp_raw_env = std::getenv("STRATA_BATCH_MTP");
+        const bool batch_mtp_raw = o.batch_mtp ||
+                                   (batch_mtp_raw_env != nullptr && batch_mtp_raw_env[0] != '\0' &&
+                                    batch_mtp_raw_env[0] != '0');
+        const char* why = o.spec < 2
+                              ? "it needs --spec T (T >= 2): a window of one token is not speculation"
+                              : !o.mtp.empty() ? "it and --mtp are two drafters for one window"
+                              : batch_mtp_raw ? "it and --batch-mtp are two drafters for one window"
+                              : o.batch >= 2 ? "it needs serial requests; --batch 2 or more is not supported"
+                              : o.pipeline_windows >= 2
+                                    ? "it has no teacher-forced draft chain (--pipeline-windows 2); use 0 or 1"
+                                    : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: --dflash2: %s\n", why);
+            return 2;
+        }
+        if (o.dflash2_block != 0 &&
+            (o.dflash2_block < 2 || o.dflash2_block > (int) strata::kernels::kVerifyMaxT)) {
+            std::fprintf(stderr, "strata generate: --dflash2-block must be between 2 and %d\n",
+                         (int) strata::kernels::kVerifyMaxT);
+            return 2;
+        }
+    }
     strata::core::Verifier::set_commit_async(!multi_gpu);   // see Verifier::set_commit_async
     // --pipeline-windows (opt-in): one conversation's windows with the two stages of a layer split overlapped.  Decided
     // here, before any stage sizes its expert cache (the second verifier per stage and the snapshots are allocated
@@ -4352,7 +4978,8 @@ int main(int argc, char** argv) {
                         : split_devs.empty() ? "it needs a layer split into two or more stages"
                         : split_devs.size() > 1 && o.pipeline_windows == 1 ? "--pipeline-windows 1 needs exactly two stages"
                         : split_devs.size() > 1 && o.adapt_async ? "not with --adapt-async on three or more stages"
-                        : o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
+                        : (o.mtp.empty() && o.dflash2.empty()) || o.spec < 2
+                              ? "it needs the MTP drafter (--mtp) or --dflash2, with --spec 2 or more"
                         : o.batch != 0 ? "not with --batch slots"
                         : o.peer_device >= 1 ? "not with --peer-device"
                         : helpers ? "not with the helper caches (--expert-cache-device1..3, --remote-expert-opt)"
@@ -5396,6 +6023,32 @@ int main(int argc, char** argv) {
             batch_mtp = false;
         }
     }
+
+    // --dflash2 (include/strata/core/dflash2.hpp; Dflash2Driver above): the DFlash2 block drafter.  It is a SECOND
+    // drafter, so it takes the MTP's place rather than sharing a window with it, and it reads the target's hidden
+    // states out of the verify windows, so the loops that teacher-force a draft chain (--pipeline-windows 2, the
+    // chain_launch path) cannot drive it: asked for together, --dflash2 is refused with the reason rather than
+    // silently replaced by something else.  The window path (--pipeline-windows 0 or 1) and the solo loop both work.
+    Dflash2Driver d2;
+    // (its contract was checked on the raw flags, before the normalization: see above)
+    if (!o.dflash2.empty()) {
+        // the drafter reads the last stage's residual and its head, so it lives on that stage's card
+        const strata::core::OnDevice on_d2(last_st ? last_st->dev : -1);
+        if (!d2.init(o.dflash2, last_st ? last_st->dev : strata::core::primary_device(), g, g.n_vocab, o.dflash2_block,
+                     (int) strata::kernels::kVerifyMaxT, err)) {
+            std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
+            return 1;
+        }
+        if (d2.slots > o.spec - 1)
+            std::fprintf(stderr, "strata generate: --dflash2: the block proposes %d slots and --spec %d verifies %d of "
+                                 "them (raise --spec to %d for all of them)\n",
+                         d2.slots, o.spec, o.spec - 1, d2.slots + 1);
+        std::fprintf(stderr, "strata generate: DFlash2 drafter: %d draft layers, %d slots a block, %d taps %s, "
+                             "%.0f MiB on CUDA%d\n",
+                     d2.d2.n_draft_layers(), d2.slots, d2.cfg.n_taps, d2.d2.loaded() ? "loaded" : "NOT loaded",
+                     (double) d2.d2.device_bytes() / 1048576.0, d2.device);
+    }
+
     // The most slots, up to n, whose windows hold at most kVerifyMaxT rows each: n itself up to that, more only as
     // pipelined groups on a layer split - the groups as resolved below (a number given, auto, or the default's one
     // group for --adapt-async 1), dividing the slots, each at most kVerifyMaxT, all at most one group's worth per
@@ -9412,6 +10065,54 @@ int main(int argc, char** argv) {
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+        // --dflash2: the drafter reads the last stage's weights (its embedding) and head, as the MTP does, and every
+        // verifier that runs window layers gets the taps whose completed residual it holds (Dflash2Driver::install).
+        if (d2.on && !d2.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, err)) {
+            std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+            return 1;
+        }
+        if (d2.on) {
+            for (int st = 0; st < n_stages; ++st) {
+                const int64_t lb = st == 0 ? 0 : split_at[(size_t) st - 1];
+                const int64_t le = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
+                if (!d2.install(stage_ver(st), lb, le, 0, err) ||
+                    (pipe && !d2.install(stage_ver_p(st, 1), lb, le, 1, err))) {
+                    std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                    return 1;
+                }
+            }
+            if (split_same && !d2.install(ver_same, 0, g.n_layers, 0, err)) {   // the second stage on the first card
+                std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                return 1;
+            }
+            // the BATCHED prompt path's taps (Prefill::set_dflash2_taps), one Prefill per stage, the same split: a
+            // fresh prompt then feeds the drafter's ring through the batched read (the fast path), not only through
+            // the window read.  A stage's Prefill writes its share on its own card; the drafter reads them from its
+            // own (a cross-card write needs peer access, as the verify taps' cross-card copy does).
+            if (!d2.install_prefill(sp, 0, n_stages > 1 ? split_at[0] : g.n_layers, sp.chunk(),
+                                    n_stages > 1 ? 0 : strata::core::primary_device(), err)) {
+                std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                return 1;
+            }
+            for (int st = 1; st < n_stages; ++st) {
+                GpuStage& gs = *stages[(size_t) st - 1];
+                if (!d2.install_prefill(gs.sp, split_at[(size_t) st - 1],
+                                        st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers, gs.sp.chunk(), gs.dev, err)) {
+                    std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                    return 1;
+                }
+            }
+            // every tap must have a capture point on both paths: a slot no owner writes would be appended as
+            // uninitialised device memory
+            if (!d2.check_coverage(err)) {
+                std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: DFlash2 drafter: %d slots a block, %d taps on %zu verifier%s, "
+                                 "%.0f MiB of weights on CUDA%d\n",
+                         d2.slots, d2.cfg.n_taps, d2.owners.size(), d2.owners.size() == 1 ? "" : "s",
+                         (double) d2.d2.device_bytes() / 1048576.0, d2.device);
+        }
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp) {
@@ -9543,7 +10244,7 @@ int main(int argc, char** argv) {
                     const strata::core::OnDevice on(v.device());
                     if (!v.capture_all(e)) return false;
                 }
-            if (!mtp.prepare_prefill(e)) return false;
+            if (use_mtp && !mtp.prepare_prefill(e)) return false;
             if (o.pipeline_windows >= 2 && pl_snap_ok && !mtp.prepare_chain(e)) return false;
             const strata::core::OnDevice on(mtp.device());
             for (cudaEvent_t& ev : pl_mtp_ev)
@@ -9577,8 +10278,10 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(stage_ver_p(st, 0).device());
                 cudaStreamSynchronize(stage_ver_p(st, 0).stream());
             }
-            const strata::core::OnDevice on(mtp.device());
-            cudaStreamSynchronize(mtp.stream());
+            if (use_mtp) {
+                const strata::core::OnDevice on(mtp.device());
+                cudaStreamSynchronize(mtp.stream());
+            }
         };
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
@@ -9941,6 +10644,10 @@ int main(int argc, char** argv) {
                 if (!o.mtp.empty()) {
                     for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
                     files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
+                }
+                if (!o.dflash2.empty()) {   // --dflash2: the drafter's checkpoint, as the MTP's runtime directory is
+                    files.push_back({"dflash2 model.safetensors", o.dflash2 + "/model.safetensors"});
+                    files.push_back({"dflash2 config.json", o.dflash2 + "/config.json"});
                 }
                 uint64_t fp = 0;
                 // each file is one blocking read of at most 2 MiB (head and tail): announced before it starts
@@ -10842,6 +11549,13 @@ int main(int argc, char** argv) {
                                                  "runs: %s\n", why);
                     }
                 }
+            }
+            // --dflash2: this chunk's tail feeds the drafter's feature ring (the batched prompt path's own taps).
+            // The ordinal is the reported stage's, not the first stage's (that one is a chunk or more ahead, so its
+            // own would name a slot this chunk's rows are not in).
+            if (d2.on && e.empty()) {
+                const int64_t tap_ord = (multi_gpu ? stages.back()->sp : sp).dflash2_tap_ordinal();
+                if (!d2.append_chunk(T, p0, tap_ord, e)) return false;
             }
             if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
@@ -14320,6 +15034,11 @@ int main(int argc, char** argv) {
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
             if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
+            // DFlash2: the drafter's feature ring is not part of the session (it cannot be checkpointed), so a request
+            // starts it fresh at the first position this request's window path processes - the reused prefix of a
+            // conversation cache feeds no features, and the proposals before the ring fills have no target context.
+            // The target's tokens are unaffected either way: the verify window decides every one of them.
+            if (d2.on) d2.reset();
             tr("request", n, geni ? 1 : 0);
             req_times = ReqTimes{};
             if (use_mtp) mtp.set_prompt_len(n);
@@ -14454,12 +15173,14 @@ int main(int argc, char** argv) {
                             if (nonfinite_hit(v, "prompt")) return fail("non-finite logits (#879)");
                             const Win& w = wins[f1];
                             for (int t = 0; t < w.T; ++t) nx[(size_t) t] = (int32_t) cur[(size_t) (w.q + t + 1)];
-                            if (!mtp.prefill(v.final_R(0), nx.data(), w.T, w.q, e, false)) return fail(e);
-                            {
+                            if (use_mtp && !mtp.prefill(v.final_R(0), nx.data(), w.T, w.q, e, false)) return fail(e);
+                            // DFlash2: every row of a prompt window is committed, so all of them feed the ring
+                            if (d2.on && !d2.append(w.T, w.q, 0, (int) (f1 & 1), e)) return fail(e);
+                            if (use_mtp) {   // the drafter's rows for this parity are in: the next window waits for them
                                 const strata::core::OnDevice on(mtp.device());
                                 cudaEventRecord(pl_mtp_ev[f1 & 1], mtp.stream());
+                                pl_mtp_live[f1 & 1] = true;
                             }
-                            pl_mtp_live[f1 & 1] = true;
                             pp_reached = w.q + w.T;   // #471
                             ++f1;
                         } else if (!e.empty()) return fail(e);
@@ -14521,7 +15242,11 @@ int main(int argc, char** argv) {
                     }();
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
-                    if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+                    // DFlash2: a prompt window commits every row, so the drafter's ring takes all of them
+                    if (!ver.commit(T, e) ||
+                        (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) ||
+                        (d2.on && !d2.append(T, q, 0, 0, e)))
+                        return false;
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -16285,9 +17010,32 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
+            // --dflash2: one block for the window that starts at `pos`, whose row 0 is the committed token `anchor`.
+            // Its slots land in the loop's own `drafts`/`dprob`, so the window is built from them as from the MTP's
+            // drafts.  Greedy unless this request's coupled / probabilistic mode asked for a sampled path.
+            const bool d2_sampled = strata::core::coupled_draft_env() && !req_sp.greedy && req_sp.temperature > 0.0f &&
+                                    req_sp.temperature >= strata::core::spec_min_temp();
+            auto d2_block = [&](int32_t anchor, int64_t pos) -> bool {
+                if (!d2.propose(anchor, pos, d2_sampled ? req_sp.temperature : 0.0f, !d2_sampled, req_sp.seed, err))
+                    return false;
+                for (size_t j = 0; j < d2.tokens.size() && j < drafts.size(); ++j) {
+                    drafts[j] = d2.tokens[j];
+                    dprob[j] = d2.probs[j];
+                }
+                return true;
+            };
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
-                if (use_mtp && req_spec_min_p > 0.0) {
+                if (d2.on) {   // DFlash2: the slots one block proposes, and --spec-min-p's early stop over their q
+                    T = 1 + std::min(d2.slots, o.spec - 1);
+                    if (req_spec_min_p > 0.0) {
+                        int k = 0;
+                        while (k < (int) d2.probs.size() && k < o.spec - 1 &&
+                               dprob[(size_t) k] >= (float) req_spec_min_p)
+                            ++k;
+                        T = 1 + k;
+                    }
+                } else if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
@@ -16506,6 +17254,10 @@ int main(int argc, char** argv) {
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
                 if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                // DFlash2 under STRATA_SPEC_PROB: the block's per-slot conditional q, judged by rejection sampling
+                // (a point-mass block, the greedy case, sets no q and keeps the exact-match rule)
+                if (d2.on && d2.n_q > 0 && !from_sfx && !first_window && T_mtp > 1 && strata::core::spec_prob_env())
+                    ver.set_spec_q(d2.q_rows.data(), std::min(d2.n_q, T_mtp - 1));
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -16535,6 +17287,12 @@ int main(int argc, char** argv) {
                         a = i;
                         break;
                     }
+                // DFlash2: the window's first a + 1 rows are committed, so they - and only they - are the drafter's
+                // feature history (the ring therefore never holds a rejected row)
+                if (d2.on && !d2.append(a + 1, p, 0, 0, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
@@ -16593,8 +17351,10 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
-                const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                const bool drafted = d2.on ? (eos || produced_n >= max_new || d2_block(outv[(size_t) a], p + a + 1))
+                                            : (!use_mtp || eos || produced_n >= max_new ||
+                                               mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(),
+                                                         (float) req_spec_min_p));
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -17294,6 +18054,19 @@ int main(int argc, char** argv) {
                 return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
             };
         }
+        if (d2.on) {
+            // --dflash2: the BATCHED prompt path's own taps (Prefill::set_dflash2_taps): every chunk feeds the
+            // drafter's ring its newest positions, so a fresh prompt gives the drafter its target context.  The
+            // buffer holds only the rows the ring can still use (the newest `cap`, up to the 2047-cell window).
+            if (!d2.install_prefill(prefill, 0, g.n_layers, prefill.chunk(), strata::core::primary_device(), err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                (void) R_rows;
+                return d2.append_chunk(T, p0, prefill.dflash2_tap_ordinal(), e);
+            };
+        }
         if (!kvg_started) {   // the elastic K/V: every cell this run can reach (no loan)
             kvg_started = true;
             kvg_start(xcache.slots(), {});
@@ -17626,6 +18399,23 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (d2.on && !d2.bind(wt, &native_head, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        if (d2.on && !d2.install(ver, 0, g.n_layers, 0, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        if (d2.on && !d2.install_prefill(prefill, 0, g.n_layers, prefill.chunk(),
+                                        strata::core::primary_device(), err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        if (d2.on && !d2.check_coverage(err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
         mem_mark("the verifier and the drafter's binding");
         ver.set_sampling(sp);   // the CLI's own sampling (until 0.1.19 this loop was always greedy); no penalties here
         if (use_mtp) mtp.set_draft_sampling(sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
@@ -17884,14 +18674,41 @@ int main(int argc, char** argv) {
         }
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
+
+        // --dflash2: one block for the window that starts at `pos`, whose row 0 is the committed token `anchor`.  The
+        // slots land in the loop's own `drafts`/`dprob`, so a window is built from them exactly as from the MTP's
+        // drafts.  Greedy unless the coupled / probabilistic mode asked for a sampled path (the drafter's own Philox
+        // draw, one per slot position).
+        const bool d2_sampled = strata::core::coupled_draft_env() && !sp.greedy && sp.temperature > 0.0f &&
+                                sp.temperature >= strata::core::spec_min_temp();
+        auto d2_block = [&](int32_t anchor, int64_t pos) -> bool {
+            if (!d2.propose(anchor, pos, d2_sampled ? sp.temperature : 0.0f, !d2_sampled, sp.seed, err)) return false;
+            for (size_t j = 0; j < d2.tokens.size() && j < drafts.size(); ++j) {
+                drafts[j] = d2.tokens[j];
+                dprob[j] = d2.probs[j];
+            }
+            return true;
+        };
         while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
             int T = S_mtp;
-            if (use_mtp && o.spec_min_p > 0.0) {
+            if (d2.on) {   // DFlash2: the slots one block proposes, and --spec-min-p's early stop over their q
+                T = 1 + std::min(d2.slots, o.spec - 1);
+                if (o.spec_min_p > 0.0) {
+                    int k = 0;
+                    while (k < (int) d2.probs.size() && k < o.spec - 1 &&
+                           dprob[(size_t) k] >= (float) o.spec_min_p)
+                        ++k;
+                    T = 1 + k;
+                }
+            } else if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
             if (first_window) T = 1;
+            // DFlash2: no block has been proposed before the first window, so it holds one row (the token the prompt
+            // path left); the block for the window after it is proposed at the end of this round.
+            if (d2.on && rounds == 0) T = 1;
             bool from_sfx = false;
             int sfx_match = 0;
             if (o.suffix_draft > 0 && !first_window) {
@@ -17932,7 +18749,7 @@ int main(int argc, char** argv) {
             window[0] = x;
             for (int i = 1; i < T; ++i) {
                 const size_t at = produced.size() - 1 + (size_t) i;
-                int32_t d = from_sfx ? sbuf[(size_t) i - 1] : use_mtp ? drafts[(size_t) i - 1]
+                int32_t d = from_sfx ? sbuf[(size_t) i - 1] : (use_mtp || d2.on) ? drafts[(size_t) i - 1]
                                                     : at < oracle.size() ? (int32_t) oracle[at] : 0;
                 if (i >= T_mtp) d = cbuf[(size_t) (i - T_mtp)];
                 if (o.spec_corrupt > 0 && (++corrupt_counter % o.spec_corrupt) == 0) d = (d + 1) % (int32_t) n_vocab;
@@ -17947,6 +18764,11 @@ int main(int argc, char** argv) {
             if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+            // DFlash2 under STRATA_SPEC_PROB: the block's per-slot conditional q, judged by rejection sampling (a
+            // point-mass block, the greedy case, sets no q and keeps the exact-match rule)
+            if (d2.on && d2.n_q > 0 && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0 &&
+                strata::core::spec_prob_env())
+                ver.set_spec_q(d2.q_rows.data(), std::min(d2.n_q, T_mtp - 1));
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
@@ -17977,6 +18799,12 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            // DFlash2: the window's first a + 1 rows are committed, so they - and only they - are the drafter's
+            // feature history (the ring therefore never holds a rejected row).
+            if (d2.on && !d2.append(a + 1, p, 0, 0, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -18021,8 +18849,11 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
-            const bool drafted = !use_mtp || (int64_t) produced.size() >= max_new ||
-                                 mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+            const bool drafted = d2.on
+                                     ? ((int64_t) produced.size() >= max_new || d2_block(outv[(size_t) a], p + a + 1))
+                                     : (!use_mtp || (int64_t) produced.size() >= max_new ||
+                                        mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(),
+                                                  (float) o.spec_min_p));
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
             if (!drafted) {

@@ -2082,6 +2082,33 @@ double split_help_frac(int64_t T) {
 }
 }  // namespace
 
+// --dflash2: the chunk's completed residual for the tap layers this stage runs (see set_dflash2_taps).  The rows
+// the feature ring can still use are the newest `tap_cap_` positions, and they sit at the front of the chunk's
+// capture slot, so the caller reads min(T, cap) rows from it and appends them at position pos0 + T - min(T, cap).
+// The slot is `tap_ordinal_ % stage_count()`: the buffer must hold every chunk the pipeline can still have in
+// flight through this stage.  A stage hands the next chunk on only after its direct successor's previous chunk
+// returned (run_impl's next_run_ wait), so stage k is at most N - k chunks ahead of the last stage; that last
+// stage, the only reader, appends this stage's slot for a chunk in its on_chunk, before it returns from that
+// chunk's run - and the wait chains back, so this stage cannot start the chunk that would reuse the slot until
+// the read is done.  One slot per stage from here to the last (this stage's own stage count) therefore covers
+// every in-flight chunk, and it is what the caller's buffer must be sized for (see set_dflash2_taps).
+bool Prefill::tap_copy(int64_t layer, int64_t T, const float* R, void* cs, std::string& err) {
+    if (tap_out_ == nullptr || tap_n_ <= 0 || tap_row_ <= 0) return true;
+    const size_t slot = (size_t) (tap_ordinal_ % (int64_t) stage_count());
+    for (int k = 0; k < tap_n_; ++k) {
+        if (tap_layers_[k] != layer) continue;
+        const int64_t n = T < tap_cap_ ? T : tap_cap_;
+        float* dst = tap_out_ + (slot * (size_t) tap_n_ + (size_t) k) * (size_t) tap_cap_ * (size_t) tap_row_;
+        if (cudaMemcpyAsync(dst, R + (size_t) (T - n) * (size_t) tap_row_,
+                            (size_t) n * (size_t) tap_row_ * sizeof(float), cudaMemcpyDeviceToDevice,
+                            (cudaStream_t) cs) != cudaSuccess) {
+            err = "prefill: the DFlash2 tap copy failed";
+            return false;
+        }
+    }
+    return true;
+}
+
 namespace {
 // APR: the down projections' sign vectors on the current device (the peer's or the helper's), one per layer,
 // resolved once at setup (hadamard_device_signs: a mutex and, the first time on that device, a cudaMalloc) into
@@ -2479,11 +2506,24 @@ int Prefill::stage_count() const {
     for (const Prefill* p = next_; p != nullptr; p = p->next_) ++stages;
     return stages;
 }
+int64_t Prefill::tap_chain_chunk() const {
+    bool taps = false;
+    int64_t chunk = 0;
+    for (const Prefill* p = this; p != nullptr; p = p->next_) {
+        if (p->impl_ != nullptr) chunk = chunk == 0 ? p->impl_->T : std::min(chunk, p->impl_->T);
+        taps = taps || p->tap_out_ != nullptr;
+    }
+    return taps ? chunk : 0;
+}
 int64_t Prefill::plan_chunk(int64_t n) const {
     const double pipe = pipe_value();
     const int stages = stage_count();
     if (pipe <= 0.0 || hand_in_ != nullptr || stages < 2) return 0;
-    return pipeline_chunk(n, impl_->T, stages, pipe > 1.0 ? pipe : 0.0);
+    const int64_t plan = pipeline_chunk(n, impl_->T, stages, pipe > 1.0 ? pipe : 0.0);
+    // --dflash2: a handed chunk must fit every stage that captures prompt taps (see set_dflash2_taps), so the chunk
+    // the engine plans and forces is the one run_impl reads - a plan's chunk grid stays the checkpoints' grid.
+    const int64_t chain = tap_chain_chunk();
+    return chain > 0 && chain < plan ? chain : plan;
 }
 void Prefill::force_chunk(int64_t chunk, bool single, bool planned) {
     force_chunk_ = chunk;
@@ -2834,12 +2874,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         return false;
     }
     const int64_t planned_C = forced > 0 ? 0 : plan_chunk(n);
-    const int64_t C = forced > 0 ? forced : planned_C > 0 ? planned_C : m.T;
-    if (planned_C > 0 && C < std::min(n, m.T)) log_plan(n, C, stage_count());
-    const bool single_chunk = hand_in_ == nullptr ? (forced > 0 ? forced_single : n <= C) : single_chunk_;
+    int64_t C = forced > 0 ? forced : planned_C > 0 ? planned_C : m.T;
+    // --dflash2 (set_dflash2_taps): the chunk must fit every stage of the chain that captures prompt taps.  A later
+    // stage whose buffers are smaller - a runtime relayout halves each participant's chunk on its own - would read a
+    // larger handed chunk in pieces, and the pieces of one handed chunk carry its capture ordinal (one slot, several
+    // captures), so the source reads the smallest chunk the chain takes.  No taps in the chain: exactly as before.
+    const int64_t chain_C = tap_chain_chunk();
+    if (chain_C > 0 && chain_C < C) C = chain_C;
+    // what this run actually reads: the plan's flags describe the plan, and the taps' clamp can chunk a plan's one
+    // chunk or chunk it further, so both flags follow the geometry the run has
+    const bool chunked = C < std::min(n, m.T);
+    if (planned_C > 0 && chunked) log_plan(n, C, stage_count());
+    const bool single_chunk = hand_in_ == nullptr ? (n <= C && (forced == 0 || forced_single)) : single_chunk_;
     // a read the pipe chunked takes no CPU share: its chunks overlap on the stages by design, and which stage won the
     // pool would decide which experts the CPU computed (other bits) - timing, where the chunks are a function of n
-    const bool pipe_chunked = hand_in_ == nullptr ? (forced > 0 ? forced_planned : planned_C > 0 && C < std::min(n, m.T))
+    const bool pipe_chunked = hand_in_ == nullptr ? (forced > 0 ? forced_planned || chunked : planned_C > 0 && chunked)
                                                   : pipe_chunked_;
     const bool helped = single_chunk && bind_stage_helper(n);
     if (helped) std::swap(m.pp, m.help_pp);
@@ -2905,6 +2954,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(C, n - c0), p0 = pos0 + c0;
+        // --dflash2 (set_dflash2_taps): the ordinal that names this chunk's capture slot.  The first stage counts
+        // its run's chunks from 0 - public run() drains the chain before it returns, so no slot of an earlier run
+        // is still read - and hands each chunk's ordinal on to the next stage with the chunk's rows.
+        if (hand_in_ == nullptr) tap_ordinal_ = c0 / C;
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
@@ -5366,6 +5419,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (steered && !cv_fused)   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+                // --dflash2: with half 1 done, the write above leaves layer l's COMPLETED residual in R - what the
+                // drafter's encoder consumes.  This stage captures only the taps whose layers it runs.
+                if (half == 1 && !tap_copy(l, T, m.R, m.cs, err)) return false;
             }
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
@@ -5413,6 +5469,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             next_->hand_pieces_ = hp;
             next_->single_chunk_ = single_chunk;
             next_->pipe_chunked_ = pipe_chunked;
+            next_->tap_ordinal_ = tap_ordinal_;   // --dflash2: the chunk's capture slot (set_dflash2_taps)
             if (handoff_pipe_worker()) {
                 if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
                 next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([this, tokens, c0, T, p0] {

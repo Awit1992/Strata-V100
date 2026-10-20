@@ -562,11 +562,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+    # --dflash2: the DFlash2 block drafter (include/strata/core/dflash2.hpp).  It is a .cu with cuBLAS (its
+    # projections are fp16 GEMMs), so it lives in this CUDA-enabled target and brings the BLAS target with it.
+    src/core/dflash2.cu
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp
     src/core/conversation_disk.cpp src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp
     src/core/conversation_file.cpp src/core/peer_experts.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
+    ${_strata_gpu_blas_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
     target_include_directories(host_graph_launch_test PRIVATE include)
@@ -690,6 +694,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(expert_cache_slot_guard_test PRIVATE strata_engine)
     add_test(NAME expert_cache_slot_guard_test COMMAND expert_cache_slot_guard_test)
     set_tests_properties(expert_cache_slot_guard_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  endif()
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    # The draft residual must preserve values above FP16 range before final normalization.
+    add_executable(dflash2_overflow_test tests/core/dflash2_overflow_test.cu)
+    target_link_libraries(dflash2_overflow_test PRIVATE strata_engine)
+    add_test(NAME dflash2_overflow_test COMMAND dflash2_overflow_test)
+    set_tests_properties(dflash2_overflow_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   endif()
   if(STRATA_BUILD_CONVERSATION_TESTS)
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)

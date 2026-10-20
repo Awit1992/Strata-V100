@@ -158,6 +158,22 @@ public:
     /// Counters of the rejection path (windows judged, drafts kept / offered over its rows with a q list).
     int64_t spec_windows = 0;
 
+    /// DFlash2 TARGET-FEATURE TAPS (include/strata/core/dflash2.hpp): the completed residual of the layer
+    /// `layers[k]` - the value the NEXT layer's hyper-connection read folds into the window's rows - is copied into
+    /// `out + (k * max_t + t) * (hc * n_embd)` for the window's row t.  `out` is device memory of the caller's (the
+    /// drafter gathers the rows it accepts from it) and `layers` host memory; both must outlive the windows.  A layer
+    /// is tapped by the verifier that RUNS THE LAYER AFTER IT (`layers[k] + 1`): the residual of a stage's last layer
+    /// is complete at the first read of the next stage, so that stage's verifier captures it.  A batch window
+    /// captures no taps (no drafter drafts in one).  Null (the default): no taps.
+    void set_dflash2_taps(const int32_t* layers, int n_layers, float* out) {
+        tap_layers_ = layers;
+        tap_n_ = n_layers;
+        tap_out_ = out;
+    }
+    /// How many taps this verifier's own list holds (0: none).  The integration reads it to size the drafter's
+    /// gather of the rows the window accepted.
+    int dflash2_tap_count() const { return tap_n_; }
+
     /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
@@ -442,6 +458,9 @@ private:
     const int32_t* spec_q_ = nullptr;   ///< set_spec_q: the drafter's q rows for the next window (host)
     int spec_nq_ = 0;
     int32_t* d_spec_ = nullptr;          ///< device: kVerifyMaxT draft ids, then kVerifyMaxT q rows
+    const int32_t* tap_layers_ = nullptr;   ///< set_dflash2_taps: the completed layers this verifier taps
+    int tap_n_ = 0;                         ///< ... how many
+    float* tap_out_ = nullptr;              ///< ... and where their rows go ([tap][row][hc * n_embd], device)
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
 #if defined(STRATA_GPU_METAL)

@@ -1147,6 +1147,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // Set by pre() on every call: the window's q8_1 image already exists (QDEDUP made it in pre, or QFUSE's
     // fused GR read made it), so post(l, 0)'s whole-window quantize must not run again (upstream's guards).
     bool q8_image_ready = false;
+    // DFlash2 taps (set_dflash2_taps, include/strata/core/dflash2.hpp): layer `l`'s COMPLETED residual for this
+    // group's rows now lives in R - either because the layer's successor folded its pending write into it (pre, the
+    // usual case) or because the layer applied that write itself (post's last layer and its control-vector case).
+    // Copy it out for the drafter.  A plain device-to-device copy, so it captures with the window's graph.  A batch
+    // window captures nothing: no drafter drafts in one.
+    auto tap_copy = [&](int64_t l, int grp, int64_t n, cudaStream_t cs, std::string& err) -> bool {
+        if (tap_out_ == nullptr || batch_rec_ || tap_n_ <= 0) return true;
+        const int tb = tb_[grp];
+        const size_t row = (size_t) (HC * N);
+        for (int k = 0; k < tap_n_; ++k) {
+            if (tap_layers_[k] != l) continue;
+            if (cudaMemcpyAsync(tap_out_ + ((size_t) k * (size_t) MT + (size_t) tb) * row, R_ + (size_t) tb * row,
+                                (size_t) n * row * sizeof(float), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                err = "verify: the DFlash2 tap copy failed";
+                return false;
+            }
+        }
+        return true;
+    };
 
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     auto pre = [&](int64_t l, int grp) -> bool {
@@ -1287,6 +1306,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
         const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
+        // DFlash2 taps: the read above folded layer l-1's pending write into R, so R now holds layer l-1's completed
+        // residual - the value this layer's mixer is about to read.  Copy it out before anything else writes R.
+        if (l > 0 && !tap_copy(l - 1, grp, n, cs, err)) return false;
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
             static const int dummy = [] { const char* e = std::getenv("STRATA_DUMMY_NODES"); return e != nullptr ? std::atoi(e) : 0; }();
             for (int d = 0; d < dummy; ++d) gpu_noop(cs);
@@ -1999,6 +2021,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     }();
     const bool fuse_head_gr = fuse_head_gr_env && (le_ == g.n_layers) && (head_ != nullptr && head_->loaded()) &&
                               !cvec().covers(g.n_layers - 1);
+    // DFlash2 taps: STRATA_FUSE_HEAD_GR folds the last layer's write into the head's read, which runs after post() -
+    // the layer's completed residual is never materialized in R then, so a tap on it cannot be captured.  Refuse
+    // rather than hand the drafter a stale row.
+    if (fuse_head_gr && tap_out_ != nullptr) {
+        for (int k = 0; k < tap_n_; ++k)
+            if (tap_layers_[k] >= g.n_layers - 1) {
+                err = "verify: a DFlash2 tap on the last layer needs STRATA_FUSE_HEAD_GR=0";
+                return false;
+            }
+    }
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
         // The window's activation rows for the grouped hits: quantized once per layer in group 0's post,
@@ -2145,6 +2177,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
         }
+        // DFlash2 taps: the last layer has no successor to fold its write in, so its completed residual is here.
+        // (Every other layer's tap is taken by its successor's read; a control vector's layer is complete there too.)
+        if (l == g.n_layers - 1 && !tap_copy(l, grp, n, cs, err)) return false;
         return true;
     };
 

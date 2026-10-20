@@ -120,10 +120,14 @@ public:
     /// (pipeline_chunk over chunk(), the stage count and pipe_setting()), or 0 when the pipe is off here (one stage,
     /// value 0, or a later stage) and the buffers' chunk applies.  The engine plans a segment once, on its whole
     /// length, and reads every part of it with force_chunk, so its chunks do not depend on how it is cut into runs.
+    /// A chain that captures --dflash2 prompt taps clamps it to the smallest chunk capacity of its stages (see
+    /// set_dflash2_taps): a handed chunk must fit every later stage, and the plan must be the chunk read.
     int64_t plan_chunk(int64_t n) const;
     /// The next run on this (first) stage only: chunks of `chunk` tokens (at most chunk()) instead of a plan, from
     /// its first token; `single`: the segment is one chunk (the stage helper may bind); `planned`: the chunks came
     /// from a --prefill-pipe plan (such a read takes no CPU share: its chunks overlap on the stages by design).
+    /// Both are the plan's: a run the --dflash2 taps clamp to a smaller chunk than the plan's reports the chunk it
+    /// actually reads (not one chunk when it now takes several, and chunked when the clamp is what chunked it).
     void force_chunk(int64_t chunk, bool single, bool planned);
     /// One log line for a planned segment (the same as a whole read logs when its plan differs from chunk()).
     static void log_plan(int64_t n, int64_t chunk, int stages);
@@ -197,6 +201,32 @@ public:
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
     /// K/V from them.  The prefill stream is synchronized before the call.
     std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;
+
+    /// --dflash2 (Dflash2Driver): the target-feature taps of the BATCHED prompt path.  After a chunk finishes the
+    /// COMPLETED layer `layers[k]` (its hyper-connection write is in R), the chunk's last min(T, cap) rows of the
+    /// residual are copied to the front of the chunk's capture slot, row r of it holding the r-th of them in
+    /// ascending position order - so the rows the feature ring wants (the newest positions) sit at the front.
+    /// The buffer is [slot][tap][cap][row_floats], `stage_count()` slots deep: one slot per chunk the pipeline can
+    /// still have in flight through this stage, which is exactly this stage's own stage count (each stage is at
+    /// most one chunk ahead of the stage after it, so a chunk's rows are overwritten only after the last stage -
+    /// the only reader - has appended them; see dflash2_tap_ordinal).  `out` must be sized for all of them, is
+    /// device memory of the caller's, and `layers` host memory; both must outlive the reads.  A layer this stage
+    /// does not run is not captured (a layer split's stages each get their own buffer).  Null: no taps.
+    /// Set after `set_stage` (the slot count is the stage's, which the caller's buffer must match).
+    void set_dflash2_taps(const int32_t* layers, int n_layers, float* out, int64_t cap, int64_t row_floats) {
+        tap_layers_ = layers;
+        tap_n_ = n_layers;
+        tap_out_ = out;
+        tap_cap_ = cap;
+        tap_row_ = row_floats;
+    }
+
+    /// --dflash2: the ordinal of the chunk this stage has just captured (0 for a run's first chunk).  The first
+    /// stage counts its run's chunks and hands each chunk's ordinal on to the next stage with the chunk's rows, so
+    /// every stage names the same chunk by the same ordinal - and, because public `run` drains the chain before it
+    /// returns, a new run may count from 0 again.  The batched path's consumer (Dflash2Driver::append_chunk) takes
+    /// it from the stage that reported the chunk and reads each capture buffer at `ordinal % its slot count`.
+    int64_t dflash2_tap_ordinal() const { return tap_ordinal_; }
 
     /// STRATA_PREFILL_REFILL_OVERLAP: called at the very end of `run` - every chunk is done, the chunk-scoped
     /// stager and issuer are joined, this stage's final residual has been read, and its compute, expert-copy,
@@ -300,6 +330,19 @@ private:
     std::string next_err_;
     std::future<bool> next_run_;
     int hand_buf_ = 0;
+    // --dflash2: the taps this stage captures (see set_dflash2_taps)
+    const int32_t* tap_layers_ = nullptr;
+    int tap_n_ = 0;
+    float* tap_out_ = nullptr;
+    int64_t tap_cap_ = 0, tap_row_ = 0;
+    /// ... and the ordinal of the chunk it is capturing (see set_dflash2_taps / dflash2_tap_ordinal)
+    int64_t tap_ordinal_ = 0;
+    bool tap_copy(int64_t layer, int64_t T, const float* R, void* cs, std::string& err);
+    /// --dflash2: the smallest chunk capacity among this stage and every stage after it when any of them captures
+    /// prompt taps; 0 when none does (the chunk is then unconstrained by the taps).  One handed chunk larger than a
+    /// later stage's buffers is read there in pieces, and the pieces of one handed chunk share its capture ordinal
+    /// (see dflash2_tap_ordinal) - which would mislabel their rows.
+    int64_t tap_chain_chunk() const;
 
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)

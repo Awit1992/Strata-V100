@@ -45,6 +45,10 @@ This works the same on NVIDIA (CUDA) and AMD (HIP) cards: the same engine, compi
   up to 5 tokens from the earlier copy, but only where its measured acceptance and cost say it pays: code edits 6-11%
   faster, other text unchanged. The drafts are checked like the MTP's, so the output is the same.
 
+The optional [DFlash2 draft model](DFLASH2.md) predicts a block in one pass.
+It uses intermediate target-model features and a candidate selector instead
+of the MTP chain. The target model still checks every proposed token.
+
 ## Reading long texts
 
 **Long texts are read in big pieces** (up to 8,192 tokens - pieces of words - at a time), which is why a long

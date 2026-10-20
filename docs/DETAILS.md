@@ -12,6 +12,19 @@ New here? Start with the [README](../README.md); installing step by step is in [
 
 ---
 
+## Optional DFlash2 draft model
+
+The native engine can load `incoai/Qwen3.8-Flash-Next-DFlash2` with
+`--dflash2 DIR`. It captures the required target-layer features, predicts a
+block, and verifies the candidate selector's path with the target model.
+The accepted prefix supplies the next draft context.
+
+Use `--dflash2-block 4 --spec 4` to compare three draft tokens per step with
+MTP. Do not combine the two draft models. DFlash2 supports serial requests
+and pipeline modes 0 and 1. It rejects batch slots and pipeline mode 2.
+See [DFlash2 operation and acceptance measurements](DFLASH2.md) for the
+checkpoint revision, sampling controls, memory use, and comparison rules.
+
 ## Upstream v0.1.36 in the V100 fork
 
 This update includes upstream releases 0.1.32 through 0.1.36. The upstream source is
