@@ -76,6 +76,13 @@ unadjusted draft logits as `q`. The target sampler still applies the request's
 sampling controls. On rejection, it samples from the residual target
 probability distribution.
 
+All draft positions run through one parallel five-layer pass. GPU kernels
+select the top candidates in vocabulary shards and merge the results.
+The selector then walks one path on the GPU and returns the distribution
+that it used for each choice. Attention uses coalesced query/key loads and
+FP32 reductions. These changes do not replace the model with an MTP chain
+or change its attention mask.
+
 ## Limits and memory
 
 - This path requires the native Flash-Next target and its output projection.

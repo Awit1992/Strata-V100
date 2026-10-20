@@ -22,7 +22,7 @@
 // Nothing here verifies or commits tokens: the caller runs the target over the block and applies the
 // greedy / rejection-sampling rule (core/verify.hpp, core/spec_prob.hpp).
 //
-// Precision (the reference's own scheme): the checkpoint is bf16, so the weights are stored fp16
+// Native precision: the checkpoint is bf16, so the weights are stored fp16
 // (exact for every bf16 value in fp16's range - the loader checks that) and each projection is a
 // cuBLAS fp16 matmul with fp32 accumulation and an FP32 OUTPUT.  Every activation, the residual
 // stream, the context K/V and every elementwise step (norms, RoPE, conv, attention, softmax, silu,
@@ -123,9 +123,6 @@ public:
     /// the caller streams its own staging buffer.
     bool append_features(const float* dev_tap_rows, int64_t n_rows, int64_t tap_stride_rows,
                          int64_t base_pos, std::string& err);
-    /// Drops every ring row at a position >= `keep_pos` (a partial accept that did not commit the
-    /// speculative tail).  No-op when `keep_pos >= next_pos()`.
-    void truncate(int64_t keep_pos);
     int64_t next_pos() const;          ///< the global position the next appended row must have
     int64_t ctx_len() const;           ///< ring rows currently held
 

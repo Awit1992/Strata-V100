@@ -365,7 +365,8 @@ int main() {
         }
         // sampling: q must be the softmax of the row (temperature 1), and the token the drawn index
         if (rc == 0) {
-            const float u = 0.37f;
+            // A non-argmax draw detects accidental integer truncation of the supplied uniform.
+            const float u = 0.99f;
             strata::core::DFlash2Proposal s;
             if (!b.propose(0, ctx_rows, d_emb, 1.0f, /*greedy=*/false, &u, s, err)) {
                 std::fprintf(stderr, "propose (sampling): %s\n", err.c_str());

@@ -701,6 +701,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(dflash2_overflow_test PRIVATE strata_engine)
     add_test(NAME dflash2_overflow_test COMMAND dflash2_overflow_test)
     set_tests_properties(dflash2_overflow_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # The block attention has one writer per output dimension: the keys are split over the block's
+    # warps, so a value pass that let each warp store its own partial sum to the same output is a
+    # race that survives as one warp's mixture.  The private attn_kernel is launched the way the
+    # backend launches it and every row is checked against a CPU double softmax - ring wrap, the
+    # strict 2048 window bound, GQA, head_dim 8..256 (no device: 77).
+    add_executable(dflash2_attention_test tests/core/dflash2_attention_test.cu)
+    target_link_libraries(dflash2_attention_test PRIVATE strata_engine)
+    add_test(NAME dflash2_attention_test COMMAND dflash2_attention_test)
+    set_tests_properties(dflash2_attention_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   endif()
   if(STRATA_BUILD_CONVERSATION_TESTS)
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)

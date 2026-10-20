@@ -50,6 +50,9 @@ constexpr int kThreads = 256;
 constexpr int kChunkRows = 256;         ///< rows of target features converted / projected at once
 constexpr int kTopKThreads = 128;       ///< top-k scan width (the shared merge table is 128 * KMAX)
 constexpr int kTopKMax = kDFlash2MaxTopK;
+constexpr int kSelShards = 16;          ///< top-k shards per logits row (contiguous vocabulary spans)
+constexpr int kMergeThreads = 512;      ///< top-k merge block: one thread per shard entry (>= kSelShards * kTopKMax)
+constexpr int kMergeWarps = kMergeThreads / 32;
 
 // --------------------------------------------------------------------------- small helpers
 
@@ -72,8 +75,6 @@ inline uint16_t bf16_to_f16(uint16_t b) {
     std::memcpy(&f, &u, sizeof f);
     return (uint16_t) __half_as_ushort(__float2half_rn(f));
 }
-
-inline float f16_to_f32(uint16_t h) { return __half2float(__ushort_as_half(h)); }
 
 inline bool env_on(const char* name) {
     const char* v = std::getenv(name);
@@ -693,6 +694,11 @@ __global__ void grouped_conv_kernel(const float* __restrict__ src, const float* 
 /// Non-causal sliding-window attention for the block rows.  Keys are the context ring
 /// (`ctx_len` rows at positions ctx_pos0.., indexed from `ring_start`) followed by the block's own
 /// rows (`n_blk` at q_pos0..).  Visible iff |q_pos - k_pos| < window.
+///
+/// One warp owns one key at a time. Its lanes load contiguous float4 segments and reduce the
+/// query-key dot product across the warp. Value accumulation retains the existing partitioned
+/// reduction: head-sized thread groups visit disjoint keys, then one thread combines their
+/// partials and writes each output dimension.
 __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict__ k_ring,
                             const float* __restrict__ v_ring, const float* __restrict__ k_blk,
                             const float* __restrict__ v_blk, float* __restrict__ out, int n_blk,
@@ -708,8 +714,20 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
     const int kvh = h / gqa;
     const int64_t qpos = q_pos0 + row;
     const float* qrow = q + ((size_t) row * n_q_heads + h) * head_dim;
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    const int nwarp = blockDim.x >> 5;
+    const int nslot = head_dim >> 2;                    // float4 slots in a row (head_dim % 4 == 0)
+    constexpr int kSlots = (kThreads / 4 + 31) / 32;    // head_dim <= kThreads -> at most 2 per lane
 
-    for (int i = tid; i < n_keys; i += blockDim.x) {
+    float4 qv[kSlots];                                  // the query row, hoisted out of the key loop
+#pragma unroll
+    for (int k = 0; k < kSlots; ++k) {
+        const int f = lane + 32 * k;
+        if (f < nslot) qv[k] = *reinterpret_cast<const float4*>(qrow + 4 * f);
+    }
+
+    for (int i = wid; i < n_keys; i += nwarp) {
         const float* krow;
         int64_t kpos;
         if (i < ctx_len) {
@@ -721,14 +739,28 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
             krow = k_blk + ((size_t) j * n_kv_heads + kvh) * head_dim;
         }
         float s = -INFINITY;
-        const int64_t d = qpos - kpos;
+        const int64_t d = qpos - kpos;                  // uniform across the warp: i depends on wid
         if (d < (int64_t) window && d > -(int64_t) window) {
+            float4 a[kSlots];
+#pragma unroll
+            for (int k = 0; k < kSlots; ++k) a[k] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+            for (int k = 0; k < kSlots; ++k) {
+                const int f = lane + 32 * k;
+                if (f < nslot) {
+                    const float4 kv = *reinterpret_cast<const float4*>(krow + 4 * f);
+                    a[k].x = fmaf(qv[k].x, kv.x, a[k].x);
+                    a[k].y = fmaf(qv[k].y, kv.y, a[k].y);
+                    a[k].z = fmaf(qv[k].z, kv.z, a[k].z);
+                    a[k].w = fmaf(qv[k].w, kv.w, a[k].w);
+                }
+            }
             float acc = 0.0f;
-            for (int t = 0; t < head_dim; ++t)
-                acc = fmaf(qrow[t], krow[t], acc);
-            s = acc * scale;
-        }
-        scores[i] = s;
+#pragma unroll
+            for (int k = 0; k < kSlots; ++k) acc += (a[k].x + a[k].y) + (a[k].z + a[k].w);
+            s = warp_sum_f(acc) * scale;                // every lane takes this branch, so the
+        }                                               // full mask is live; the total is in lane 0
+        if (lane == 0) scores[i] = s;
     }
     __syncthreads();
     float m = -INFINITY;
@@ -742,7 +774,7 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
     }
     sum = block_sum_f(sum, red);       // its last __syncthreads makes every write visible
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-    const int per = blockDim.x / head_dim;      // head_dim <= blockDim.x
+    const int per = blockDim.x / head_dim;
     const int d = tid % head_dim;
     const int part = tid / head_dim;
     float acc = 0.0f;
@@ -758,13 +790,13 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
     vred[part * head_dim + d] = acc;
     __syncthreads();
     if (tid < head_dim) {
-        float s = 0.0f;
-        for (int p = 0; p < per; ++p) s += vred[p * head_dim + tid];
-        out[((size_t) row * n_q_heads + h) * head_dim + tid] = s;
+        float sum_value = 0.0f;
+        for (int p = 0; p < per; ++p) sum_value += vred[p * head_dim + tid];
+        out[((size_t) row * n_q_heads + h) * head_dim + tid] = sum_value;
     }
 }
 
-/// torch.topk's order: NaN first, then descending value, ties to the lower id.  A NaN logit must
+/// Native top-k order: NaN first, then descending value, ties to the lower id. A NaN logit must
 /// still yield a REAL id - a sentinel here would index the codebooks out of bounds downstream.
 __device__ __forceinline__ bool topk_better(float a, int32_t ai, float b, int32_t bi) {
     const bool an = isnan(a), bn = isnan(b);
@@ -781,23 +813,30 @@ __device__ __forceinline__ void warp_best_f(float& v, int32_t& id) {
     }
 }
 
-/// Per-row top-k over `limit` fp32 logits (torch.topk's order, NaN included).
-/// Each thread keeps a private sorted list, then the block merges the 128 lists one slot at a time.
-__global__ void topk_kernel(const float* __restrict__ logits, int64_t vocab, int64_t limit, int k,
-                            int32_t* __restrict__ ids_out, float* __restrict__ vals_out) {
+/// One SHARD of a row's top-k: the same comparator and the same block merge as before, restricted to
+/// the contiguous span [blockIdx.y * shard_len, +shard_len).  `gridDim.y` shards per row; each writes
+/// its own `k` entries, shard-major, into the row's partial list.
+/// The union's top-k is exactly the merge of the shards' top-k (topk_better is a total order on
+/// (value, unique id) pairs), so the merged result is identical to one block scanning the whole row.
+__global__ void topk_shard_kernel(const float* __restrict__ logits, int64_t vocab, int64_t limit,
+                                  int64_t shard_len, int k, int32_t* __restrict__ part_ids,
+                                  float* __restrict__ part_vals) {
     __shared__ float sv[kTopKThreads * kTopKMax];
     __shared__ int32_t si[kTopKThreads * kTopKMax];
     __shared__ int32_t cur[kTopKThreads];
-    __shared__ float bsh[8];
-    __shared__ int32_t bsi[8];
+    __shared__ float bsh[kMergeWarps];
+    __shared__ int32_t bsi[kMergeWarps];
     const int tid = threadIdx.x;
-    const float* lg = logits + (int64_t) blockIdx.x * vocab;
+    const int row = blockIdx.x, shard = blockIdx.y;
+    const float* lg = logits + (int64_t) row * vocab;
+    const int64_t lo = (int64_t) shard * shard_len;
+    const int64_t hi = lo + shard_len < limit ? lo + shard_len : limit;
     const int kk = k < kTopKMax ? k : kTopKMax;
 
     float tv[kTopKMax];
     int32_t ti[kTopKMax];
     for (int j = 0; j < kTopKMax; ++j) { tv[j] = -INFINITY; ti[j] = INT32_MAX; }
-    for (int64_t i = tid; i < limit; i += blockDim.x) {
+    for (int64_t i = lo + tid; i < hi; i += blockDim.x) {
         const float v = lg[i];
         if (topk_better(v, (int32_t) i, tv[kk - 1], ti[kk - 1])) {
             int j = kk - 1;
@@ -816,6 +855,8 @@ __global__ void topk_kernel(const float* __restrict__ logits, int64_t vocab, int
     }
     cur[tid] = 0;
     __syncthreads();
+    float* pv = part_vals + ((int64_t) row * gridDim.y + shard) * k;
+    int32_t* pi = part_ids + ((int64_t) row * gridDim.y + shard) * k;
     for (int step = 0; step < kk; ++step) {
         const int c = cur[tid];
         float v = c < kk ? sv[tid * kTopKMax + c] : -INFINITY;
@@ -835,10 +876,51 @@ __global__ void topk_kernel(const float* __restrict__ logits, int64_t vocab, int
         const float bv = bsh[0];
         const int32_t bid = bsi[0];
         if (tid == 0) {
-            vals_out[(int64_t) blockIdx.x * k + step] = bv;
-            ids_out[(int64_t) blockIdx.x * k + step] = bid;
+            pv[step] = bv;
+            pi[step] = bid;
         }
         if (c < kk && si[tid * kTopKMax + c] == bid) cur[tid] = c + 1;
+        __syncthreads();
+    }
+}
+
+/// Merges `g` shard lists of `k` entries each (shard-major, contiguous per row) into the row's final
+/// top-k, with the same comparator: one thread owns one entry and offers it until it is emitted, so
+/// the order, the NaN rule and the lower-id tie rule are exactly the single-block kernel's.
+__global__ void topk_merge_kernel(const int32_t* __restrict__ part_ids,
+                                  const float* __restrict__ part_vals, int g, int k,
+                                  int32_t* __restrict__ ids_out, float* __restrict__ vals_out) {
+    __shared__ float bsh[kMergeWarps];
+    __shared__ int32_t bsi[kMergeWarps];
+    const int tid = threadIdx.x;
+    const int n_in = g * k;
+    const int row = blockIdx.x;
+    const bool owns = tid < n_in;
+    float v = owns ? part_vals[(int64_t) row * n_in + tid] : -INFINITY;
+    int32_t id = owns ? part_ids[(int64_t) row * n_in + tid] : INT32_MAX;
+    const int lane = tid & 31, wid = tid >> 5;
+    const int nw = (blockDim.x + 31) >> 5;
+    for (int step = 0; step < k; ++step) {
+        float bv = v;
+        int32_t bid = id;
+        warp_best_f(bv, bid);
+        if (lane == 0) { bsh[wid] = bv; bsi[wid] = bid; }
+        __syncthreads();
+        if (wid == 0) {
+            float wv = lane < nw ? bsh[lane] : -INFINITY;
+            int32_t wi = lane < nw ? bsi[lane] : INT32_MAX;
+            warp_best_f(wv, wi);
+            if (lane == 0) { bsh[0] = wv; bsi[0] = wi; }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            vals_out[(int64_t) row * k + step] = bsh[0];
+            ids_out[(int64_t) row * k + step] = bsi[0];
+        }
+        if (owns && id == bsi[0]) {   // this entry has been emitted
+            v = -INFINITY;
+            id = INT32_MAX;
+        }
         __syncthreads();
     }
 }
@@ -859,6 +941,71 @@ __global__ void pred_ids_kernel(const int32_t* __restrict__ cand, int32_t anchor
     if (i >= slots * k) return;
     const int e = i / k, p = i - e * k;
     out[i] = e == 0 ? anchor : cand[(e - 1) * k + p];
+}
+
+/// The selector's walk ON THE DEVICE: one block, `slots` sequential steps.  Slot e scores the `k`
+/// candidates of the REALIZED predecessor's lattice row, then takes the greedy argmax or the sampling
+/// inverse-CDF draw, and writes the chosen position, the token id and the q row.
+/// The score expression and its order, the temperature clamp (done by the caller), the NaN rules, the
+/// tie rule and the CDF boundary rule (`the first c with u < cumsum`, else k-1) are the same as the
+/// host walk this replaces; the products use explicit round-to-nearest so the compiler cannot contract
+/// them into an FMA and change the last bits.
+__global__ void selector_kernel(const int32_t* __restrict__ cand_ids, const float* __restrict__ unary,
+                                const float* __restrict__ H, const __half* __restrict__ a_rows,
+                                const __half* __restrict__ b_rows, const float* __restrict__ uniforms,
+                                int slots, int k, int rank, float temperature, int greedy,
+                                int32_t* __restrict__ sel_tokens,
+                                float* __restrict__ sel_q) {
+    __shared__ int s_prev;
+    __shared__ float s_scores[kDFlash2MaxTopK];
+    const int tid = threadIdx.x;
+    if (tid == 0) s_prev = 0;
+    __syncthreads();
+    for (int e = 0; e < slots; ++e) {
+        const int prev = s_prev;
+        if (tid < k) {   // one candidate per thread: the row's scores in the host's summation order
+            const int c = tid;
+            const __half* A = a_rows + ((size_t) e * k + prev) * rank;
+            const float* Hh = H + (size_t) e * rank;
+            const __half* B = b_rows + ((size_t) e * k + c) * rank;
+            float acc = unary[(size_t) e * k + c];
+            for (int r = 0; r < rank; ++r)
+                acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(__half2float(A[r]), Hh[r]), __half2float(B[r])));
+            s_scores[c] = acc;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            int idx = 0;
+            if (greedy) {
+                for (int c = 0; c < k; ++c)
+                    if (isnan(s_scores[c])) { idx = c; break; }
+                for (int c = 1; c < k; ++c)
+                    if (s_scores[c] > s_scores[idx]) idx = c;
+                for (int c = 0; c < k; ++c) sel_q[(size_t) e * k + c] = c == idx ? 1.0f : 0.0f;
+            } else {
+                float mx = -INFINITY;   // fmaxf ignores a NaN operand exactly as std::max does
+                for (int c = 0; c < k; ++c) mx = fmaxf(mx, s_scores[c] / temperature);
+                float sum = 0.0f;
+                for (int c = 0; c < k; ++c) {
+                    const float pr = expf(s_scores[c] / temperature - mx);
+                    sel_q[(size_t) e * k + c] = pr;
+                    sum += pr;
+                }
+                const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+                for (int c = 0; c < k; ++c) sel_q[(size_t) e * k + c] *= inv;
+                const float u = uniforms[e];
+                float cum = 0.0f;
+                idx = k - 1;
+                for (int c = 0; c < k; ++c) {
+                    cum += sel_q[(size_t) e * k + c];
+                    if (u < cum) { idx = c; break; }
+                }
+            }
+            sel_tokens[e] = cand_ids[(size_t) e * k + idx];
+            s_prev = idx;
+        }
+        __syncthreads();
+    }
 }
 
 /// Writes `count` rows into the ring at absolute rows `first..first+count-1` (modulo `cap`).
@@ -950,11 +1097,17 @@ struct DFlash2Backend::Impl {
     int32_t* pred_ids = nullptr;
     __half* a_rows = nullptr;
     __half* b_rows = nullptr;
+    // the sharded top-k's partial lists and the device selector's outputs (all preallocated)
+    int32_t* part_ids = nullptr;
+    float* part_vals = nullptr;
+    int32_t* sel_tokens = nullptr;
+    float* sel_q = nullptr;
+    float* sel_uniforms = nullptr;
 
     // host
-    std::vector<float> h_H, h_unary;
-    std::vector<uint16_t> h_A, h_B;
-    std::vector<int32_t> h_cand;
+    std::vector<float> h_unary;
+    std::vector<float> h_q, h_uniforms;
+    std::vector<int32_t> h_cand, h_tokens;
     DFlash2HeadFn head_fn = nullptr;
     void* head_ctx = nullptr;
     uint64_t steps_ = 0;
@@ -1230,12 +1383,18 @@ bool DFlash2Backend::Impl::load(const DFlash2Config& c, std::string& err) {
     if (!alloc_t(&pred_ids, (size_t) slots * top_k, "pred ids", err)) return false;
     if (!alloc_t(&a_rows, (size_t) slots * top_k * rank, "A rows", err)) return false;
     if (!alloc_t(&b_rows, (size_t) slots * top_k * rank, "B rows", err)) return false;
+    const size_t part_n = (size_t) slots * kSelShards * kTopKMax;
+    if (!alloc_t(&part_ids, part_n, "topk parts", err)) return false;
+    if (!alloc_t(&part_vals, part_n, "topk parts", err)) return false;
+    if (!alloc_t(&sel_tokens, (size_t) slots, "sel tokens", err)) return false;
+    if (!alloc_t(&sel_q, (size_t) slots * top_k, "sel q", err)) return false;
+    if (!alloc_t(&sel_uniforms, (size_t) slots, "sel uniforms", err)) return false;
 
-    h_H.assign((size_t) slots * rank, 0.0f);
     h_unary.assign((size_t) slots * top_k, 0.0f);
-    h_A.assign((size_t) slots * top_k * rank, (uint16_t) 0);
-    h_B.assign((size_t) slots * top_k * rank, (uint16_t) 0);
+    h_q.assign((size_t) slots * top_k, 0.0f);
     h_cand.assign((size_t) slots * top_k, 0);
+    h_tokens.assign((size_t) slots, 0);
+    h_uniforms.assign((size_t) slots, 0.0f);
 
     if (!cuda_ok(cudaStreamSynchronize(stream), "load sync", err)) return false;
     loaded = true;
@@ -1378,8 +1537,15 @@ bool DFlash2Backend::Impl::propose(int32_t anchor_id, int64_t start_pos, const f
     // the TARGET's head over the draft rows (row 0, the anchor, is discarded), then the candidates
     if (!head_fn(head_ctx, final_h + hh, slots, logits, (void*) stream, err)) return false;
     if (!cuda_ok(cudaGetLastError(), "head", err)) return false;
-    topk_kernel<<<(unsigned) slots, kTopKThreads, 0, stream>>>(logits, vocab, vocab, top_k, cand_ids,
-                                                               cand_vals);
+    // the candidates: kSelShards contiguous shards per row, then the merge (identical to one block
+    // scanning the whole row - see topk_shard_kernel)
+    {
+        const int64_t shard_len = (vocab + kSelShards - 1) / kSelShards;
+        topk_shard_kernel<<<dim3((unsigned) slots, (unsigned) kSelShards), kTopKThreads, 0, stream>>>(
+            logits, vocab, vocab, shard_len, top_k, part_ids, part_vals);
+        topk_merge_kernel<<<(unsigned) slots, kMergeThreads, 0, stream>>>(part_ids, part_vals, kSelShards,
+                                                                          top_k, cand_ids, cand_vals);
+    }
     if (!gemm(hproj, rank, hh, final_h + hh, slots, H, "hidden_projection", err)) return false;
     pred_ids_kernel<<<(unsigned) ((slots * top_k + 127) / 128), 128, 0, stream>>>(cand_ids, anchor_id, slots,
                                                                                   top_k, pred_ids);
@@ -1387,68 +1553,38 @@ bool DFlash2Backend::Impl::propose(int32_t anchor_id, int64_t start_pos, const f
     gather_rows_kernel<<<(unsigned) (slots * top_k), kThreads, 0, stream>>>(succ_cb, cand_ids, b_rows, rank);
     if (!cuda_ok(cudaGetLastError(), "selector kernels", err)) return false;
 
-    // host copies (tiny)
+    // the selector's uniforms (host -> device, `slots` floats) and the walk itself, on the device
+    for (int e = 0; e < slots; ++e)
+        h_uniforms[(size_t) e] = (!greedy && uniforms != nullptr) ? uniforms[e] : 0.0f;
+    if (!cuda_ok(cudaMemcpyAsync(sel_uniforms, h_uniforms.data(), (size_t) slots * sizeof(float),
+                                 cudaMemcpyHostToDevice, stream), "selector uniforms", err)) return false;
+    selector_kernel<<<1, kThreads, 0, stream>>>(cand_ids, cand_vals, H, a_rows, b_rows, sel_uniforms, slots,
+                                                top_k, rank, temperature, greedy ? 1 : 0, sel_tokens,
+                                                sel_q);
+    if (!cuda_ok(cudaGetLastError(), "selector", err)) return false;
+
+    // host copies: the candidate list, the unary logits and the selector's own outputs - no H/A/B rows
     if (!cuda_ok(cudaMemcpyAsync(h_cand.data(), cand_ids, (size_t) slots * top_k * sizeof(int32_t),
                                  cudaMemcpyDeviceToHost, stream), "cand ids", err)) return false;
     if (!cuda_ok(cudaMemcpyAsync(h_unary.data(), cand_vals, (size_t) slots * top_k * sizeof(float),
                                  cudaMemcpyDeviceToHost, stream), "unary", err)) return false;
-    if (!cuda_ok(cudaMemcpyAsync(h_H.data(), H, (size_t) slots * rank * sizeof(float), cudaMemcpyDeviceToHost,
-                                 stream), "H", err)) return false;
-    if (!cuda_ok(cudaMemcpyAsync(h_A.data(), a_rows, (size_t) slots * top_k * rank * sizeof(uint16_t),
-                                 cudaMemcpyDeviceToHost, stream), "A rows", err)) return false;
-    if (!cuda_ok(cudaMemcpyAsync(h_B.data(), b_rows, (size_t) slots * top_k * rank * sizeof(uint16_t),
-                                 cudaMemcpyDeviceToHost, stream), "B rows", err)) return false;
+    if (!cuda_ok(cudaMemcpyAsync(h_q.data(), sel_q, (size_t) slots * top_k * sizeof(float),
+                                 cudaMemcpyDeviceToHost, stream), "q rows", err)) return false;
+    if (!cuda_ok(cudaMemcpyAsync(h_tokens.data(), sel_tokens, (size_t) slots * sizeof(int32_t),
+                                 cudaMemcpyDeviceToHost, stream), "tokens", err)) return false;
     if (!cuda_ok(cudaStreamSynchronize(stream), "step sync", err)) return false;
 
-    // ---- the selector: one lattice row per slot, over the REALIZED predecessor (the walk
-    // model.py's CandidateSelector.select takes - the other predecessor rows are never needed)
-    const int k = top_k, S = slots, R = rank;
-    out.n_slots = S;
+    // ---- the proposal: the device selector's tokens and q rows plus the candidate list it chose from
+    const int k = top_k;
+    out.n_slots = slots;
     out.n_cand = k;
-    int prev = 0;
-    for (int e = 0; e < S; ++e) {
-        // score[e][prev][c] = unary[e][c] + <A[pred[e][prev]] * H[e], B[cand[e][c]]>
-        const uint16_t* A = h_A.data() + ((size_t) e * k + prev) * R;
-        const float* Hh = h_H.data() + (size_t) e * R;
-        float s[kDFlash2MaxTopK];
-        for (int c = 0; c < k; ++c) {
-            const uint16_t* B = h_B.data() + ((size_t) e * k + c) * R;
-            float acc = h_unary[(size_t) e * k + c];
-            for (int r = 0; r < R; ++r) acc += (f16_to_f32(A[r]) * Hh[r]) * f16_to_f32(B[r]);
-            s[c] = acc;
-        }
-        int idx = 0;
-        if (greedy) {
-            for (int c = 0; c < k; ++c)
-                if (std::isnan(s[c])) { idx = c; break; }
-            for (int c = 1; c < k; ++c)
-                if (s[c] > s[idx]) idx = c;
-            for (int c = 0; c < k; ++c) out.q[(size_t) e * k + c] = c == idx ? 1.0f : 0.0f;
-        } else {
-            float mx = -INFINITY;
-            for (int c = 0; c < k; ++c) mx = std::max(mx, s[c] / temperature);
-            float sum = 0.0f;
-            for (int c = 0; c < k; ++c) {
-                const float pr = std::exp(s[c] / temperature - mx);
-                out.q[(size_t) e * k + c] = pr;
-                sum += pr;
-            }
-            const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-            for (int c = 0; c < k; ++c) out.q[(size_t) e * k + c] *= inv;
-            const float u = uniforms != nullptr ? uniforms[e] : 0.0f;
-            float cum = 0.0f;
-            idx = k - 1;
-            for (int c = 0; c < k; ++c) {
-                cum += out.q[(size_t) e * k + c];
-                if (u < cum) { idx = c; break; }
-            }
-        }
-        out.tokens[e] = h_cand[(size_t) e * k + idx];
+    for (int e = 0; e < slots; ++e) {
+        out.tokens[e] = h_tokens[(size_t) e];
         for (int c = 0; c < k; ++c) {
             out.cand[(size_t) e * k + c] = h_cand[(size_t) e * k + c];
             out.unary[(size_t) e * k + c] = h_unary[(size_t) e * k + c];
+            out.q[(size_t) e * k + c] = h_q[(size_t) e * k + c];
         }
-        prev = idx;
     }
     ++steps_;
     return true;
@@ -1486,14 +1622,6 @@ bool DFlash2Backend::append_features(const float* dev_tap_rows, int64_t n_rows, 
                                      int64_t base_pos, std::string& err) {
     if (!impl_->loaded) { err = "dflash2: append_features before load"; return false; }
     return impl_->append(dev_tap_rows, n_rows, tap_stride_rows, base_pos, err);
-}
-
-void DFlash2Backend::truncate(int64_t keep_pos) {
-    Impl& d = *impl_;
-    if (keep_pos >= d.next_pos) return;
-    const int64_t drop = d.next_pos - keep_pos;
-    d.ctx_len = d.ctx_len > drop ? d.ctx_len - drop : 0;
-    d.next_pos = keep_pos;
 }
 
 int64_t DFlash2Backend::next_pos() const { return impl_->next_pos; }
