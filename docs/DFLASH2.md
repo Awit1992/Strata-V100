@@ -82,6 +82,8 @@ The selector then walks one path on the GPU and returns the distribution
 that it used for each choice. Attention uses coalesced query/key loads and
 FP32 reductions. These changes do not replace the model with an MTP chain
 or change its attention mask.
+The context ring bounds each index to less than twice its capacity. Attention
+wraps that index with one conditional subtraction instead of integer division.
 
 ## Limits and memory
 

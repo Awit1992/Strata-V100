@@ -727,12 +727,15 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
         if (f < nslot) qv[k] = *reinterpret_cast<const float4*>(qrow + 4 * f);
     }
 
+    // ctx_len <= ring_cap and ring_start < ring_cap: each context index wraps at most once.
     for (int i = wid; i < n_keys; i += nwarp) {
         const float* krow;
         int64_t kpos;
         if (i < ctx_len) {
             kpos = ctx_pos0 + i;
-            krow = k_ring + ((size_t) ((ring_start + i) % ring_cap) * n_kv_heads + kvh) * head_dim;
+            const int index = ring_start + i;
+            const int slot = index < ring_cap ? index : index - ring_cap;
+            krow = k_ring + ((size_t) slot * n_kv_heads + kvh) * head_dim;
         } else {
             const int j = i - ctx_len;
             kpos = q_pos0 + j;
@@ -780,9 +783,11 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
     float acc = 0.0f;
     for (int i = part; i < n_keys; i += per) {
         const float* vrow;
-        if (i < ctx_len)
-            vrow = v_ring + ((size_t) ((ring_start + i) % ring_cap) * n_kv_heads + kvh) * head_dim;
-        else
+        if (i < ctx_len) {
+            const int index = ring_start + i;
+            const int slot = index < ring_cap ? index : index - ring_cap;
+            vrow = v_ring + ((size_t) slot * n_kv_heads + kvh) * head_dim;
+        } else
             vrow = v_blk + ((size_t) (i - ctx_len) * n_kv_heads + kvh) * head_dim;
         acc = fmaf(scores[i] * inv, vrow[d], acc);
     }
