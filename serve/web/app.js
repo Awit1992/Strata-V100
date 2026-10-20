@@ -169,22 +169,39 @@ function chart(svg, series, max) {
   const W = Math.max(260, Math.round(svg.clientWidth || 720));
   const H = Math.max(90, Math.round(svg.clientHeight || 190));
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
-  const padL = 46, padR = 10, padT = 8, padB = 18;
+  // a series may name the axis it scales to: "left" (default) or "right", so two
+  // series on different orders of magnitude each keep a readable curve
+  const hasRight = series.some((s) => s.axis === "right");
+  const padL = 46, padR = hasRight ? 46 : 10, padT = 8, padB = 18;
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const n = Math.max(0, ...series.map((s) => s.values.length));
-  const flat = series.flatMap((s) => s.values).filter((v) => typeof v === "number");
-  const top = Math.max(max || 0, ...flat, 1e-9) * 1.06;
+  const axisTop = (side) => {
+    const flat = series.filter((s) => (s.axis || "left") === side)
+                       .flatMap((s) => s.values).filter((v) => typeof v === "number");
+    return Math.max(side === "left" ? max || 0 : 0, ...flat, 1e-9) * 1.06;
+  };
+  const topL = axisTop("left"), topR = axisTop("right");
   const px = (i) => padL + (n <= 1 ? plotW : (i / (n - 1)) * plotW);
-  const py = (v) => padT + plotH - (Math.max(0, Math.min(v, top)) / top) * plotH;
+  const pyOn = (top) => (v) => padT + plotH - (Math.max(0, Math.min(v, top)) / top) * plotH;
+  const py = pyOn(topL);
   const base = (padT + plotH).toFixed(1);
   let out = "";
+  const axisColor = (side) => {
+    const s = series.find((x) => (x.axis || "left") === side && x.color);
+    return s ? ` style="fill:${s.color}"` : "";
+  };
   for (let t = 0; t <= 4; t++) {
-    const yy = py((top / 4) * t);
+    const yy = py((topL / 4) * t);
     out += `<line class="grid" x1="${padL}" y1="${yy.toFixed(1)}" x2="${(W - padR).toFixed(1)}" y2="${yy.toFixed(1)}"/>` +
-           `<text class="axis" x="${padL - 7}" y="${(yy + 4).toFixed(1)}" text-anchor="end">${fmt((top / 4) * t, top >= 100 ? 0 : 1)}</text>`;
+           `<text class="axis"${axisColor("left")} x="${padL - 7}" y="${(yy + 4).toFixed(1)}" text-anchor="end">${fmt((topL / 4) * t, topL >= 100 ? 0 : 1)}</text>`;
+    if (hasRight) {
+      const yr = pyOn(topR)((topR / 4) * t);
+      out += `<text class="axis"${axisColor("right")} x="${(W - padR + 7).toFixed(1)}" y="${(yr + 4).toFixed(1)}" text-anchor="start">${fmt((topR / 4) * t, topR >= 100 ? 0 : 1)}</text>`;
+    }
   }
   series.forEach((s, si) => {
-    const pts = s.values.map((v, i) => (typeof v === "number" ? [px(i), py(v)] : null)).filter(Boolean);
+    const pyS = pyOn((s.axis || "left") === "right" ? topR : topL);
+    const pts = s.values.map((v, i) => (typeof v === "number" ? [px(i), pyS(v)] : null)).filter(Boolean);
     if (pts.length < 2) return;
     const d = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join("");
     if (si === 0) {
@@ -482,8 +499,8 @@ function renderMonitor(m) {
 
   // throughput over the sampler's window
   const samples = (h.tok_s || []).length;
-  chart($("chart-speed"), [{values: h.tok_s || [], color: "var(--st-accent)"},
-                           {values: h.prefill_tok_s_mean || [], color: "var(--st-info)"}]);
+  chart($("chart-speed"), [{values: h.tok_s || [], color: "var(--st-accent)", axis: "left"},
+                           {values: h.prefill_tok_s_mean || [], color: "var(--st-info)", axis: "right"}]);
   $("legend-speed").innerHTML =
     `<span style="color:var(--st-accent)"><i></i>Decode <b>${rate(live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null)}</b></span>` +
     `<span style="color:var(--st-info)"><i></i>Prefill <b>${rate(live.state === "idle" ? null : live.prefill_tok_s_mean)}</b></span>`;
