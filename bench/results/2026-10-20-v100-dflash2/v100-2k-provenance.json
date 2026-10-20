@@ -34,5 +34,33 @@
   "kv_growth": true,
   "server_recovery_rules": false,
   "sampling": "Unchanged runner defaults; seed controls prompt construction, not an explicit sampler seed.",
-  "runtime_restored": true
+  "runtime_restored": true,
+  "ab_comparison": {
+    "baseline": "MTP with coupled/probability verification active",
+    "candidate": "DFlash2 block 4",
+    "only_configuration_differences": [
+      "drafter selection",
+      "log destination"
+    ],
+    "same_executable": true,
+    "same_regular_target_and_tokenizer": true,
+    "same_environment": true,
+    "same_pipeline_windows": 1,
+    "same_verify_window": 4,
+    "same_prompt_seed": 68,
+    "explicit_sampler_seed": false,
+    "prompt_counts_identical": true,
+    "prompt_reuse_each_arm": 0,
+    "mtp_actual_output_tokens": [
+      1631,
+      1973,
+      2048,
+      799,
+      2048,
+      1208
+    ],
+    "delta_definition": "DFlash2 minus MTP; percentage baseline is MTP",
+    "repetitions_per_arm": 1,
+    "daily_runtime_restored_and_inference_verified": true
+  }
 }
