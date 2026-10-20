@@ -1,0 +1,151 @@
+{
+  "implementation_commit": "330eeb73d2c4ed8596d711f23e6c376154d3b2a7",
+  "binary_md5": "43743f3681057e040414434d16f65140",
+  "runner": "bench/run_dflash2_bench.py",
+  "runner_sha256": "d820d5099bb7f3ca226d4b499d3a8fb6712422ad06a6d2835b19244e430d1514",
+  "adapter_sha256": "273a1725f18e84cca83988ff70a9f0c90a5e3c77543c6dc13b335963c23d37ac",
+  "prompts_sha256": "8bc58e99bd072a9752c913a4403d5983201a2de3f2f2a04960839d01589c96f7",
+  "requested_measured_requests_per_arm": 6,
+  "max_output_tokens": 16384,
+  "repeats": 1,
+  "warmups": 0,
+  "calibration_requests": 0,
+  "sampling": {
+    "temperature": 0,
+    "top_p": 1,
+    "top_k": 0,
+    "min_p": 0,
+    "seeds": [
+      68,
+      69,
+      70,
+      71,
+      72,
+      73
+    ],
+    "thinking": false,
+    "tool_choice": "none",
+    "strata_checkpoint": false
+  },
+  "assistant_prefill": "```",
+  "chat_template_base_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce",
+  "chat_template_extension": "\n{%- if add_generation_prompt and enable_thinking is defined and enable_thinking is false %}{{- '```' }}{%- endif %}\n",
+  "chat_template_modified_sha256": "a0052ffa371735bc1f324c684c7f9339e5111f411cfdd6903133e4b773beb371",
+  "tokenizer_vocabulary_unchanged": true,
+  "shared_controls": {
+    "route_resident": 0,
+    "route_tail_skip": 0,
+    "prompt_cache": 0,
+    "conversation_cache_mib": 0,
+    "conversation_cache_slots": 0,
+    "conversation_disk_cache": false,
+    "vram_reserve_mib": 1024,
+    "vram_elastic": false,
+    "suffix_draft": 0,
+    "lookup_chain": 0,
+    "recovery_flags": false,
+    "repeat_stop_tokens": 0,
+    "expert_profile_sha256": "8f59b4aa8873209dff11c11e37bcda9529a1335b724a1afeea37bf6388975baf",
+    "max_context": "524288",
+    "rope_scaling": "yarn",
+    "rope_scale": "2",
+    "prefill": "auto",
+    "expert_cache": "auto",
+    "kv": "int8",
+    "spec_min_p": "0",
+    "vision_enabled_no_image_requests": true,
+    "common_engine_environment": {
+      "STRATA_EXPERT_PAIR": "1",
+      "STRATA_SPLIT_RING": "192",
+      "STRATA_PREFILL_CPU_SHARE": "auto",
+      "STRATA_PREFILL_STREAM_MIN": "3072",
+      "STRATA_EMB_REUSE_ACCOUNT": "1",
+      "STRATA_SM70_TABLE": "1",
+      "STRATA_PF_WMMA": "1",
+      "STRATA_PF_SKIP_UNROUTED": "1",
+      "STRATA_KV_GROW": "1",
+      "STRATA_ROUTE_RESIDENT": "0",
+      "STRATA_ARENA_LOCK": "0",
+      "STRATA_WATCHDOG_S": "300",
+      "STRATA_DECODE_TIMING": "1",
+      "STRATA_ROUTE_TAIL_SKIP": "0",
+      "STRATA_SPEC_COUPLED": "1",
+      "STRATA_SPEC_PROB": "1"
+    }
+  },
+  "gpu_order": [
+    0,
+    1
+  ],
+  "layer_split": 16,
+  "pipeline_windows": 1,
+  "verify_window": 4,
+  "dflash2_block": 4,
+  "target": "regular Qwen3.8-Flash-Next-GSQ-RCO IQ3_S",
+  "draft_checkpoint": "incoai/Qwen3.8-Flash-Next-DFlash2",
+  "draft_checkpoint_revision": "a22a1744e85c17364dcc54a6a420af7135d4c7f6",
+  "source_sha256": {
+    "src/core/dflash2.cu": "5fd480afb79d5b044d2430f0d2d06e88cc291a5b625691b25c734467c9b8a23d",
+    "tests/core/dflash2_attention_test.cu": "6dd89dcf19a69825e7afb3577572b351bbc63a85f23bc4fe23d358c638d64de8"
+  },
+  "excluded_protocol_attempts": {
+    "tool_call_rejections": 2,
+    "provisional_valid_before_final_restart": 3,
+    "total_generated_tokens": 19754,
+    "reason": "Instruction-only prompts produced two unrequested tool-call replies. Three valid provisional outputs from the interrupted arm were also discarded. Both final measured arms start fresh and use the same opening-code-fence assistant prefill."
+  },
+  "limitations": [
+    "One measured request per prompt per arm, not a significance claim.",
+    "First prompt is measured from a fresh engine; no warmup request.",
+    "16384 is a maximum, not a forced output length.",
+    "This is a coding generation-speed/acceptance comparison, not an execution or correctness grade.",
+    "Full generated responses are retained privately outside the repository; only numeric metrics and content hashes are published."
+  ],
+  "verification_mode": "Greedy verification at temperature zero; coupled/probability flags are set in both environments, but sampled acceptance is not exercised.",
+  "restoration": {
+    "active": true,
+    "running": true,
+    "restarts": 0,
+    "models_loaded": true,
+    "authenticated_inference_answer": "4",
+    "approved_abliterated_assets": true,
+    "gpu_order": [
+      0,
+      1
+    ],
+    "layer_split": 16,
+    "pipeline_windows": 2,
+    "audio_services_inactive_and_disabled": true
+  },
+  "configuration_matching_verified": true,
+  "request_bodies_identical_by_task": true,
+  "matched_prompt_counts_by_task": true,
+  "final_measured_engine_generations_per_arm": 6,
+  "all_final_finishes": "stop",
+  "all_final_tool_calls": 0,
+  "all_final_reasoning_characters": 0,
+  "request_fields_except_messages_and_seed": {
+    "model": "qwen",
+    "max_tokens": 16384,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    },
+    "strata_checkpoint": false,
+    "tool_choice": "none"
+  },
+  "seed_rule": "68 + record.row",
+  "message_source": {
+    "system": "record.system",
+    "user": "record.turns[0]"
+  },
+  "aggregate_definitions": {
+    "paired_geometric_mean": "Geometric mean of six DFlash2/MTP per-prompt decode-rate ratios, minus one. Each task has equal weight.",
+    "pooled_decode": "Sum of generated tokens divided by sum of engine decode seconds. Actual continuation lengths differ.",
+    "mean_acceptance_length": "Arithmetic mean across six per-request generated-token/verification-window ratios.",
+    "window_weighted_timing": "Per-window phase means weighted by the number of verification windows in each request."
+  }
+}
