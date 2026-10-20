@@ -173,6 +173,10 @@ Set `answer_room`, `reasoning_close_retry`, `reasoning_loop_recovery`, and
 `repeat_stop_tokens` to `0`. These settings prevent server-side changes to
 the measured output.
 
+Use a one-record custom workload for a routine implementation check.
+The full five-dataset cohort below sends 640 measured requests per arm,
+plus warmups. Run it only when you need a full reference comparison.
+
 Prepare the full cohort with
 [`bench/prepare_dflash2_prompts.py`](../bench/prepare_dflash2_prompts.py).
 It uses the prompt formats and selection order from the
@@ -183,7 +187,7 @@ benchmark uses only the first turn, including MT-Bench. One separate request
 with a 64-token limit runs before each dataset as a warmup.
 
 ```sh
-python bench/prepare_dflash2_prompts.py --out PROMPTS_JSON
+python bench/prepare_dflash2_prompts.py --num-prompts 128 --out PROMPTS_JSON
 python bench/run_dflash2_bench.py --suite acceptance \
   --base http://127.0.0.1:8089 --config TEST_SERVICE_JSON \
   --prompts PROMPTS_JSON --engine-log ENGINE_LOG --limit 128 \
@@ -198,6 +202,14 @@ The runner includes the assistant reply in the next turn of a multi-turn
 item. It does not write reply text or credentials to the results. It reads
 the exact verification-step count from each request's engine log span.
 It rejects a request that starts more than one engine generation.
+
+## V100 measurements
+
+The [V100 comparison report](../benchmarks/v100-iq3_s-dflash2-2026-10-20.md)
+records the measured acceptance and throughput. DFlash2 increased acceptance
+in the three complete matched datasets, but did not increase request throughput.
+The user stopped the large sweep. Unmatched and partial data do not support
+additional relative-gain claims.
 
 Sources: [model card](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2),
 [reference model](https://github.com/z-lab/dflash/blob/main/dflash/model.py),

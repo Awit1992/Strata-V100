@@ -1,0 +1,248 @@
+{
+  "implementation_commit": "9de841284d9ae487bc5bd965427453cab1bb057e",
+  "reference_benchmark_commit": "265add3a0e4c62d02566dc44ad9a735f350084c2",
+  "reference_sglang_commit": "3c560089e1818a5217a73f2168273485a5350341",
+  "draft": {
+    "repository": "incoai/Qwen3.8-Flash-Next-DFlash2",
+    "revision": "a22a1744e85c17364dcc54a6a420af7135d4c7f6",
+    "parameter_count": 603065600,
+    "layers": 5,
+    "weights": "BF16 checkpoint rounded to FP16",
+    "matrix_inputs": "FP16",
+    "accumulation_outputs_activations_residuals_kv": "FP32"
+  },
+  "target": {
+    "model": "Qwen3.8-Flash-Next-GSQ-RCO",
+    "quantization": "IQ3_S",
+    "abliterated": false,
+    "kv": "int8",
+    "gpu_order": [
+      0,
+      1
+    ],
+    "layer_split": 16,
+    "gpu0_layers": [
+      0,
+      15
+    ],
+    "gpu1_layers": [
+      16,
+      47
+    ]
+  },
+  "hardware": {
+    "gpus": [
+      {
+        "index": 0,
+        "name": "Tesla V100-PCIE-16GB",
+        "memory_mib": 16384,
+        "power_limit_w": 175,
+        "pcie_generation": 3,
+        "pcie_width": 4
+      },
+      {
+        "index": 1,
+        "name": "Tesla V100-PCIE-16GB",
+        "memory_mib": 16384,
+        "power_limit_w": 175,
+        "pcie_generation": 3,
+        "pcie_width": 16
+      }
+    ],
+    "cpu": "AMD Ryzen 5 3600",
+    "physical_cores": 6,
+    "logical_cpus": 12,
+    "ram_kib": 98798956,
+    "kernel": "7.0.0-38-generic",
+    "gcc": "13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1)",
+    "driver": "580.178.04",
+    "cuda_toolkit": "12.8.93",
+    "driver_reported_max_cuda": "13.0",
+    "model_storage": "KINGSTON OM8PDP3256B-AI1 NVMe, ext4",
+    "workspace_storage": "Samsung PSSD T7, ext4",
+    "continuous_thermal_or_clock_trace": false
+  },
+  "datasets": [
+    {
+      "repository": "openai/gsm8k",
+      "revision": "740312add88f781978c0658806c59bc2815b9866",
+      "split": "test",
+      "config": "main",
+      "corpus_rows": 1319,
+      "revision_url": "https://huggingface.co/datasets/openai/gsm8k/commit/740312add88f781978c0658806c59bc2815b9866"
+    },
+    {
+      "repository": "HuggingFaceH4/MATH-500",
+      "revision": "6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be",
+      "split": "test",
+      "config": "default",
+      "corpus_rows": 500,
+      "revision_url": "https://huggingface.co/datasets/HuggingFaceH4/MATH-500/commit/6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be"
+    },
+    {
+      "repository": "openai/openai_humaneval",
+      "revision": "7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544",
+      "split": "test",
+      "config": "openai_humaneval",
+      "corpus_rows": 164,
+      "revision_url": "https://huggingface.co/datasets/openai/openai_humaneval/commit/7dce6050a7d6d172f3cc5c32aa97f52fa1a2e544"
+    },
+    {
+      "repository": "google-research-datasets/mbpp",
+      "revision": "4bb6404fdc6cacfda99d4ac4205087b89d32030c",
+      "split": "test",
+      "config": "sanitized",
+      "corpus_rows": 257,
+      "revision_url": "https://huggingface.co/datasets/google-research-datasets/mbpp/commit/4bb6404fdc6cacfda99d4ac4205087b89d32030c"
+    },
+    {
+      "repository": "HuggingFaceH4/mt_bench_prompts",
+      "revision": "e3a795c5e9a82ee40611c416b8a7786c73198991",
+      "split": "train",
+      "config": "default",
+      "corpus_rows": 80,
+      "revision_url": "https://huggingface.co/datasets/HuggingFaceH4/mt_bench_prompts/commit/e3a795c5e9a82ee40611c416b8a7786c73198991"
+    }
+  ],
+  "cohort": {
+    "sha256": "0f0a47a1e5aa97bac70df2bae70ffce59371ea083fc1921cf242f2a75cea2b58",
+    "fixture_sha256": {
+      "gsm8k": "95e1010d5bf52607df25a148a27de1ecbbc9a366ade638a88800a112e657df7b",
+      "math500": "50c906df64a39a2655312c7bf0b565be14fde2f66518d573237cc5d81689ab77",
+      "humaneval": "fc956f111c0b39f83201a63ae244c417975680a643645903f018f62c74d0630d",
+      "mbpp": "6ba20003d8c11a9ed38fc1f397083612c8d99d8811c7b8574f25fe8a19ea02ae",
+      "mt-bench": "eb5db948ed318c52885a1006033ae103f8069c03c4f9feba04b3b02362f2a8c5"
+    },
+    "shuffle_seed": 42,
+    "selection": "Shuffle full corpus; select first 128; cycle short corpora. First turn only. Separate warmup at ordinal128, limited to64 tokens."
+  },
+  "acceptance_protocol": {
+    "requests_per_dataset_per_arm": 128,
+    "concurrency": 1,
+    "max_tokens": 4096,
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "reasoning": "xhigh",
+    "seed": "4200 + selection ordinal",
+    "metric": "Per-request engine_generated / exact decode verification windows, then arithmetic mean across requests."
+  },
+  "short_protocol": {
+    "workloads": [
+      "code",
+      "math",
+      "prose"
+    ],
+    "repeats": 3,
+    "max_tokens": 256,
+    "temperature": 0,
+    "thinking": false,
+    "seed": 4107,
+    "cache_reuse_forbidden": true
+  },
+  "runtime_controls": {
+    "route_resident": 0,
+    "route_tail_skip": 0,
+    "prompt_cache": 0,
+    "conversation_cache_mib": 0,
+    "conversation_cache_slots": 0,
+    "conversation_disk_cache": false,
+    "vram_reserve_mib": 1024,
+    "vram_elastic": false,
+    "suffix_draft": 0,
+    "lookup_chain": 0,
+    "recovery_flags": false,
+    "repeat_stop_tokens": 0,
+    "expert_profile_sha256": "8f59b4aa8873209dff11c11e37bcda9529a1335b724a1afeea37bf6388975baf",
+    "max_context": "524288",
+    "rope_scaling": "yarn",
+    "rope_scale": "2",
+    "prefill": "auto",
+    "expert_cache": "auto",
+    "kv": "int8",
+    "spec_min_p": "0",
+    "vision_enabled_no_image_requests": true,
+    "common_engine_environment": {
+      "STRATA_EXPERT_PAIR": "1",
+      "STRATA_SPLIT_RING": "192",
+      "STRATA_PREFILL_CPU_SHARE": "auto",
+      "STRATA_PREFILL_STREAM_MIN": "3072",
+      "STRATA_EMB_REUSE_ACCOUNT": "1",
+      "STRATA_SM70_TABLE": "1",
+      "STRATA_PF_WMMA": "1",
+      "STRATA_PF_SKIP_UNROUTED": "1",
+      "STRATA_KV_GROW": "1",
+      "STRATA_ROUTE_RESIDENT": "0",
+      "STRATA_ARENA_LOCK": "0",
+      "STRATA_WATCHDOG_S": "300",
+      "STRATA_DECODE_TIMING": "1",
+      "STRATA_ROUTE_TAIL_SKIP": "0"
+    },
+    "arm_settings": {
+      "ar": {
+        "spec": 4,
+        "pipeline_windows": 0,
+        "spec_coupled": 1,
+        "spec_prob": 1
+      },
+      "mtp-coupled4": {
+        "spec": 4,
+        "pipeline_windows": 1,
+        "spec_coupled": 1,
+        "spec_prob": 1
+      },
+      "mtp-point4": {
+        "spec": 4,
+        "pipeline_windows": 1,
+        "spec_coupled": 0,
+        "spec_prob": 0
+      },
+      "mtp-pipeline2": {
+        "spec": 4,
+        "pipeline_windows": 2,
+        "spec_coupled": 0,
+        "spec_prob": 0
+      },
+      "dflash4": {
+        "spec": 4,
+        "pipeline_windows": 1,
+        "spec_coupled": 1,
+        "spec_prob": 1
+      },
+      "dflash8": {
+        "spec": 8,
+        "pipeline_windows": 1,
+        "spec_coupled": 1,
+        "spec_prob": 1
+      }
+    }
+  },
+  "limits": [
+    "Published card uses FP8 on GB300, not IQ3_S on V100.",
+    "The card does not publish its MTP launch flags. Coupled MTP is the primary local baseline; point-mass MTP is a separately labeled default-like comparison.",
+    "No claim of bitwise parity with BF16 reference or deterministic repeated greedy output.",
+    "DFlash2 cached-prefix draft features are not restored; measurements disable prompt and conversation caches.",
+    "Local arms use the same YaRN factor 2 configuration and a 524288-token context limit; this is not an exact reproduction of the published FP8 server launch."
+  ],
+  "collection_scope": {
+    "stopped_on_user_request": true,
+    "complete_dflash2_datasets": [
+      "gsm8k",
+      "math500",
+      "humaneval",
+      "mbpp",
+      "mt-bench"
+    ],
+    "complete_mtp_coupled_datasets": [
+      "gsm8k",
+      "math500",
+      "humaneval"
+    ],
+    "measured_acceptance_requests_completed": 1054,
+    "complete_cohort_requests_exported": 1024,
+    "partial_mtp_mbpp_requests_excluded": 30,
+    "aborted_request_excluded": true,
+    "mtp_coupled_mt_bench_started": false,
+    "mtp_point_acceptance_started": false
+  }
+}
