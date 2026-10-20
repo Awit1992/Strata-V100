@@ -1,0 +1,325 @@
+{
+  "scope": "One 32K row per arm; not a full context sweep or acceptance sweep.",
+  "runner": "bench/run_v100_bench.py",
+  "command": "python bench/run_v100_bench.py --model-gguf REGULAR_IQ3_S_SHARD1 --base TEST_BASE --model qwen --only 32K --max-tokens 2048 --seed 68 --repeats 1 --out RESULTS_DIR",
+  "measured_requests_per_arm": 1,
+  "runner_calibration_requests_per_arm": 5,
+  "frozen_implementation_commit": "9de841284d9ae487bc5bd965427453cab1bb057e",
+  "frozen_binary_md5": "30f022f52072b737e73a11aea64f4672",
+  "fused_binary_md5": "a56cddede9d045b8a558e34812a3ad39",
+  "post_measurement_cleanup": "Removed unused n_heads parameters from two CUDA kernels and their callers. No arithmetic changed. The incremental build passed.",
+  "controls": {
+    "target": "regular Qwen3.8-Flash-Next-GSQ-RCO IQ3_S",
+    "gpu_order": [
+      0,
+      1
+    ],
+    "layer_split": 16,
+    "pipeline_windows": 1,
+    "kv": "int8",
+    "max_context": 524288,
+    "rope_scaling": "yarn",
+    "rope_scale": 2,
+    "prompt_reuse": 0,
+    "route_resident": 0,
+    "route_tail_skip": 0,
+    "vram_reserve_mib": 1024,
+    "kv_growth": true,
+    "spec_min_p": 0,
+    "suffix_draft": 0,
+    "lookup_chain": 0,
+    "coupled_probability_verification": true,
+    "server_recovery_rules": false,
+    "prompt_seed": 68,
+    "explicit_sampler_seed": false,
+    "sampling": "Unchanged runner defaults. Output lengths and continuations differ.",
+    "verify_window": "Equal to the block size; MTP uses 4."
+  },
+  "caveats": [
+    "One repetition per arm, with no statistical significance claim.",
+    "The 2048-token cap is not a forced output length.",
+    "The one-row prompt has 29495 tokens and differs from the 29494-token prompt in the earlier full six-row run. Do not mix those cohorts.",
+    "Draft time per window is an observed aggregate, not an isolated kernel microbenchmark.",
+    "All count-scan arms use the frozen executable; only df4-fused uses the fused executable."
+  ],
+  "delta_definition": "Candidate minus MTP; percentage baseline is MTP.",
+  "arms": {
+    "df2": {
+      "arm": "df2",
+      "block": 2,
+      "draft_tokens": 1,
+      "row": {
+        "label": "32K",
+        "target": 29512,
+        "prompt_tokens": 29495,
+        "reused": 0,
+        "prompt_ms": 14460.7,
+        "prompt_tok_s": 2039.7,
+        "output_tokens": 2048,
+        "decode_ms": 41883.0,
+        "decode_tok_s": 48.9,
+        "hit_rate": 0.931,
+        "duration_s": 56.4,
+        "wall_s": 56.4,
+        "seed": 68,
+        "model": "qwen",
+        "max_tokens": 2048
+      },
+      "decode_timing": "strata decode timing: 1199 windows, avg T 2.00, 1.71 tokens/window, 34.93 ms/window = verify 27.31 (GPU-reach wait 6.97 + per-layer host 0.72 [plan 0.11 actq 0.05 jobs 0.01 CPU 6.51] + stage 0.44) + commit/emit 0.44 + draft 6.59; per layer-window: CPU experts 1.21 (1.35 entries), VRAM hits 18.32, PCIe 0.32; adapt wait 0.59 join 0.00, 11.9 swaps/window",
+      "engine_summary": "strata serve: prompt 29495 tokens = 0 reused + 29495 read in 14461 ms (2039.7 tok/s), 2048 generated in 41883 ms (48.9 tok/s), drafts accepted 849 of 1198, 0 checkpoints",
+      "window_metrics": {
+        "windows": 1199,
+        "average_verify_tokens": 2.0,
+        "tokens_per_window": 1.71,
+        "ms_per_window": 34.93,
+        "verify_ms": 27.31,
+        "draft_ms": 6.59,
+        "accepted": 849,
+        "proposed": 1198
+      },
+      "delta_vs_mtp": {
+        "decode_tok_s": -8.7,
+        "decode_percent": -15.1042
+      }
+    },
+    "df4": {
+      "arm": "df4",
+      "block": 4,
+      "draft_tokens": 3,
+      "row": {
+        "label": "32K",
+        "target": 29512,
+        "prompt_tokens": 29495,
+        "reused": 0,
+        "prompt_ms": 14475.8,
+        "prompt_tok_s": 2037.5,
+        "output_tokens": 2048,
+        "decode_ms": 41190.7,
+        "decode_tok_s": 49.7,
+        "hit_rate": 0.92,
+        "duration_s": 55.7,
+        "wall_s": 55.7,
+        "seed": 68,
+        "model": "qwen",
+        "max_tokens": 2048
+      },
+      "decode_timing": "strata decode timing: 811 windows, avg T 4.00, 2.53 tokens/window, 50.79 ms/window = verify 41.30 (GPU-reach wait 9.98 + per-layer host 1.04 [plan 0.22 actq 0.12 jobs 0.02 CPU 13.83] + stage 0.70) + commit/emit 0.48 + draft 7.24; per layer-window: CPU experts 2.49 (3.12 entries), VRAM hits 35.91, PCIe 0.88; adapt wait 1.77 join 0.00, 22.9 swaps/window",
+      "engine_summary": "strata serve: prompt 29495 tokens = 0 reused + 29495 read in 14476 ms (2037.5 tok/s), 2048 generated in 41191 ms (49.7 tok/s), drafts accepted 1237 of 2430, 0 checkpoints",
+      "window_metrics": {
+        "windows": 811,
+        "average_verify_tokens": 4.0,
+        "tokens_per_window": 2.53,
+        "ms_per_window": 50.79,
+        "verify_ms": 41.3,
+        "draft_ms": 7.24,
+        "accepted": 1237,
+        "proposed": 2430
+      },
+      "delta_vs_mtp": {
+        "decode_tok_s": -7.9,
+        "decode_percent": -13.7153
+      }
+    },
+    "df3": {
+      "arm": "df3",
+      "block": 3,
+      "draft_tokens": 2,
+      "row": {
+        "label": "32K",
+        "target": 29512,
+        "prompt_tokens": 29495,
+        "reused": 0,
+        "prompt_ms": 14526.0,
+        "prompt_tok_s": 2030.5,
+        "output_tokens": 1691,
+        "decode_ms": 34767.5,
+        "decode_tok_s": 48.6,
+        "hit_rate": 0.921,
+        "duration_s": 49.3,
+        "wall_s": 49.5,
+        "seed": 68,
+        "model": "qwen",
+        "max_tokens": 2048
+      },
+      "decode_timing": "strata decode timing: 775 windows, avg T 3.00, 2.18 tokens/window, 44.86 ms/window = verify 35.99 (GPU-reach wait 7.91 + per-layer host 3.64 [plan 0.17 actq 0.09 jobs 0.02 CPU 10.65] + stage 3.31) + commit/emit 0.47 + draft 6.99; per layer-window: CPU experts 1.92 (2.33 entries), VRAM hits 27.01, PCIe 0.61; adapt wait 1.41 join 0.00, 20.1 swaps/window",
+      "engine_summary": "strata serve: prompt 29495 tokens = 0 reused + 29495 read in 14526 ms (2030.5 tok/s), 1691 generated in 34767 ms (48.6 tok/s), drafts accepted 916 of 1548, 0 checkpoints",
+      "window_metrics": {
+        "windows": 775,
+        "average_verify_tokens": 3.0,
+        "tokens_per_window": 2.18,
+        "ms_per_window": 44.86,
+        "verify_ms": 35.99,
+        "draft_ms": 6.99,
+        "accepted": 916,
+        "proposed": 1548
+      },
+      "delta_vs_mtp": {
+        "decode_tok_s": -9.0,
+        "decode_percent": -15.625
+      }
+    },
+    "df8": {
+      "arm": "df8",
+      "block": 8,
+      "draft_tokens": 7,
+      "row": {
+        "label": "32K",
+        "target": 29512,
+        "prompt_tokens": 29495,
+        "reused": 0,
+        "prompt_ms": 14536.6,
+        "prompt_tok_s": 2029.0,
+        "output_tokens": 2048,
+        "decode_ms": 51852.6,
+        "decode_tok_s": 39.5,
+        "hit_rate": 0.925,
+        "duration_s": 66.4,
+        "wall_s": 66.4,
+        "seed": 68,
+        "model": "qwen",
+        "max_tokens": 2048
+      },
+      "decode_timing": "strata decode timing: 658 windows, avg T 7.99, 3.11 tokens/window, 78.80 ms/window = verify 67.89 (GPU-reach wait 15.58 + per-layer host 1.86 [plan 0.49 actq 0.21 jobs 0.04 CPU 23.45] + stage 1.21) + commit/emit 0.50 + draft 8.90; per layer-window: CPU experts 4.12 (5.84 entries), VRAM hits 72.11, PCIe 1.71; adapt wait 1.50 join 0.00, 23.9 swaps/window",
+      "engine_summary": "strata serve: prompt 29495 tokens = 0 reused + 29495 read in 14537 ms (2029.0 tok/s), 2048 generated in 51853 ms (39.5 tok/s), drafts accepted 1390 of 4599, 0 checkpoints",
+      "window_metrics": {
+        "windows": 658,
+        "average_verify_tokens": 7.99,
+        "tokens_per_window": 3.11,
+        "ms_per_window": 78.8,
+        "verify_ms": 67.89,
+        "draft_ms": 8.9,
+        "accepted": 1390,
+        "proposed": 4599
+      },
+      "delta_vs_mtp": {
+        "decode_tok_s": -18.1,
+        "decode_percent": -31.4236
+      }
+    },
+    "mtp": {
+      "arm": "mtp",
+      "block": 4,
+      "draft_tokens": 3,
+      "row": {
+        "label": "32K",
+        "target": 29512,
+        "prompt_tokens": 29495,
+        "reused": 0,
+        "prompt_ms": 15581.9,
+        "prompt_tok_s": 1892.9,
+        "output_tokens": 2048,
+        "decode_ms": 35534.8,
+        "decode_tok_s": 57.6,
+        "hit_rate": 0.932,
+        "duration_s": 51.1,
+        "wall_s": 51.1,
+        "seed": 68,
+        "model": "qwen",
+        "max_tokens": 2048
+      },
+      "decode_timing": "strata decode timing: 789 windows, avg T 4.00, 2.60 tokens/window, 45.04 ms/window = verify 38.33 (GPU-reach wait 10.06 + per-layer host 0.49 [plan 0.21 actq 0.10 jobs 0.02 CPU 11.44] + stage 0.03) + commit/emit 0.48 + draft 3.86; per layer-window: CPU experts 2.09 (2.65 entries), VRAM hits 36.56, PCIe 0.71; adapt wait 2.37 join 0.00, 20.7 swaps/window",
+      "engine_summary": "strata serve: prompt 29495 tokens = 0 reused + 29495 read in 15582 ms (1892.9 tok/s), 2048 generated in 35535 ms (57.6 tok/s), drafts accepted 1259 of 2364, 0 checkpoints",
+      "window_metrics": {
+        "windows": 789,
+        "average_verify_tokens": 4.0,
+        "tokens_per_window": 2.6,
+        "ms_per_window": 45.04,
+        "verify_ms": 38.33,
+        "draft_ms": 3.86,
+        "accepted": 1259,
+        "proposed": 2364
+      },
+      "delta_vs_mtp": {
+        "decode_tok_s": 0.0,
+        "decode_percent": 0.0
+      }
+    },
+    "df4-fused": {
+      "arm": "df4-fused",
+      "block": 4,
+      "draft_tokens": 3,
+      "row": {
+        "label": "32K",
+        "target": 29512,
+        "prompt_tokens": 29495,
+        "reused": 0,
+        "prompt_ms": 14453.2,
+        "prompt_tok_s": 2040.7,
+        "output_tokens": 1270,
+        "decode_ms": 25300.0,
+        "decode_tok_s": 50.2,
+        "hit_rate": 0.931,
+        "duration_s": 39.8,
+        "wall_s": 39.8,
+        "seed": 68,
+        "model": "qwen",
+        "max_tokens": 2048
+      },
+      "decode_timing": "strata decode timing: 530 windows, avg T 3.99, 2.40 tokens/window, 47.74 ms/window = verify 39.16 (GPU-reach wait 9.83 + per-layer host 1.07 [plan 0.22 actq 0.11 jobs 0.02 CPU 11.45] + stage 0.73) + commit/emit 0.48 + draft 6.31; per layer-window: CPU experts 2.10 (2.69 entries), VRAM hits 36.50, PCIe 0.70; adapt wait 1.79 join 0.00, 21.5 swaps/window",
+      "engine_summary": "strata serve: prompt 29495 tokens = 0 reused + 29495 read in 14453 ms (2040.7 tok/s), 1270 generated in 25300 ms (50.2 tok/s), drafts accepted 740 of 1587, 0 checkpoints",
+      "window_metrics": {
+        "windows": 530,
+        "average_verify_tokens": 3.99,
+        "tokens_per_window": 2.4,
+        "ms_per_window": 47.74,
+        "verify_ms": 39.16,
+        "draft_ms": 6.31,
+        "accepted": 740,
+        "proposed": 1587
+      },
+      "delta_vs_mtp": {
+        "decode_tok_s": -7.4,
+        "decode_percent": -12.8472
+      }
+    }
+  },
+  "fusion_change_vs_old_block4": {
+    "decode_tok_s": 0.5,
+    "decode_percent": 1.0060362173038184,
+    "draft_ms_per_window": -0.93,
+    "draft_percent": -12.845303867403324,
+    "scratch_bytes_saved": 311296
+  },
+  "verification": {
+    "focused_ctest_passed": 8,
+    "focused_tests": [
+      "dflash2_overflow_test",
+      "dflash2_attention_test",
+      "verify_parity",
+      "sampler_parity",
+      "spec_verify_parity",
+      "sampler_parity_one_block",
+      "sampler_parity_old",
+      "spec_prob_test"
+    ],
+    "real_checkpoint": "incoai/Qwen3.8-Flash-Next-DFlash2",
+    "checkpoint_revision": "a22a1744e85c17364dcc54a6a420af7135d4c7f6",
+    "real_checkpoint_hidden_values": 17920,
+    "real_checkpoint_hidden_values_finite": 17920,
+    "max_absolute_error_vs_numpy": 0.024612128734588623,
+    "relative_l2_error_vs_numpy": 0.001318683965198771,
+    "relative_l2_threshold": 0.03,
+    "normalized_sampled_proposals": 7,
+    "sampled_path_membership_checked": true,
+    "greedy_determinism_checked": true,
+    "independent_conditional_q_distribution_rechecked": false
+  },
+  "restoration": {
+    "service": "active/running",
+    "restarts": 0,
+    "model_list_loaded": true,
+    "authenticated_inference_answer": "4",
+    "approved_abliterated_assets_verified": true,
+    "gpu_order": [
+      0,
+      1
+    ],
+    "layer_split": 16,
+    "pipeline_windows": 2
+  },
+  "final_reviewed_source_sha256": {
+    "src/core/dflash2.cu": "5fd480afb79d5b044d2430f0d2d06e88cc291a5b625691b25c734467c9b8a23d",
+    "tests/core/dflash2_attention_test.cu": "6dd89dcf19a69825e7afb3577572b351bbc63a85f23bc4fe23d358c638d64de8"
+  },
+  "source_hash_scope": "Final reviewed files after the non-arithmetic unused-parameter cleanup; runtime measurements precede that cleanup."
+}

@@ -85,6 +85,15 @@ or change its attention mask.
 The context ring bounds each index to less than twice its capacity. Attention
 wraps that index with one conditional subtraction instead of integer division.
 
+The native backend packs Q/K/V and feed-forward gate/up weights at load time.
+Each pair or group of projections with the same input uses one matrix
+multiplication. Context K/V uses the K/V rows of the same packed weights.
+The output views retain their row strides through normalization, rotary
+embedding, attention, and context-ring writes. The SwiGLU kernel computes in
+FP32 and writes the existing FP16 operand for the down projection.
+These changes remove separate projection calls and redundant conversions.
+They do not change the draft algorithm or the FP32 accumulation rules.
+
 ## Limits and memory
 
 - This path requires the native Flash-Next target and its output projection.

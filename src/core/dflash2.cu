@@ -12,12 +12,20 @@
 //   per layer, over the block rows only:
 //     h        = input_layernorm(x)                                  (pre-norm, residual carried)
 //     pre, co  = attention_conv.prepare(h)     coef = base + delta, delta = kernel_projection(h)
-//     q,k,v    = q_proj|k_proj|v_proj(pre);  q,k: per-head RMSNorm then RoPE at the row's position
+//     q,k,v    = qkv(pre)        ONE GEMM over the packed [q_proj;k_proj;v_proj] weight, read back as
+//                                three row-stride views of its output; q and k then take their per-head
+//                                RMSNorm and RoPE at the row's position
 //     a        = softmax(q k^T * 128^-0.5) v   over [ctx K/V] ++ [block K/V], NON-CAUSAL, sliding window
 //     a        = attention_conv.finish(a, co);  h2,res = post_attention_layernorm(a, res)
-//     g,u      = gate_proj|up_proj(h2); h3 = down_proj(silu(g)*u)
+//     g,u      = gate_up(h2)     ONE GEMM over the packed [gate_proj;up_proj] weight, same two views
+//     h3       = down(silu(g)*u) the SwiGLU writes the down projection's fp16 operand directly
 //     y        = mlp_conv.finish(h3, mlp_conv.prepare(h2).co)
 //   out = norm(y + res)[1:]  -> target lm_head -> top-k -> selector lattice -> one path -> tokens + q
+//
+// The two packed weights are the checkpoint's own tensors, each uploaded into ONE allocation and read at
+// row offsets: a fused GEMM costs the same weight bytes, the same fp16 operands and the same fp32
+// accumulation as the projections it joins, and the k/v rows also serve the context K/V projection
+// (append_features).
 //
 // Native precision: BF16 checkpoint weights are rounded to FP16 at load time. Tiny values can round
 // or underflow; the loader rejects non-finite weights and magnitudes above 65504. cuBLAS uses FP16
@@ -632,11 +640,13 @@ __global__ void rmsnorm_res_kernel(const float* x, float* res, const float* __re
     }
 }
 
-/// Per-head RMSNorm (Qwen3's q_norm / k_norm), applied over each `head_dim` slice.
-__global__ void head_rmsnorm_kernel(float* __restrict__ x, const float* __restrict__ w, int n_heads,
-                                    int head_dim, float eps) {
+/// Per-head RMSNorm (Qwen3's q_norm / k_norm), applied over each `head_dim` slice.  `row_stride` is the
+/// row pitch of `x`: the fused QKV GEMM's output holds q, k and v in ONE buffer, so a row of it is
+/// wider than the head block this normalizes.
+__global__ void head_rmsnorm_kernel(float* __restrict__ x, const float* __restrict__ w, int head_dim,
+                                    int row_stride, float eps) {
     __shared__ float sh[32];
-    float* xr = x + ((size_t) blockIdx.x * n_heads + blockIdx.y) * head_dim;
+    float* xr = x + (size_t) blockIdx.x * row_stride + (size_t) blockIdx.y * head_dim;
     float sum = 0.0f;
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         const float v = xr[i];
@@ -646,12 +656,13 @@ __global__ void head_rmsnorm_kernel(float* __restrict__ x, const float* __restri
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) xr[i] = xr[i] * rstd * w[i];
 }
 
-/// Rotary (NeoX / HF Qwen3 half-split) at `pos0 + blockIdx.x`, in place.
-__global__ void rope_kernel(float* __restrict__ x, int n_heads, int head_dim, int64_t pos0,
+/// Rotary (NeoX / HF Qwen3 half-split) at `pos0 + blockIdx.x`, in place.  `row_stride` is the row pitch
+/// of `x` (head_rmsnorm_kernel: the fused QKV output is one buffer).
+__global__ void rope_kernel(float* __restrict__ x, int head_dim, int row_stride, int64_t pos0,
                             const float* __restrict__ inv_freq) {
     const int half = head_dim >> 1;
     if ((int) threadIdx.x >= half) return;
-    float* xr = x + ((size_t) blockIdx.x * n_heads + blockIdx.y) * head_dim;
+    float* xr = x + (size_t) blockIdx.x * row_stride + (size_t) blockIdx.y * head_dim;
     const float a = xr[threadIdx.x];
     const float b = xr[threadIdx.x + half];
     const float ang = (float) (pos0 + blockIdx.x) * inv_freq[threadIdx.x];
@@ -660,12 +671,21 @@ __global__ void rope_kernel(float* __restrict__ x, int n_heads, int head_dim, in
     xr[threadIdx.x + half] = b * c + a * s;
 }
 
-__global__ void silu_mul_kernel(const float* __restrict__ g, const float* __restrict__ u,
-                                float* __restrict__ out, int64_t n) {
-    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += (int64_t) gridDim.x * blockDim.x) {
+/// SwiGLU straight into the down-projection's fp16 operand.  `gate_up` is the packed gate/up GEMM's fp32
+/// output: row `r` starts at `gate_up + r * row_stride`, holds the gate in its first `inter` columns and
+/// `up` in the second.  `out16` is the [rows, inter] fp16 operand `down_proj` reads, so no fp32
+/// intermediate is written and no separate operand cast runs.  The value is the same fp32 expression
+/// this kernel has always written and `__float2half` is the same rounding the operand cast applied, so
+/// the down projection reads exactly the operands it read before.
+__global__ void swiglu_f16_kernel(const float* __restrict__ gate_up, __half* __restrict__ out16, int inter,
+                                  int row_stride) {
+    const float* g = gate_up + (size_t) blockIdx.x * row_stride;
+    const float* u = g + inter;
+    __half* o = out16 + (size_t) blockIdx.x * inter;
+    const int step = (int) (gridDim.y * blockDim.x);   // the row's columns are split over the grid's y
+    for (int i = (int) (blockIdx.y * blockDim.x) + (int) threadIdx.x; i < inter; i += step) {
         const float x = g[i];
-        out[i] = u[i] * (x / (1.0f + __expf(-x)));
+        o[i] = __float2half(u[i] * (x / (1.0f + __expf(-x))));
     }
 }
 
@@ -699,11 +719,15 @@ __global__ void grouped_conv_kernel(const float* __restrict__ src, const float* 
 /// query-key dot product across the warp. Value accumulation retains the existing partitioned
 /// reduction: head-sized thread groups visit disjoint keys, then one thread combines their
 /// partials and writes each output dimension.
+/// `q_stride` is q's row pitch and `blk_stride` the block K/V rows': the fused QKV GEMM leaves q, k and
+/// v in one buffer, so a row of it is wider than the head blocks the kernel reads out of it.  Both must
+/// be multiples of 4: the head-block loads are float4.
 __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict__ k_ring,
                             const float* __restrict__ v_ring, const float* __restrict__ k_blk,
                             const float* __restrict__ v_blk, float* __restrict__ out, int n_blk,
-                            int n_q_heads, int n_kv_heads, int head_dim, int ring_start, int ring_cap,
-                            int ctx_len, int64_t ctx_pos0, int64_t q_pos0, int window, float scale) {
+                            int n_q_heads, int n_kv_heads, int head_dim, int q_stride, int blk_stride,
+                            int ring_start, int ring_cap, int ctx_len, int64_t ctx_pos0, int64_t q_pos0,
+                            int window, float scale) {
     extern __shared__ float sh[];
     const int row = blockIdx.x, h = blockIdx.y;
     const int tid = threadIdx.x;
@@ -713,7 +737,7 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
     const int gqa = n_q_heads / n_kv_heads;
     const int kvh = h / gqa;
     const int64_t qpos = q_pos0 + row;
-    const float* qrow = q + ((size_t) row * n_q_heads + h) * head_dim;
+    const float* qrow = q + (size_t) row * q_stride + (size_t) h * head_dim;
     const int lane = tid & 31;
     const int wid = tid >> 5;
     const int nwarp = blockDim.x >> 5;
@@ -739,7 +763,7 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
         } else {
             const int j = i - ctx_len;
             kpos = q_pos0 + j;
-            krow = k_blk + ((size_t) j * n_kv_heads + kvh) * head_dim;
+            krow = k_blk + (size_t) j * blk_stride + (size_t) kvh * head_dim;
         }
         float s = -INFINITY;
         const int64_t d = qpos - kpos;                  // uniform across the warp: i depends on wid
@@ -788,7 +812,7 @@ __global__ void attn_kernel(const float* __restrict__ q, const float* __restrict
             const int slot = index < ring_cap ? index : index - ring_cap;
             vrow = v_ring + ((size_t) slot * n_kv_heads + kvh) * head_dim;
         } else
-            vrow = v_blk + ((size_t) (i - ctx_len) * n_kv_heads + kvh) * head_dim;
+            vrow = v_blk + (size_t) (i - ctx_len) * blk_stride + (size_t) kvh * head_dim;
         acc = fmaf(scores[i] * inv, vrow[d], acc);
     }
     float* vred = red + 32;
@@ -1013,13 +1037,16 @@ __global__ void selector_kernel(const int32_t* __restrict__ cand_ids, const floa
     }
 }
 
-/// Writes `count` rows into the ring at absolute rows `first..first+count-1` (modulo `cap`).
+/// Writes `count` rows into the ring at absolute rows `first..first+count-1` (modulo `cap`).  A `src` row
+/// is `row_len` values wide but pitched `src_stride` apart: the context K/V projection writes both halves
+/// of the packed [k;v] weight into one buffer, so its k rows are not `row_len` apart.
 __global__ void ring_write_kernel(const float* __restrict__ src, float* __restrict__ ring, int row_len,
-                                  int cap, int first, int count) {
+                                  int src_stride, int cap, int first, int count) {
     const int i = blockIdx.x;
     if (i >= count) return;
     const int dst = (first + i) % cap;
-    for (int j = threadIdx.x; j < row_len; j += blockDim.x) ring[dst * row_len + j] = src[i * row_len + j];
+    for (int j = threadIdx.x; j < row_len; j += blockDim.x)
+        ring[dst * row_len + j] = src[(size_t) i * src_stride + j];
 }
 
 /// Target tap rows -> one context row: the hyper-connection streams are averaged, the taps
@@ -1061,12 +1088,19 @@ struct DFlash2Backend::Impl {
     int cap = 2047;                       // ring rows
     int32_t mask_token = 248077;
     int kv_dim = 1024;
+    int q_dim = 4096;                  ///< heads * hd: the q rows of the packed QKV weight
+    int qkv_dim = 6144;                ///< q_dim + 2 * kv_dim: the packed QKV weight's rows
 
     struct Layer {
         const float *input_ln = nullptr, *post_ln = nullptr, *q_norm = nullptr, *k_norm = nullptr;
         const float *attn_base = nullptr, *mlp_base = nullptr;
-        const __half *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr;
-        const __half *gate = nullptr, *up = nullptr, *down = nullptr;
+        /// the packed QKV weight [heads*hd + 2*kv_dim, hidden]: q's rows first, then k's, then v's.  One
+        /// GEMM produces all three, and the k/v slice is also the context K/V projection's operand.
+        const __half* qkv = nullptr;
+        const __half* o = nullptr;
+        /// the packed gate/up weight [2*inter, hidden] - one GEMM produces both SwiGLU operands.
+        const __half* gate_up = nullptr;
+        const __half* down = nullptr;
         const __half *attn_kproj = nullptr, *mlp_kproj = nullptr;
     };
     std::vector<Layer> layers;
@@ -1090,12 +1124,18 @@ struct DFlash2Backend::Impl {
     std::vector<void*> allocs;
     float *emb = nullptr, *x_next = nullptr, *res = nullptr, *h = nullptr;
     float *conv_pre = nullptr, *attn_pre = nullptr;
-    float *q = nullptr, *k = nullptr, *v = nullptr, *blk_k = nullptr, *blk_v = nullptr;
+    /// the fused QKV GEMM's output [B, qkv_dim]: q's columns first, then k's, then v's.  Every consumer
+    /// reads one of the three as a row-stride view of this buffer (see propose).
+    float *qkv = nullptr;
     float *attn_out = nullptr, *attn_proj = nullptr, *attn_fin = nullptr, *h2 = nullptr;
-    float *gate = nullptr, *up = nullptr, *act = nullptr, *mlp_out = nullptr;
+    /// the fused gate/up GEMM's output [B, 2*inter]: gate's columns first, then up's.
+    float *gate_up = nullptr;
+    float *mlp_out = nullptr;
     float *final_h = nullptr;
-    float *ctx_f = nullptr, *ctx_hidden = nullptr, *tmp_k = nullptr, *tmp_v = nullptr;
-    __half* x16 = nullptr;                ///< the fp16 copy of a GEMM operand (the reference's cast)
+    /// the fused context K/V GEMM's output [kChunkRows, 2*kv_dim]: k's columns first, then v's.
+    float *ctx_f = nullptr, *ctx_hidden = nullptr, *tmp_kv = nullptr;
+    __half* x16 = nullptr;                ///< the fp16 copy of a GEMM operand (the reference's cast), and
+                                          ///< the down projection's operand once the SwiGLU wrote it
     float *delta = nullptr, *delta2 = nullptr, *H = nullptr, *logits = nullptr;
     int32_t* cand_ids = nullptr;
     float* cand_vals = nullptr;
@@ -1143,17 +1183,26 @@ struct DFlash2Backend::Impl {
 
     /// y[n_tok, n_out] = fp16(x) * W^T, fp32 accumulate and fp32 output - the reference's matmul
     /// (`x.astype(fp16) @ w.T`, weights already fp16).  The activation is rounded to fp16 on the way
-    /// in; nothing else in the step is, so a large residual cannot overflow.
+    /// in; nothing else in the step is, so a large residual cannot overflow.  A packed weight (the QKV
+    /// and gate/up groups) is one operand: its row blocks are the projections it joins, so `W` may point
+    /// at any row of it and `n_out` is the row count of the slice being produced.
     bool gemm(const __half* W, int n_out, int n_in, const float* x, int n_tok, float* y,
               const char* what, std::string& err) {
         const int64_t n = (int64_t) n_tok * n_in;
         if (n > 0)
             f32_to_f16_kernel<<<(unsigned) ((n + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
                 x, x16, n);
+        return gemm16(W, n_out, n_in, x16, n_tok, y, what, err);
+    }
+
+    /// The same GEMM with an operand that is ALREADY fp16 in `x16`: the fused SwiGLU writes the down
+    /// projection's operand itself, so there is nothing left to cast.
+    bool gemm16(const __half* W, int n_out, int n_in, const __half* x16_operand, int n_tok, float* y,
+                const char* what, std::string& err) {
         const float one = 1.0f, zero = 0.0f;
         return blas_ok(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, n_out, n_tok, n_in, &one, W,
-                                    CUDA_R_16F, n_in, x16, CUDA_R_16F, n_in, &zero, y, CUDA_R_32F, n_out,
-                                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                                    CUDA_R_16F, n_in, x16_operand, CUDA_R_16F, n_in, &zero, y, CUDA_R_32F,
+                                    n_out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
                        what, err);
     }
 
@@ -1214,6 +1263,8 @@ bool DFlash2Backend::Impl::load(const DFlash2Config& c, std::string& err) {
     mask_token = g.mask;
     groups = hidden / group;
     kv_dim = kv_heads * hd;
+    q_dim = heads * hd;
+    qkv_dim = q_dim + 2 * kv_dim;
     scale = 1.0f / std::sqrt((float) hd);
 
     if (!cuda_ok(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream", err)) return false;
@@ -1231,9 +1282,11 @@ bool DFlash2Backend::Impl::load(const DFlash2Config& c, std::string& err) {
         }
     }
 
-    // bf16 -> fp16/fp32, with the fp16 range check the conversion needs.
-    auto convert = [&](const std::string& name, std::initializer_list<int64_t> dims, bool as_f32, void** dst,
-                       std::string& e) -> bool {
+    // bf16 -> fp16/fp32, with the fp16 range check the conversion needs.  A `base`/`elem_off` pair uploads
+    // the tensor into a slice of an existing allocation: the packed QKV and gate/up weights hold the
+    // layout one GEMM needs without their tensors ever existing twice.
+    auto convert = [&](const std::string& name, std::initializer_list<int64_t> dims, bool as_f32, void* base,
+                       size_t elem_off, void** dst, std::string& e) -> bool {
         const StTensor* t = st.find(name);
         if (t == nullptr) { e = "dflash2: the checkpoint has no tensor '" + name + "'"; return false; }
         if (t->dtype != "BF16") { e = "dflash2: '" + name + "' is " + t->dtype + ", expected BF16"; return false; }
@@ -1251,8 +1304,11 @@ bool DFlash2Backend::Impl::load(const DFlash2Config& c, std::string& err) {
             e = "dflash2: '" + name + "' has shape [" + got + "], expected [" + want_s + "]";
             return false;
         }
-        void* dev = nullptr;
-        if (!alloc(&dev, (size_t) want * (as_f32 ? 4 : 2), name.c_str(), e)) return false;
+        const size_t esz = as_f32 ? 4 : 2;
+        if (base == nullptr) {
+            if (!alloc(&base, (size_t) want * esz, name.c_str(), e)) return false;
+        }
+        char* out = (char*) base + elem_off * esz;
         std::vector<float> fbuf;
         std::vector<uint16_t> hbuf;
         if (as_f32) fbuf.resize((size_t) std::min<int64_t>(want, 1 << 21));
@@ -1274,8 +1330,8 @@ bool DFlash2Backend::Impl::load(const DFlash2Config& c, std::string& err) {
                 else hbuf[(size_t) i] = bf16_to_f16(src[i]);
             }
             const void* host = as_f32 ? (const void*) fbuf.data() : (const void*) hbuf.data();
-            if (cudaMemcpyAsync((char*) dev + done * (as_f32 ? 4 : 2), host,
-                                (size_t) n * (as_f32 ? 4 : 2), cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+            if (cudaMemcpyAsync(out + done * esz, host, (size_t) n * esz, cudaMemcpyHostToDevice,
+                                stream) != cudaSuccess) {
                 e = "dflash2: uploading '" + name + "' failed";
                 return false;
             }
@@ -1292,14 +1348,19 @@ bool DFlash2Backend::Impl::load(const DFlash2Config& c, std::string& err) {
         if (debug)
             std::fprintf(stderr, "dflash2: %-52s bf16->%s max|v|=%.4g\n", name.c_str(),
                          as_f32 ? "f32" : "f16", max_abs);
-        *dst = dev;
+        if (dst != nullptr) *dst = base;
         return true;
     };
     auto load_f16 = [&](const std::string& n, const __half** dst, std::initializer_list<int64_t> dims) {
-        return convert(n, dims, false, (void**) dst, err);
+        return convert(n, dims, false, nullptr, 0, (void**) dst, err);
     };
     auto load_f32 = [&](const std::string& n, const float** dst, std::initializer_list<int64_t> dims) {
-        return convert(n, dims, true, (void**) dst, err);
+        return convert(n, dims, true, nullptr, 0, (void**) dst, err);
+    };
+    /// `name`'s rows, converted to fp16 into the row slice starting at `elem_off` of `base`.
+    auto load_f16_into = [&](const std::string& n, void* base, size_t elem_off,
+                             std::initializer_list<int64_t> dims) {
+        return convert(n, dims, false, base, elem_off, nullptr, err);
     };
 
     // fc's width is the tap count's fail-fast check: taps x the target's per-stream hidden
@@ -1319,12 +1380,27 @@ bool DFlash2Backend::Impl::load(const DFlash2Config& c, std::string& err) {
         if (!load_f32(p + "post_attention_layernorm.weight", &L.post_ln, {hidden})) return false;
         if (!load_f32(p + "self_attn.q_norm.weight", &L.q_norm, {hd})) return false;
         if (!load_f32(p + "self_attn.k_norm.weight", &L.k_norm, {hd})) return false;
-        if (!load_f16(p + "self_attn.q_proj.weight", &L.q, {heads * hd, hidden})) return false;
-        if (!load_f16(p + "self_attn.k_proj.weight", &L.k, {kv_dim, hidden})) return false;
-        if (!load_f16(p + "self_attn.v_proj.weight", &L.v, {kv_dim, hidden})) return false;
-        if (!load_f16(p + "self_attn.o_proj.weight", &L.o, {hidden, heads * hd})) return false;
-        if (!load_f16(p + "mlp.gate_proj.weight", &L.gate, {inter, hidden})) return false;
-        if (!load_f16(p + "mlp.up_proj.weight", &L.up, {inter, hidden})) return false;
+        // The QKV weight is packed once, in ONE allocation: q's rows first, then k's, then v's.  A single
+        // GEMM over the packed operand produces all three (propose), and the k/v rows are also the context
+        // K/V projection's operand (append).  The packed tensor takes exactly the bytes the three
+        // separate tensors took.
+        void* wqkv = nullptr;
+        if (!alloc(&wqkv, (size_t) qkv_dim * hidden * 2, "qkv weight", err)) return false;
+        L.qkv = (const __half*) wqkv;
+        if (!load_f16_into(p + "self_attn.q_proj.weight", wqkv, 0, {q_dim, hidden})) return false;
+        if (!load_f16_into(p + "self_attn.k_proj.weight", wqkv, (size_t) q_dim * hidden, {kv_dim, hidden}))
+            return false;
+        if (!load_f16_into(p + "self_attn.v_proj.weight", wqkv, (size_t) (q_dim + kv_dim) * hidden,
+                           {kv_dim, hidden}))
+            return false;
+        if (!load_f16(p + "self_attn.o_proj.weight", &L.o, {hidden, q_dim})) return false;
+        // gate/up the same way: one packed operand, one GEMM, both SwiGLU operands.
+        void* wgate_up = nullptr;
+        if (!alloc(&wgate_up, (size_t) 2 * inter * hidden * 2, "gate/up weight", err)) return false;
+        L.gate_up = (const __half*) wgate_up;
+        if (!load_f16_into(p + "mlp.gate_proj.weight", wgate_up, 0, {inter, hidden})) return false;
+        if (!load_f16_into(p + "mlp.up_proj.weight", wgate_up, (size_t) inter * hidden, {inter, hidden}))
+            return false;
         if (!load_f16(p + "mlp.down_proj.weight", &L.down, {hidden, inter})) return false;
         // the conv base kernels are [2 (pre/post side), conv taps, hidden]; the projections
         // [2 * conv taps * groups, hidden]
@@ -1359,28 +1435,22 @@ bool DFlash2Backend::Impl::load(const DFlash2Config& c, std::string& err) {
     if (!alloc_t(&h, bb * hidden, "h", err)) return false;
     if (!alloc_t(&conv_pre, bb * hidden, "conv", err)) return false;
     if (!alloc_t(&attn_pre, bb * hidden, "attn_pre", err)) return false;
-    if (!alloc_t(&q, bb * (size_t) heads * hd, "q", err)) return false;
-    if (!alloc_t(&k, bb * kv_dim, "k", err)) return false;
-    if (!alloc_t(&v, bb * kv_dim, "v", err)) return false;
-    if (!alloc_t(&blk_k, bb * kv_dim, "blk k", err)) return false;
-    if (!alloc_t(&blk_v, bb * kv_dim, "blk v", err)) return false;
-    if (!alloc_t(&attn_out, bb * (size_t) heads * hd, "attn out", err)) return false;
+    if (!alloc_t(&qkv, bb * qkv_dim, "qkv", err)) return false;
+    if (!alloc_t(&attn_out, bb * q_dim, "attn out", err)) return false;
     if (!alloc_t(&attn_proj, bb * hidden, "attn proj", err)) return false;
     if (!alloc_t(&attn_fin, bb * hidden, "attn fin", err)) return false;
     if (!alloc_t(&h2, bb * hidden, "h2", err)) return false;
-    if (!alloc_t(&gate, bb * inter, "gate", err)) return false;
-    if (!alloc_t(&up, bb * inter, "up", err)) return false;
-    if (!alloc_t(&act, bb * inter, "act", err)) return false;
+    if (!alloc_t(&gate_up, bb * 2 * inter, "gate/up", err)) return false;
     if (!alloc_t(&mlp_out, bb * hidden, "mlp", err)) return false;
     if (!alloc_t(&final_h, bb * hidden, "final", err)) return false;
     if (!alloc_t(&delta, bb * (size_t) 2 * ctaps * groups, "delta", err)) return false;
     if (!alloc_t(&delta2, bb * (size_t) 2 * ctaps * groups, "delta2", err)) return false;
     if (!alloc_t(&ctx_f, (size_t) kChunkRows * taps * thid, "ctx features", err)) return false;
     if (!alloc_t(&ctx_hidden, (size_t) kChunkRows * hidden, "ctx hidden", err)) return false;
-    if (!alloc_t(&tmp_k, (size_t) kChunkRows * kv_dim, "ctx k", err)) return false;
-    if (!alloc_t(&tmp_v, (size_t) kChunkRows * kv_dim, "ctx v", err)) return false;
-    // the largest GEMM operand is the context's fc input (kChunkRows x taps x target_hidden)
-    if (!alloc_t(&x16, (size_t) kChunkRows * taps * thid, "gemm operand", err)) return false;
+    if (!alloc_t(&tmp_kv, (size_t) kChunkRows * 2 * kv_dim, "ctx kv", err)) return false;
+    // the largest GEMM operand: the context's fc input, or the fused SwiGLU's own fp16 output
+    const size_t x16_n = std::max((size_t) kChunkRows * taps * thid, bb * inter);
+    if (!alloc_t(&x16, x16_n, "gemm operand", err)) return false;
     if (!alloc_t(&H, (size_t) slots * rank, "H", err)) return false;
     if (!alloc_t(&logits, (size_t) slots * (size_t) vocab, "logits", err)) return false;
     if (!alloc_t(&cand_ids, (size_t) slots * top_k, "cand ids", err)) return false;
@@ -1446,6 +1516,7 @@ bool DFlash2Backend::Impl::append(const float* dev_tap_rows, int64_t n_rows, int
     next_pos += n_rows;
 
     const int kv_dim_ = kv_dim;
+    const int kv2 = 2 * kv_dim_;
     for (int64_t off = first_row; off < n_rows; off += kChunkRows) {
         const int m = (int) std::min<int64_t>(kChunkRows, n_rows - off);
         build_ctx_features_kernel<<<m, kThreads, 0, stream>>>(dev_tap_rows, ctx_f, taps, hc, thid,
@@ -1456,17 +1527,21 @@ bool DFlash2Backend::Impl::append(const float* dev_tap_rows, int64_t n_rows, int
         const int64_t pos0 = base_pos + off;
         for (int li = 0; li < n_layers; ++li) {
             const Layer& L = layers[(size_t) li];
-            if (!gemm(L.k, kv_dim_, hidden, ctx_hidden, m, tmp_k, "ctx k_proj", err)) return false;
-            if (!gemm(L.v, kv_dim_, hidden, ctx_hidden, m, tmp_v, "ctx v_proj", err)) return false;
+            // One GEMM over the packed weight's k/v rows: k lands in the first kv_dim columns of a
+            // [m, 2*kv_dim] row and v in the second, so both are views of one output buffer.
+            if (!gemm(L.qkv + (size_t) q_dim * hidden, kv2, hidden, ctx_hidden, m, tmp_kv, "ctx kv_proj",
+                      err)) return false;
+            float* tmp_k = tmp_kv;
+            float* tmp_v = tmp_kv + kv_dim_;
             head_rmsnorm_kernel<<<dim3((unsigned) m, (unsigned) kv_heads), 128, 0, stream>>>(
-                tmp_k, L.k_norm, kv_heads, hd, eps);
+                tmp_k, L.k_norm, hd, kv2, eps);
             rope_kernel<<<dim3((unsigned) m, (unsigned) kv_heads), (unsigned) (hd / 2), 0, stream>>>(
-                tmp_k, kv_heads, hd, pos0, inv_freq);
+                tmp_k, hd, kv2, pos0, inv_freq);
             const int first = (int) ((ring_start + keep + (off - first_row)) % cap);
             ring_write_kernel<<<(unsigned) m, kThreads, 0, stream>>>(tmp_k, ring_k[(size_t) li], kv_dim_,
-                                                                     cap, first, m);
+                                                                     kv2, cap, first, m);
             ring_write_kernel<<<(unsigned) m, kThreads, 0, stream>>>(tmp_v, ring_v[(size_t) li], kv_dim_,
-                                                                     cap, first, m);
+                                                                     kv2, cap, first, m);
         }
     }
     if (!cuda_ok(cudaGetLastError(), "append kernels", err)) return false;
@@ -1496,6 +1571,11 @@ bool DFlash2Backend::Impl::propose(int32_t anchor_id, int64_t start_pos, const f
     // the layers ping-pong between two row buffers: no copy of a layer's output per layer
     float* lin = emb;
     float* lout = x_next;
+    // the fused QKV GEMM's output holds q, k and v in ONE buffer; the three below are row-stride views
+    // of it, so a row of each is qkv_dim wide rather than the head block's own width
+    float* q = qkv;
+    float* blk_k = qkv + q_dim;
+    float* blk_v = blk_k + kv_dim_;
 
     for (int li = 0; li < n_layers; ++li) {
         const Layer& L = layers[(size_t) li];
@@ -1503,21 +1583,21 @@ bool DFlash2Backend::Impl::propose(int32_t anchor_id, int64_t start_pos, const f
         if (!gemm(L.attn_kproj, 2 * ctaps * groups, hh, h, bb, delta, "attn conv proj", err)) return false;
         grouped_conv_kernel<<<bb, kThreads, 0, stream>>>(h, delta, L.attn_base, conv_pre, hh, ctaps, group,
                                                          B, 0);
-        if (!gemm(L.q, nq * hd_, hh, conv_pre, bb, q, "q_proj", err)) return false;
-        if (!gemm(L.k, kv_dim_, hh, conv_pre, bb, blk_k, "k_proj", err)) return false;
-        if (!gemm(L.v, kv_dim_, hh, conv_pre, bb, blk_v, "v_proj", err)) return false;
-        head_rmsnorm_kernel<<<dim3((unsigned) bb, (unsigned) nq), 128, 0, stream>>>(q, L.q_norm, nq, hd_, eps);
-        head_rmsnorm_kernel<<<dim3((unsigned) bb, (unsigned) nkv), 128, 0, stream>>>(blk_k, L.k_norm, nkv, hd_, eps);
-        rope_kernel<<<dim3((unsigned) bb, (unsigned) nq), (unsigned) (hd_ / 2), 0, stream>>>(q, nq, hd_,
-                                                                                            start_pos, inv_freq);
-        rope_kernel<<<dim3((unsigned) bb, (unsigned) nkv), (unsigned) (hd_ / 2), 0, stream>>>(blk_k, nkv, hd_,
-                                                                                             start_pos, inv_freq);
+        if (!gemm(L.qkv, qkv_dim, hh, conv_pre, bb, qkv, "qkv_proj", err)) return false;
+        head_rmsnorm_kernel<<<dim3((unsigned) bb, (unsigned) nq), 128, 0, stream>>>(q, L.q_norm, hd_,
+                                                                                   qkv_dim, eps);
+        head_rmsnorm_kernel<<<dim3((unsigned) bb, (unsigned) nkv), 128, 0, stream>>>(blk_k, L.k_norm,
+                                                                                    hd_, qkv_dim, eps);
+        rope_kernel<<<dim3((unsigned) bb, (unsigned) nq), (unsigned) (hd_ / 2), 0, stream>>>(
+            q, hd_, qkv_dim, start_pos, inv_freq);
+        rope_kernel<<<dim3((unsigned) bb, (unsigned) nkv), (unsigned) (hd_ / 2), 0, stream>>>(
+            blk_k, hd_, qkv_dim, start_pos, inv_freq);
 
         const int n_keys = (int) ctx_len + bb;
         const size_t shmem = ((size_t) n_keys + 32 + (size_t) (kThreads / hd_) * hd_) * sizeof(float);
         attn_kernel<<<dim3((unsigned) bb, (unsigned) nq), kThreads, shmem, stream>>>(
-            q, ring_k[(size_t) li], ring_v[(size_t) li], blk_k, blk_v, attn_out, bb, nq, nkv, hd_, ring_start,
-            cap, (int) ctx_len, next_pos - ctx_len, start_pos, window, scale);
+            q, ring_k[(size_t) li], ring_v[(size_t) li], blk_k, blk_v, attn_out, bb, nq, nkv, hd_, qkv_dim,
+            qkv_dim, ring_start, cap, (int) ctx_len, next_pos - ctx_len, start_pos, window, scale);
         if (!gemm(L.o, hh, nq * hd_, attn_out, bb, attn_proj, "o_proj", err)) return false;
         grouped_conv_kernel<<<bb, kThreads, 0, stream>>>(attn_proj, delta, L.attn_base, attn_fin, hh, ctaps,
                                                          group, B, 1);
@@ -1526,11 +1606,12 @@ bool DFlash2Backend::Impl::propose(int32_t anchor_id, int64_t start_pos, const f
         if (!gemm(L.mlp_kproj, 2 * ctaps * groups, hh, h2, bb, delta2, "mlp conv proj", err)) return false;
         grouped_conv_kernel<<<bb, kThreads, 0, stream>>>(h2, delta2, L.mlp_base, attn_pre, hh, ctaps, group,
                                                          B, 0);
-        if (!gemm(L.gate, inter, hh, attn_pre, bb, gate, "gate_proj", err)) return false;
-        if (!gemm(L.up, inter, hh, attn_pre, bb, up, "up_proj", err)) return false;
-        silu_mul_kernel<<<(unsigned) ((bb * (int64_t) inter + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
-            gate, up, act, (int64_t) bb * inter);
-        if (!gemm(L.down, hh, inter, act, bb, mlp_out, "down_proj", err)) return false;
+        if (!gemm(L.gate_up, 2 * inter, hh, attn_pre, bb, gate_up, "gate/up_proj", err)) return false;
+        // the SwiGLU writes the down projection's fp16 operand (x16) itself: no fp32 `act` row buffer, no
+        // separate operand cast, and the down projection reads the same operands it read before
+        swiglu_f16_kernel<<<dim3((unsigned) bb, (unsigned) ((inter + kThreads - 1) / kThreads)), kThreads, 0,
+                            stream>>>(gate_up, x16, inter, 2 * inter);
+        if (!gemm16(L.down, hh, inter, x16, bb, mlp_out, "down_proj", err)) return false;
         grouped_conv_kernel<<<bb, kThreads, 0, stream>>>(mlp_out, delta2, L.mlp_base, lout, hh, ctaps, group,
                                                          B, 1);
         std::swap(lin, lout);

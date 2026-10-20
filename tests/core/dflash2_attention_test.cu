@@ -25,7 +25,10 @@
 //   - the cases cover an empty ring (ctx 0) and a full one (2047), head_dim 8/16/128/256, a ring
 //     that wraps, the 4:1 GQA share at 1, 2 and 8 kv heads, and block positions whose delta to the
 //     oldest keys is exactly 2048: the sliding window is strict (|delta| < 2048), so both sides of
-//     that bound are checked and not assumed.
+//     that bound are checked and not assumed;
+//   - two cases give every query and block-K/V row a PITCH wider than its head blocks - the layout the
+//     backend's fused QKV GEMM produces - and leave the slack NaN, so a kernel that ignores the stride
+//     it is handed reads NaN (or another row) instead of the numbers the reference uses.
 // The measured error is ~1e-6 relative against the 5e-5 / 1e-4 bounds below.
 // Needs a CUDA device (exits 77 without one).
 #include "../../src/core/dflash2.cu"
@@ -62,10 +65,14 @@ struct Case {
     int ring_start;      ///< the slot the first context row lands in
     int64_t ctx_pos0;
     int64_t q_pos0;
+    /// Extra floats per row past the head blocks.  The backend's fused QKV GEMM leaves q, k and v in ONE
+    /// buffer, so the kernel reads each row at a pitch wider than a head block; 0 is the packed layout.
+    /// Every pitch stays a multiple of 4 (the kernel's float4 head-block loads).
+    int slack = 0;
 };
 
 /// The geometries under test, as {ctx, block, head_dim, q_heads, kv_heads, ring_start, ctx_pos0,
-/// q_pos0}:
+/// q_pos0, slack}:
 ///   1  no ring: the keys are the block's own rows
 ///   2  a 3-row context at slots 2046, 2047, 0 - the ring wraps between two context rows
 ///   3  a full 2047-row ring that wraps after 3 rows: the newest context key sits 2047 away, one
@@ -77,6 +84,10 @@ struct Case {
 ///   7  the narrowest head (8): two float4 slots per row
 ///   8  the block sits 2048 past the context, so the oldest keys land exactly ON the bound (masked)
 ///      and one inside it (visible)
+///   9  a full ring with a slack of 8: every row of the query and of the block K/V sits at a pitch the
+///      packed layout would not produce, so a kernel that ignores the stride it is given reads the
+///      slack (NaN) or another row instead of the numbers the reference uses
+///  10  the narrow-head case with a slack of 4
 constexpr Case kCases[] = {
     {0, 4, 128, 32, 8, 0, 100, 100},
     {3, 8, 128, 32, 8, 2046, 97, 100},
@@ -86,32 +97,47 @@ constexpr Case kCases[] = {
     {3, 8, 256, 8, 2, 2046, 97, 100},
     {3, 4, 8, 4, 1, 2046, 97, 100},
     {3, 8, 128, 8, 2, 2046, 12048, 10000},
+    {2047, 8, 128, 32, 8, 37, 7953, 10000, 8},
+    {3, 4, 16, 4, 1, 2046, 97, 100, 4},
 };
+
+/// The row pitch of the fixture's query and block K/V buffers: the head blocks plus `slack` floats.
+int q_pitch(const Case& c) { return c.q_heads * c.head_dim + c.slack; }
+int kv_pitch(const Case& c) { return c.kv_heads * c.head_dim + c.slack; }
 
 /// The K/V fixture.  Only the scale of the numbers is deliberate: V is 1e5 so a relative tolerance
 /// cannot be met by a result that lost the tail of the mixture, and the ring outside the `ctx` rows
-/// stays NaN.
+/// stays NaN.  So does every row's slack, so a read at the wrong pitch cannot land on a number.
 struct Fixture {
-    std::vector<float> query;     ///< [block][q_heads][head_dim]
+    std::vector<float> query;     ///< [block][q_pitch], the head blocks then the slack
     std::vector<float> ring_k;    ///< [ring_cap][kv_heads][head_dim], NaN outside the ctx rows
     std::vector<float> ring_v;    ///< ditto
-    std::vector<float> block_k;   ///< [block][kv_heads][head_dim]
+    std::vector<float> block_k;   ///< [block][kv_pitch]
     std::vector<float> block_v;   ///< ditto
 };
 
 Fixture make_fixture(const Case& c) {
+    const int qp = q_pitch(c), kvp = kv_pitch(c);
     Fixture f;
-    f.query.resize((size_t) c.block * c.q_heads * c.head_dim);
+    f.query.assign((size_t) c.block * qp, kNaN);
     f.ring_k.assign((size_t) kRingCap * c.kv_heads * c.head_dim, kNaN);
     f.ring_v.assign((size_t) kRingCap * c.kv_heads * c.head_dim, kNaN);
-    f.block_k.resize((size_t) c.block * c.kv_heads * c.head_dim);
-    f.block_v.resize((size_t) c.block * c.kv_heads * c.head_dim);
+    f.block_k.assign((size_t) c.block * kvp, kNaN);
+    f.block_v.assign((size_t) c.block * kvp, kNaN);
 
-    for (size_t i = 0; i < f.query.size(); ++i) f.query[i] = std::sin((float) i * 0.017f) * 0.7f;
-    for (size_t i = 0; i < f.block_k.size(); ++i) {
-        f.block_k[i] = std::cos((float) i * 0.019f) * 0.9f;
-        f.block_v[i] = std::sin((float) i * 0.031f) * 100000.0f;
-    }
+    for (int r = 0; r < c.block; ++r)
+        for (int h = 0; h < c.q_heads; ++h)
+            for (int d = 0; d < c.head_dim; ++d) {
+                const size_t i = (size_t) r * qp + (size_t) h * c.head_dim + d;
+                f.query[i] = std::sin((float) i * 0.017f) * 0.7f;
+            }
+    for (int r = 0; r < c.block; ++r)
+        for (int h = 0; h < c.kv_heads; ++h)
+            for (int d = 0; d < c.head_dim; ++d) {
+                const size_t i = (size_t) r * kvp + (size_t) h * c.head_dim + d;
+                f.block_k[i] = std::cos((float) i * 0.019f) * 0.9f;
+                f.block_v[i] = std::sin((float) i * 0.031f) * 100000.0f;
+            }
     // the context rows land in slots (ring_start + t) % cap, which is where the kernel looks
     for (int t = 0; t < c.ctx; ++t)
         for (int h = 0; h < c.kv_heads; ++h)
@@ -130,11 +156,11 @@ int64_t key_pos(const Case& c, int t) {
 }
 
 /// Where key `t` of kv head `kv_head` lives: the ring slot (ring_start + t) % cap for a context row,
-/// the block's own row t - ctx for one of the block's keys.
+/// the block's own row t - ctx for one of the block's keys (at the block buffer's row pitch).
 const float* key_value_row(const float* ring, const float* block, const Case& c, int t, int kv_head) {
     if (t < c.ctx)
         return ring + ((size_t) ((c.ring_start + t) % kRingCap) * c.kv_heads + kv_head) * c.head_dim;
-    return block + ((size_t) (t - c.ctx) * c.kv_heads + kv_head) * c.head_dim;
+    return block + (size_t) (t - c.ctx) * kv_pitch(c) + (size_t) kv_head * c.head_dim;
 }
 
 bool check_cuda(cudaError_t e, const char* what, std::string& err) {
@@ -202,7 +228,8 @@ bool run_case(const Case& c, std::string& err) {
         ((size_t) n_keys + 32 + (size_t) (threads / c.head_dim) * c.head_dim) * sizeof(float);
     strata::core::attn_kernel<<<dim3((unsigned) c.block, (unsigned) c.q_heads), threads, shmem>>>(
         query.p, ring_k.p, ring_v.p, block_k.p, block_v.p, out.p + kGuard, c.block, c.q_heads, c.kv_heads,
-        c.head_dim, c.ring_start, kRingCap, c.ctx, c.ctx_pos0, c.q_pos0, kWindow, scale);
+        c.head_dim, q_pitch(c), kv_pitch(c), c.ring_start, kRingCap, c.ctx, c.ctx_pos0, c.q_pos0, kWindow,
+        scale);
     if (!check_cuda(cudaGetLastError(), "attn_kernel launch", err) ||
         !check_cuda(cudaDeviceSynchronize(), "attn_kernel", err))
         return false;
@@ -222,7 +249,7 @@ bool run_case(const Case& c, std::string& err) {
     for (int row = 0; row < c.block; ++row) {
         for (int h = 0; h < c.q_heads; ++h) {
             const int kv_head = h / group;
-            const float* q = f.query.data() + ((size_t) row * c.q_heads + h) * c.head_dim;
+            const float* q = f.query.data() + (size_t) row * q_pitch(c) + (size_t) h * c.head_dim;
 
             double top = -std::numeric_limits<double>::infinity();
             for (int t = 0; t < n_keys; ++t) {
@@ -265,8 +292,8 @@ bool run_case(const Case& c, std::string& err) {
 
     const double rel_l2 = std::sqrt(sq_err / std::max(sq_ref, 1e-30));
     const double max_scaled = max_err / std::max(max_ref, 1e-30);
-    std::printf("ctx=%d block=%d head=%d ring=%d relL2=%.9g maxScaled=%.9g\n", c.ctx, c.block, c.head_dim,
-                c.ring_start, rel_l2, max_scaled);
+    std::printf("ctx=%d block=%d head=%d ring=%d slack=%d relL2=%.9g maxScaled=%.9g\n", c.ctx, c.block,
+                c.head_dim, c.ring_start, c.slack, rel_l2, max_scaled);
     if (rel_l2 > kMaxRelL2) {
         err = message("relative L2 %.9g > %.9g: the output is not the mixture over every key", rel_l2,
                       kMaxRelL2);
