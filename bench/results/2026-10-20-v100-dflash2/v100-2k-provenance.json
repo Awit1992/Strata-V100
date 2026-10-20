@@ -1,0 +1,38 @@
+{
+  "implementation_commit": "9de841284d9ae487bc5bd965427453cab1bb057e",
+  "binary_md5": "30f022f52072b737e73a11aea64f4672",
+  "runner": "bench/run_v100_bench.py",
+  "runner_sha256": "1d1b7e3fa77c89d0721de74dba84633579f3c2cc752a51cb8f56ab0303b139d4",
+  "command": "python bench/run_v100_bench.py --model-gguf REGULAR_IQ3_S_SHARD1 --base TEST_BASE --model qwen --max-tokens 2048 --seed 68 --repeats 1 --out RESULTS_DIR",
+  "measured_requests": 6,
+  "runner_calibration_requests": 5,
+  "max_output_tokens": 2048,
+  "actual_output_tokens": [
+    2048,
+    701,
+    1978,
+    1917,
+    2048,
+    953
+  ],
+  "target": "regular Qwen3.8-Flash-Next-GSQ-RCO IQ3_S",
+  "drafter": "DFlash2 block 4",
+  "gpu_order": [
+    0,
+    1
+  ],
+  "layer_split": 16,
+  "pipeline_windows": 1,
+  "kv": "int8",
+  "max_context": 524288,
+  "rope_scaling": "yarn",
+  "rope_scale": 2,
+  "prompt_reuse": 0,
+  "route_resident": 0,
+  "route_tail_skip": 0,
+  "vram_reserve_mib": 1024,
+  "kv_growth": true,
+  "server_recovery_rules": false,
+  "sampling": "Unchanged runner defaults; seed controls prompt construction, not an explicit sampler seed.",
+  "runtime_restored": true
+}
