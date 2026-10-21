@@ -163,6 +163,46 @@ The table is inside the noise of this rig's own run-to-run spread. The change is
 speed** here: it moves a switch that the service set by hand into the engine's own defaults, so that a
 Volta card gets the measured kernels without a hand-set environment variable.
 
+## The fork's V100 bench, A/B
+
+`bench/run_v100_prefill.py` (the fork's own harness: the engine's stdin/stdout protocol, exact prompt token
+counts, a fresh engine per arm, the cards cooled to 55 C between the requests). Four prompt lengths, five
+repeats each, 128 generated tokens per request, greedy. The arms are the released engine, the PR's engine
+with its default settings, and the PR's engine with `--pcie-mode dma`.
+
+**Prefill, prompt tok/s (the median of five):**
+
+| Prompt tokens | before | after | after (DMA path) |
+| --- | ---: | ---: | ---: |
+| 2,048 | 449.3 | 449.3 | 449.3 |
+| 8,192 | 1,149.0 | 1,148.7 | 1,148.8 |
+| 16,384 | 1,489.1 | 1,489.6 | 1,484.5 |
+| 32,768 | 1,724.6 | 1,725.0 | 1,721.7 |
+
+The prompt path is not touched: the three arms agree to 0.3 %, and every arm's **first generated token is the
+same** at every length (the harness's parity signal).
+
+**Decode, tok/s (the median of five per length, and the pooled rate over all twenty rows):**
+
+| Prompt tokens | before | after | after (DMA path) |
+| --- | ---: | ---: | ---: |
+| 2,048 | 68.5 | 70.5 | 75.2 |
+| 8,192 | 70.9 | 77.2 | 76.7 |
+| 16,384 | 68.4 | 64.0 | 63.9 |
+| 32,768 | 65.0 | 67.2 | 64.1 |
+| **pooled (20 rows)** | **66.72** | **68.92** | **69.26** |
+
+**How to read the decode column.** The spread inside one arm is larger than the difference between the arms:
+the 2,048-token length alone runs 51 to 83 tok/s across five requests of the *same* engine. The engine's
+output text is not reproducible from run to run (the adaptive tier's copies decide which window computes a
+swapped-in expert on the GPU and which on the CPU, and the two round differently), so a request's routing, and
+with it its speed, moves with the timing. The per-length medians are therefore not decisive; the pooled rate
+over twenty rows is the number to compare, and it is **+3.3 %** for the PR's engine and **+3.8 %** with the
+DMA path. The dedicated decode measurement (a 512-token prompt, 256 generated tokens, four repeats per arm,
+alternating) gave **+8.1 %** for the DMA path; the difference between the two shapes is the workload: a short
+answer after a long prompt spends more of its time in the attention over the long KV, where the PCIe share of
+the experts matters less.
+
 ## The before/after table
 
 The same rig, the same model, the same configuration, one change: the engine's **DMA path with the device-raised
