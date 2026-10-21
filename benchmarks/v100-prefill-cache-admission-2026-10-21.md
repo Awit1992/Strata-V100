@@ -28,6 +28,51 @@ This report links to the earlier incremental-TTFT study
 [V100 incremental TTFT, 2026-10-21](v100-incremental-ttft-2026-10-21.md).
 That study covers the first change in this series.
 
+## Final executable confirmation
+
+A separate two-round A/B run used the final executable:
+`d0eb45c4107ce3d6e44486c229d677d5b6fb91ea7076b5fcac315b97b41b29f7`.
+This build adds the helper refusal and active-slot bounds.
+It is the code saved in commit `372a22f6`.
+The baseline remained `f740c535277fa66d825d2d443937d895406c69095c3224f48410dd8761b920c4`.
+The order was installed, hot, hot, installed. Each run had a new server
+and conversation store. The seed, prompts, output cap, and fixed settings
+were the same as in the four-arm study.
+
+All ten turns had the same measured prompt, read, and reuse counts in both
+arms. Each table value is the median of two runs. Times are milliseconds.
+
+| Actual read | Baseline TTFT | Final TTFT | TTFT reduction | Baseline full request | Final full request |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 52 | 632.3 | 554.5 | 12.3% | 860.9 | 926.4 |
+| 93 | 853.8 | 638.5 | 25.2% | 1100.2 | 991.2 |
+| 122 | 1012.1 | 780.5 | 22.9% | 1250.5 | 1145.7 |
+| 188 | 1030.0 | 793.3 | 23.0% | 1277.2 | 1143.6 |
+| 309 | 1206.3 | 980.2 | 18.7% | 1429.7 | 1306.8 |
+| 573 | 1504.4 | 1246.8 | 17.1% | 1771.5 | 1595.7 |
+| 1082 | 1946.3 | 1709.4 | 12.2% | 2189.0 | 2040.4 |
+| 2108 | 2693.6 | 2436.7 | 9.5% | 2953.2 | 2833.1 |
+| 3053 | 3690.1 | 3287.2 | 10.9% | 3921.2 | 3658.8 |
+
+All nine incremental TTFT medians improved. Their sum fell by 14.7%.
+The full-request sum fell by 6.6%. The 52-token full request was 7.6%
+slower. Five read-size medians stayed below one second, not the full range.
+Both tracing variables were absent from the environment and configuration.
+All four engine logs contained zero trace and prefill-timing records.
+An earlier confirmation had both diagnostics set to `0`. Their presence
+still enabled them. That instrumented run is excluded from this table.
+
+Telemetry recorded 630 samples with no query errors. Maximum temperatures
+were 47 C on GPU 0 and 58 C on GPU 1. No sampled thermal or hardware
+slowdown flag was active. The power-cap flag was active in 3 and 8 samples.
+Both power limits stayed at 175 W. This was not a locked-clock test.
+
+The final executable also passed all eight consumer-visible quality cases.
+Each arm first completed an 8K warm prefix and two tool-result turns.
+The cases checked exact READY, arithmetic, JSON output, and a forced tool
+call. The tool was not executed. The admission arm performed 3047 rotations
+across ten trace records. These checks are not a general quality evaluation.
+
 ## Test system and fixed conditions
 
 - Two Tesla V100-PCIE-16GB GPUs, 16 GiB each.
@@ -202,8 +247,9 @@ Do not use these numbers as steady-state token throughput.
 
 ## Mechanism
 
-1. The wide dequant kernel is on by default for SM70 in the frozen binary. An
-   explicit override still wins. `SM70_PERF=0` turns it off.
+1. The wide dequant kernel is on by default for SM70 in the frozen binary.
+   An explicit setting still wins. `STRATA_SM70_PERF=0` disables the default
+   table. It does not remove a setting supplied by the user or service.
 2. The pinned CPU output buffer tests the actual need, `rows_cpu * N`. It
    doubles the allocation only when the actual need exceeds the capacity. This
    avoids a false host allocation or free.
@@ -234,7 +280,7 @@ an arm with different expert placement.
 
 ## Prior Nsight evidence and its limits
 
-An earlier Nsight Compute capture measured the same narrow and wide dequant
+An earlier Nsight Systems capture measured the same narrow and wide dequant
 kernel set on the same prompt shape. The capture used a 8192-token prefix,
 diffs of 128, 512, 1024, 2048, and 3000, and a 16-token output cap. Q6 dtype 14
 was the measured kernel.
@@ -246,8 +292,8 @@ they are not a six-times end-to-end claim.
 A separate older trace of a 512-token read showed about 9.6 GB of host-to-device
 traffic. GPU 0 moved 1.4 GB in about 0.49 s. GPU 1 moved 8.2 GB in about
 0.638 s. Both rates are near the PCIe limit of their link.
-No matched traffic profile exists for this four-arm set. This report gives no
-bytes-saved value.
+These captures do not isolate admission traffic. The separate matched
+capture below measures that effect.
 
 Telemetry came from 1 Hz `nvidia-smi` samples. There were 1264 samples, 632 per
 GPU, with no query errors. The maximum temperature was 48 C on GPU 0 and 58 C
@@ -256,6 +302,58 @@ or a hardware slowdown flag. The power-cap flag was active in 5 samples on
 GPU 0 and 14 samples on GPU 1. SM clocks ranged from 135 MHz to 1380 MHz and
 include idle and startup time. Do not describe the clocks as locked, and do not
 describe the run as free of all throttling.
+
+## Matched admission traffic profile
+
+Two clean Nsight Systems runs used the final executable, with admission
+off and at `2048`. Both used wide dequantization and pooled parallel saves.
+The direct chain used an 8192-token prefix, differences
+`0,1,32,64,128,256,512,1024,2048,3000`, seed `20261021`, and one output token.
+Both runs completed all eleven requests. Their prompt hashes, read counts,
+and reuse counts matched. Internal trace and timing variables were unset.
+
+The measurement starts at the first embedding kernel. It excludes startup
+cache uploads. Request groups use gaps longer than 1.5 seconds in the union
+of kernel and copy activity. The runner waits at least three seconds between
+requests. There are eleven request groups and a final pair of 64-byte
+shutdown reads. The shutdown reads are excluded.
+
+The table sums explicit host-to-device copies in the ten warm request groups.
+GB means decimal gigabytes.
+
+| Device | Admission off, GB | Admission 2048, GB | Reduction |
+| --- | ---: | ---: | ---: |
+| GPU 0, x4 link | 12.078 | 7.483 | 38.0% |
+| GPU 1, x16 link | 56.433 | 49.656 | 12.0% |
+| Both | 68.511 | 57.139 | 16.6% |
+
+The policy removed 11.372 GB of explicit host-to-device traffic from this
+warm chain. The initial prefix copied the same 39.275 GB in both arms.
+Its admission operation added 4.115 GB of device-to-device copies instead
+of an extra host refill.
+
+| Actual read | Explicit H2D off, GB | Explicit H2D on, GB | Reduction |
+| ---: | ---: | ---: | ---: |
+| 128 | 6.445 | 5.163 | 19.9% |
+| 256 | 7.529 | 5.737 | 23.8% |
+| 512 | 8.943 | 7.414 | 17.1% |
+| 1024 | 11.381 | 9.020 | 20.7% |
+| 2048 | 15.441 | 13.056 | 15.4% |
+| 3000 | 18.568 | 16.544 | 10.9% |
+
+Warm device-to-device volume rose from 1.748 GB to 6.249 GB.
+Its summed copy duration rose from 12.0 ms to 36.3 ms.
+The summed host-to-device duration fell from 8618.7 ms to 6486.7 ms.
+These are summed device activity times, not wall time. Transfers can overlap.
+
+This metric counts CUDA copy records. It does not count mapped-host reads
+inside kernels. The 32- and 64-token paths kept the same explicit copy
+volume, although their prompt latency improved. Do not attribute those
+gains only to DMA reduction.
+
+This direct one-output-token experiment is a mechanism check. It is not
+the sixteen-output-token HTTP score. Do not combine its timings with the
+HTTP table or claim that every saved copy millisecond reduces TTFT equally.
 
 ## Correctness checks
 
@@ -292,6 +390,13 @@ they are not a universal bit-wise proof.
 | Global CPU-share calibration | The CPU `auto` EMA is already per stage of each prefill implementation and uses its own GPU events. | Reject. The premise was wrong. |
 | Helper refill path with fixed fraction 0.2 and 0.4, stream threshold 1024, and refill overlap off | Both helper arms stopped at the first prefix with `prefill: the PLE rows' upload failed: an illegal memory access was encountered`. The two direct controls completed 9 of 9 turns. At max-new 1, the stream-threshold-1024 control took 2366.5 ms at 1K read and 4117.7 ms at 3K read. The default-threshold control took 1648.1 ms and 3509.8 ms. | Reject. Not shipped. This report gives no root cause and does not reproduce the unsafe option. |
 
+An attribution control used the unchanged baseline executable with narrow
+dequantization, helper fraction 0.2, and refill overlap off. It failed at the
+first 8192-token prefix with the same illegal-access error. This failure is
+not specific to the new admission code or wide default. The trial does not
+identify the underlying kernel fault. Helpers remain off in the selected
+profile. An explicit helper setting disables admission before inference.
+
 ## Research
 
 The admission policy is local to this runtime. It is not a port of a published
@@ -316,31 +421,38 @@ cache algorithm.
 Use a regular IQ3_S pack, tokenizer, native shard, and PLE shard. Stop the daily
 service while these commands use the GPUs. Set `CONFIG` to a private
 configuration file. Set `INSTALLED`, `CHECKPOINT`, and `WIDE` to the three
-executables. Keep the output directory private.
+executables. Set `RESULTS` to a private output directory.
 
 ```sh
-export STRATA_ARENA_LOCK=0 STRATA_WATCHDOG_S=300
-export STRATA_EXPERT_PAIR=1 STRATA_SPLIT_RING=192
-export STRATA_PREFILL_CPU_SHARE=auto STRATA_PREFILL_STREAM_MIN=3072
-export STRATA_EMB_REUSE_ACCOUNT=1 STRATA_SM70_TABLE=1 STRATA_PF_WMMA=1
-export STRATA_PF_SKIP_UNROUTED=1 STRATA_KV_GROW=1 STRATA_ROUTE_RESIDENT=1
-export STRATA_ROUTE_TAIL_SKIP=0
+COMMON=',STRATA_ARENA_LOCK=0,STRATA_WATCHDOG_S=300,STRATA_SPLIT_RING=192'
+COMMON="$COMMON,STRATA_PREFILL_CPU_SHARE=auto,STRATA_PREFILL_STREAM_MIN=3072"
+COMMON="$COMMON,STRATA_EMB_REUSE_ACCOUNT=1,STRATA_SM70_TABLE=1,STRATA_PF_WMMA=1"
+COMMON="$COMMON,STRATA_PF_SKIP_UNROUTED=1,STRATA_KV_GROW=1,STRATA_ROUTE_RESIDENT=1"
+COMMON="$COMMON,STRATA_ROUTE_TAIL_SKIP=0,STRATA_PREFILL_HELP=0"
+COMMON="$COMMON,STRATA_PREFILL_REFILL_OVERLAP=1"
+unset STRATA_TRACE STRATA_PREFILL_TIMING
+mkdir -p "$RESULTS"
 
 python tools/agent_turns_bench.py "$CONFIG" \
-  "installed:exe=$INSTALLED" \
-  "checkpoint:exe=$CHECKPOINT" \
-  "work:exe=$WIDE,STRATA_PREFILL_PROMOTE=0" \
-  "hot:exe=$WIDE,STRATA_PREFILL_PROMOTE=2048" \
+  "installed:exe=$INSTALLED,STRATA_CKPT_POOL=0,STRATA_CKPT_THREADS=0,STRATA_DEQUANT_WIDE=0,STRATA_PREFILL_PROMOTE=0$COMMON" \
+  "checkpoint:exe=$CHECKPOINT,STRATA_CKPT_POOL=1,STRATA_CKPT_THREADS=1,STRATA_DEQUANT_WIDE=0,STRATA_PREFILL_PROMOTE=0$COMMON" \
+  "work:exe=$WIDE,STRATA_CKPT_POOL=1,STRATA_CKPT_THREADS=1,STRATA_DEQUANT_WIDE=1,STRATA_PREFILL_PROMOTE=0$COMMON" \
+  "hot:exe=$WIDE,STRATA_CKPT_POOL=1,STRATA_CKPT_THREADS=1,STRATA_DEQUANT_WIDE=1,STRATA_PREFILL_PROMOTE=2048$COMMON" \
   --workload agentic --rounds 2 --port 8097 --prefix-tokens 8192 \
   --additions 0,32,64,128,256,512,1024,2048,3000 --turns 9 \
   --max-new 16 --seed 20261021 --log "$RESULTS/results.jsonl" \
   --workdir "$RESULTS/runs"
 ```
 
-The checkpoint pool and the one save thread are shipped profile values of the
-last three executables. The `installed` executable ships them off with a narrow
-kernel. The runner reverses the arm order on the second round and gives each
-arm a new server and an empty conversation store.
+The command sets each measured switch on each arm. Configuration values take
+precedence over inherited shell variables. Do not rely on shell exports to
+override them. The runner reverses the arm order on the second round and
+gives each arm a new server and an empty conversation store.
+
+Remove `STRATA_TRACE` and `STRATA_PREFILL_TIMING` from the configuration
+environment too. These diagnostics check for presence, not a numeric value.
+Setting either variable to `0` still enables it. The scored final run leaves
+both variables unset.
 
 To record telemetry, run this query in a 1 Hz loop during the measurement:
 
@@ -358,9 +470,8 @@ nvidia-smi --query-gpu=index,temperature.gpu,clocks.sm,power.draw,power.limit,cl
   cost and refill cost is an interpretation, not a measured value.
 - The study does not isolate the per-token decode cost. The checkpoint copy, the
   wide kernel, and the admission policy all changed together in that interval.
-- A later build (`d0eb45c4107ce3d6e44486c229d677d5b6fb91ea7076b5fcac315b97b41b29f7`)
-  adds a helper opt-in refusal and active-slot bounds. It is not part of this
-  study, and this report gives no performance value for it.
+- The four-arm study and the final confirmation use different executable
+  hashes. The final confirmation above measures the committed code.
 - The configured VRAM reserve was 750 MiB in all arms. A separate direct
   harness check reported a settings mismatch only because its canonical value
   is 700 MiB. That check used an explicit settings-strictness waiver, and the
@@ -369,9 +480,27 @@ nvidia-smi --query-gpu=index,temperature.gpu,clocks.sm,power.draw,power.limit,cl
   request, below its 512 MiB warning threshold. The message suggests an 832 MiB
   reserve. That value is the suggestion, not the configured setting. The run did
   not prove paging.
-- No matched Nsight traffic profile exists for these arms. No transfer-volume
-  saving is claimed.
+- The matched traffic capture uses the direct one-output-token chain, not
+  the HTTP workload. It measures explicit copies, not all PCIe transactions.
 - Do not reuse the old generic 1.38 MB expert blob figure. This model's largest
   blob is 2.66 MB.
 - Raw prompts, response captures, credentials, private configuration, and full
   logs stay local. This report contains aggregates only.
+
+## Daily runtime restoration
+
+The test used separate configurations and regular IQ3_S assets. It did not
+install the candidate engine or the revised service profile.
+
+After the tests, the daily user service resumed with its original engine.
+The running command used the SC117 abliterated IQ3_S shards and the matching
+`sc117_iq3_s` pack and tokenizer. GPU order remained `0,1`, the layer split
+remained `16`, and pipeline windows remained `2`. KV capacity and format
+remained unchanged.
+
+The health endpoint reported a loaded model. The authenticated
+`/v1/models` request reported a loaded model. An authenticated inference
+request returned exactly `READY`. The service remained active after a
+20-second stability check, with zero restarts. The three speech services
+remained stopped and disabled. The temporary restoration timer was stopped
+after these checks passed.

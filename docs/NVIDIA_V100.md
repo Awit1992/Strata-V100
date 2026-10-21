@@ -89,11 +89,10 @@ native expert mode 8, and latency-hidden HC up projection on Volta.
 The interleaved 2-4 column matvec with a Volta rows table and the
 latency-hidden norm/up are bitwise the default kernels' output (GPU work
 per verify window 22.8 -> 21.2 ms on a V100-SXM2 in the contributor's
-measurement); they become the default once the contributor has confirmed
-them on a V100 with the 0.1.41 code. The individual settings
-`STRATA_MMVQ_IL`, `STRATA_EXP_MODE`, and `STRATA_GR_FAST` take precedence.
-Without the master setting, Volta retains the previous decode selection
-(what 0.1.40.3 ran).
+measurement). The Volta defaults table now selects this master setting.
+The individual settings `STRATA_MMVQ_IL`, `STRATA_EXP_MODE`, and
+`STRATA_GR_FAST` take precedence. Set `STRATA_SM70_TABLE=0` to select
+the previous decode path explicitly.
 
 The Volta defaults also select `STRATA_DEQUANT_WIDE=1`. This setting uses
 the existing vector-store dequantization kernels. The CUDA parity test
