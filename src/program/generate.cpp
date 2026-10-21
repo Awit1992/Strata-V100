@@ -232,8 +232,11 @@ bool admit_merge_first_env() {
 }
 // STRATA_CKPT_POOL=1 (read once; off by default): the serve loop keeps the running-state vectors of the conversation
 // checkpoints it drops (evicted, pruned, a batch slot's old one) and saves the next checkpoint into them, so a save
-// resizes nothing (no zero-fill of ~118 MB of fresh vectors) and a slot's copy reuses their pages.  Every byte is
-// overwritten by the copy, so the checkpoints are the same
+// resizes nothing (no zero-fill of ~118 MB of fresh vectors) and the next save's copies land in pages that are already
+// faulted in.  On the two-V100 split a boundary save measured 72-94 ms while its device sync measured 0.1 ms, so the
+// payload copy is the cost; the pool recovers only a few percent of the small increments because an L2/L3 archive
+// capture usually still shares the retired checkpoint's payloads (writable_all then detaches a fresh block).  Every
+// byte is overwritten by the copy, so the checkpoints are the same
 bool ckpt_pool_env() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_CKPT_POOL");
@@ -1784,11 +1787,19 @@ struct DecodeCheckpoint {
     std::vector<strata::core::QsaState> qsa;
     std::vector<Copy> copies;
 
-    ~DecodeCheckpoint() {
+    ~DecodeCheckpoint() { release(); }
+    /// Frees the arena and its stream.  The serial loop keeps them across windows and requests (it captures every
+    /// window); the pipelined decode releases them once its one capture has reached the host, so the extra arena is
+    /// not held through the whole reply.
+    void release() {
         if (device < 0) return;
         const strata::core::OnDevice on(device);
         if (stream) cudaStreamDestroy(stream);
         if (arena) cudaFree(arena);
+        stream = nullptr;
+        arena = nullptr;
+        copies.clear();
+        device = -1;
     }
 
     bool init(const strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
@@ -1981,6 +1992,9 @@ public:
 private:
     static void clear_marks(ConvCheckpoint& c) {
         c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false;
+        // A pooled checkpoint's vectors are reused, so every run-time mark must go with them: a stale
+        // PromptPlan would attach a later periodic checkpoint to a segment it was not taken in.
+        c.plan = ConvCheckpoint::PromptPlan{};
         for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
     }
     bool on_;
@@ -10571,16 +10585,22 @@ int main(int argc, char** argv) {
         };
 
         StageThreads ckpt_threads;   // STRATA_CKPT_THREADS: the later stages' parts of a checkpoint (started on first use)
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
-                                 const std::vector<int32_t>* tokens = nullptr) -> bool {
-            ckpt_why.clear();
-            if (o.prompt_cache <= 0 || L < 1) return true;
+        // `checks` already holds a state at L: a use, not a save (the LRU clock and the tail flag advance exactly as
+        // they do when checkpoint_at meets it).
+        auto checkpoint_present = [&](int64_t L, bool as_tail) -> bool {
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
                     c.used = ++check_clock;
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
                     return true;
                 }
+            return false;
+        };
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
+                                 const std::vector<int32_t>* tokens = nullptr) -> bool {
+            ckpt_why.clear();
+            if (o.prompt_cache <= 0 || L < 1) return true;
+            if (checkpoint_present(L, as_tail)) return true;
             ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
             if (tokens) c.ids.assign(tokens->begin(), tokens->begin() + L);
             else c.ids.assign(cur.begin(), cur.begin() + L);
@@ -15516,14 +15536,129 @@ int main(int argc, char** argv) {
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
                                      "them\n", (long long) il_parts + 1, il_ms);
+            // The input anchor (the running state after the first n-1 prompt tokens): the final prompt token is
+            // evaluated by the first decode window, and a reply rewrite resumes just before it.  Its host copy is
+            // 72-94 ms on a two-V100 split and used to sit before the first token.  The running state only changes
+            // at a commit, so it is captured on the device at this point instead; the host copy runs after the first
+            // window has emitted all of its tokens and flushed them, and the checkpoint enters `checks` at the
+            // response end, where the decode is quiescent.  The arena is this request's own (nothing else writes or
+            // aliases it) and is freed as soon as the host copy is complete.
+            // STRATA_INPUT_ANCHOR_DEFER=0: the old synchronous save before the first token, for an A/B on one binary.
+            static const bool input_anchor_defer = [] {
+                const char* v = std::getenv("STRATA_INPUT_ANCHOR_DEFER");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            int64_t input_anchor_at = -1;        // n - 1: captured on the device, not yet in the host
+            int64_t input_anchor_saved_at = -1;  // n - 1: already in `checks` (the response-end save reuses it)
+            bool input_anchor_dedicated = false; // the pipelined decode's own arenas (the serial loop captures its own)
+            bool input_anchor_ready = false;     // a capture at n - 1 is in the arena `input_anchor_host_copy` reads
+            bool input_anchor_copied = false;    // the host image is complete; the arenas are gone and not read again
+            std::vector<int32_t> input_anchor_ids;
+            std::vector<ConvCheckpoint> input_anchor_parts;
+            std::vector<std::unique_ptr<DecodeCheckpoint>> input_anchor_arenas;
+            auto input_anchor_release = [&] { input_anchor_arenas.clear(); };
+            // Capture every stage's running state at the anchor on the device.  Each device is synchronized first,
+            // as checkpoint_at does: the capture stream is not ordered against the prompt's or the drafter's streams
+            // (both parities included).  A failure leaves the state untouched; the caller saves it synchronously.
+            // Only the pipelined decode uses this (its windows never capture into `decode_checkpoints`, which a
+            // speculative rollback may own); the serial loop's own per-window capture is the anchor there.
+            auto input_anchor_capture = [&]() -> bool {
+                try {
+                    input_anchor_release();
+                    input_anchor_arenas.resize(decode_checkpoints.size());
+                    for (size_t i = 0; i < input_anchor_arenas.size(); ++i) {
+                        const strata::core::OnDevice on(stage_device(i));
+                        if (cudaDeviceSynchronize() != cudaSuccess) {
+                            cudaGetLastError();
+                            input_anchor_release();
+                            return false;
+                        }
+                        auto cp = std::make_unique<DecodeCheckpoint>();
+                        std::string e;
+                        if (!cp->init(stage_session(i), g, e) || !cp->capture(e)) {
+                            input_anchor_release();
+                            return false;
+                        }
+                        input_anchor_arenas[i] = std::move(cp);
+                    }
+                    input_anchor_dedicated = true;
+                    input_anchor_ready = true;
+                    return true;
+                } catch (const std::bad_alloc&) {
+                    // The host side of the capture (the arena list, a view's qsa vector, an error string) is the only
+                    // thing that can throw here; the caller still holds the live state at the anchor and saves that
+                    // synchronously.  The promised memory fallback must not unwind the request.
+                    cudaGetLastError();
+                    input_anchor_release();
+                    return false;
+                }
+            };
+            // The anchor's host image, from the captured arena.  The dedicated arena goes back to the driver as soon
+            // as every stage's bytes are in RAM, so no reply holds the extra device copy.
+            auto input_anchor_host_copy = [&]() -> bool {
+                std::vector<std::unique_ptr<DecodeCheckpoint>>& arenas =
+                    input_anchor_dedicated ? input_anchor_arenas : decode_checkpoints;
+                if (!input_anchor_ready || arenas.size() != decode_checkpoints.size()) return false;
+                const Clock::time_point t0 = Clock::now();
+                try {
+                    input_anchor_parts.assign(arenas.size(), ConvCheckpoint{});
+                    for (size_t i = 0; i < input_anchor_parts.size(); ++i) {
+                        const strata::core::OnDevice on(stage_device(i));
+                        input_anchor_parts[i].ids = input_anchor_ids;
+                        if (!checkpoint_save(input_anchor_parts[i], arenas[i]->view, g)) {
+                            input_anchor_parts.clear();
+                            input_anchor_release();
+                            return false;
+                        }
+                    }
+                } catch (const std::bad_alloc&) {
+                    // A host allocation failure is the old save's failure too: the caller keeps its existing error
+                    // path instead of unwinding through the decode loop.
+                    input_anchor_parts.clear();
+                    input_anchor_release();
+                    return false;
+                }
+                if (ckpt_trace)
+                    std::fprintf(stderr, "strata trace: input anchor at %lld: host copy %.1f ms after the first window "
+                                         "(%zu stage(s))\n", (long long) input_anchor_at,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                 input_anchor_parts.size());
+                input_anchor_copied = true;
+                input_anchor_ready = false;
+                input_anchor_release();
+                return true;
+            };
+            // The old synchronous path, for a request that cannot defer (no first token, a merged first window), an
+            // opt-out, or a capture that failed: the state is still at the anchor here.
+            auto input_anchor_save_now = [&](int64_t L) -> bool {
+                input_anchor_at = -1;
+                input_anchor_ready = false;
+                input_anchor_copied = false;
+                input_anchor_parts.clear();
+                input_anchor_release();
+                const bool saved = checkpoint_at(L);
+                if (saved) input_anchor_saved_at = L;   // (the response-end copy reuses it too)
+                return saved;
+            };
             // Keep the predecode input boundary inside the existing active
             // checkpoint limit. The final prompt token is evaluated by the
             // first decode window; a reply rewrite can resume just before it
             // without loading a parked copy of the previous generated tail.
-            if (!cancelled && req_ckpt && o.prompt_cache > 0 && n > 1 && at == n - 1 &&
-                !checkpoint_at(n - 1)) {
-                std::printf("ERR saving the input checkpoint failed%s\n", ckpt_why.c_str());
-                return 1;
+            if (!cancelled && req_ckpt && o.prompt_cache > 0 && n > 1 && at == n - 1) {
+                if (checkpoint_present(n - 1, false)) {
+                    input_anchor_saved_at = n - 1;   // already in the chain: the response-end copy reuses it
+                } else {
+                    const bool can_defer = input_anchor_defer && max_new > 0 && merge_at < 0;
+                    if (!can_defer) {
+                        if (!input_anchor_save_now(n - 1)) {
+                            std::printf("ERR saving the input checkpoint failed%s\n", ckpt_why.c_str());
+                            return 1;
+                        }
+                    } else {
+                        input_anchor_at = n - 1;
+                        input_anchor_ids.assign(cur.begin(), cur.begin() + (n - 1));
+                    }
+                }
             }
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
@@ -15615,6 +15750,24 @@ int main(int argc, char** argv) {
                 if (!pl_prepare(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
+                }
+                // The pipeline never captures into `decode_checkpoints` (a speculative rollback may own those), so
+                // its input anchor gets its own device image here, before any window launches or commits.  If it
+                // cannot be allocated, save it synchronously now: this is the last point at which the state is
+                // still exactly the anchor.
+                if (input_anchor_at > 0 && !input_anchor_capture()) {
+                    const int64_t L = input_anchor_at;
+                    bool saved = false;
+                    try {
+                        saved = input_anchor_save_now(L);
+                    } catch (const std::bad_alloc&) {
+                        input_anchor_at = -1;
+                        input_anchor_release();
+                    }
+                    if (!saved) {
+                        std::printf("ERR saving the input checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
                 }
                 struct PW {
                     int T = 0, seq = 0;
@@ -16138,6 +16291,16 @@ int main(int argc, char** argv) {
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
                     }
                     std::fflush(stdout);
+                    // The first accepted window has emitted and flushed every token it accepted: its pre-window
+                    // running state is still in the anchor arena, so copy it now, off the first token's path.
+                    if (A.seq == 0 && input_anchor_at > 0 && !input_anchor_copied) {
+                        if (nf) {
+                            input_anchor_at = -1;   // #879: the next request drops every checkpoint anyway
+                            input_anchor_release();
+                        } else if (!input_anchor_host_copy()) {
+                            return die("saving the input checkpoint failed");
+                        }
+                    }
                     if (nf) finish = "nonfinite";
                     else if (eos) finish = "stop";
                     else if (stop_req.load()) finish = "cancel";
@@ -16493,6 +16656,10 @@ int main(int argc, char** argv) {
                         }
                     }
                     decode_checkpoint_at = (int64_t) consumed.size();
+                    // The serial loop's capture is the input anchor when it is taken at n - 1 (the first window);
+                    // its host copy runs after that window has emitted.
+                    if (input_anchor_at > 0 && !input_anchor_copied && decode_checkpoint_at == input_anchor_at)
+                        input_anchor_ready = true;
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
                 if (kvg_on() && p + T + 64 > kvg_cells() &&
@@ -16586,6 +16753,12 @@ int main(int argc, char** argv) {
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
                 std::fflush(stdout);
+                // The first window has emitted and flushed every token it accepted: its pre-window running state is
+                // still in the anchor arena (nothing else writes it), so its host copy no longer delays the first token.
+                if (input_anchor_at > 0 && !input_anchor_copied && !input_anchor_host_copy()) {
+                    std::printf("ERR saving the input checkpoint failed\n");
+                    return 1;
+                }
                 ++rounds;
                 if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
                 const Clock::time_point tw2 = Clock::now();
@@ -16632,23 +16805,81 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-            if (decode_checkpoint_at > 0) {
-                std::vector<ConvCheckpoint> parts(decode_checkpoints.size());
-                for (size_t i = 0; i < parts.size(); ++i) {
-                    const strata::core::OnDevice on(stage_device(i));
-                    parts[i].ids.assign(consumed.begin(), consumed.begin() + decode_checkpoint_at);
-                    if (!checkpoint_save(parts[i], decode_checkpoints[i]->view, g)) {
-                        std::printf("ERR saving response-end checkpoint failed\n");
-                        return 1;
+            // The input anchor's host image (copied after the first window) enters the chain here, where the decode
+            // is quiescent: nothing is in flight and every checkpoint operation has the device to itself.
+            if (input_anchor_at > 0) {
+                const int64_t L = input_anchor_at;
+                if (nf_hit) {
+                    input_anchor_at = -1;   // #879: the next request drops every cached state first
+                    input_anchor_parts.clear();
+                    input_anchor_release();
+                } else {
+                    if (input_anchor_parts.empty()) {
+                        if (input_anchor_ready && (int64_t) consumed.size() == L) {
+                            // A capture was taken but no window committed anything (a STOP or a context break before
+                            // the first window): the arena still holds exactly n-1, so its host copy is exact.  A
+                            // failure here is the same save failure the old path had: error, never a silent drop.
+                            if (!input_anchor_host_copy()) {
+                                std::printf("ERR saving the input checkpoint failed\n");
+                                return 1;
+                            }
+                        } else if ((int64_t) consumed.size() == L) {
+                            // No capture was taken and nothing committed: the live session is still exactly at the
+                            // anchor, so the old synchronous save applies unchanged.
+                            bool saved = false;
+                            try {
+                                saved = input_anchor_save_now(L);
+                            } catch (const std::bad_alloc&) {
+                                saved = false;
+                            }
+                            if (!saved) {
+                                std::printf("ERR saving the input checkpoint failed%s\n", ckpt_why.c_str());
+                                return 1;
+                            }
+                        } else {
+                            // A commit happened without the host copy: an invariant breach.  The promised checkpoint
+                            // must not be silently omitted.
+                            std::printf("ERR saving the input checkpoint failed: its host copy was not taken after "
+                                        "the first window\n");
+                            return 1;
+                        }
+                    }
+                    if (input_anchor_at > 0) {   // (the synchronous fallback above already inserted it)
+                        input_anchor_at = -1;
+                        if (!checkpoint_at(L, &input_anchor_parts, false, &input_anchor_ids)) {
+                            std::printf("ERR saving the input checkpoint failed%s\n", ckpt_why.c_str());
+                            return 1;
+                        }
+                        input_anchor_saved_at = L;
                     }
                 }
-                if (!checkpoint_at(decode_checkpoint_at, &parts, false, &consumed)) {
-                    std::printf("ERR retaining response-end checkpoint failed%s\n", ckpt_why.c_str());
-                    return 1;
+            }
+            if (decode_checkpoint_at > 0) {
+                if (decode_checkpoint_at == input_anchor_saved_at) {
+                    // The first decode window was also the last: the response-end state IS the input anchor that is
+                    // already in `checks`, so its host image is not copied a second time.
+                    if (!checkpoint_at(decode_checkpoint_at, nullptr, false, &consumed)) {
+                        std::printf("ERR retaining response-end checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
+                } else {
+                    std::vector<ConvCheckpoint> parts(decode_checkpoints.size());
+                    for (size_t i = 0; i < parts.size(); ++i) {
+                        const strata::core::OnDevice on(stage_device(i));
+                        parts[i].ids.assign(consumed.begin(), consumed.begin() + decode_checkpoint_at);
+                        if (!checkpoint_save(parts[i], decode_checkpoints[i]->view, g)) {
+                            std::printf("ERR saving response-end checkpoint failed\n");
+                            return 1;
+                        }
+                    }
+                    if (!checkpoint_at(decode_checkpoint_at, &parts, false, &consumed)) {
+                        std::printf("ERR retaining response-end checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata serve: response-end checkpoint %lld tokens; live tail %lld tokens\n",
+                                 (long long) decode_checkpoint_at,
+                                 (long long) ((int64_t) consumed.size() - decode_checkpoint_at));
                 }
-                std::fprintf(stderr, "strata serve: response-end checkpoint %lld tokens; live tail %lld tokens\n",
-                             (long long) decode_checkpoint_at,
-                             (long long) ((int64_t) consumed.size() - decode_checkpoint_at));
             }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();

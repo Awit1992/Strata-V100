@@ -455,6 +455,31 @@ confirm which one is defective.
 Finite cache budgets still limit history. A checkpoint that both L2 and L3
 have evicted is not available for reuse. The engine must process that prefix
 again.
+
+## Incremental time to first output
+
+The engine saves an input checkpoint before it changes the prompt state.
+The new path captures this state on the GPU. It copies the state to host
+memory after the first output window is flushed. The cache receives the
+same input checkpoint before the request finishes.
+
+`STRATA_INPUT_ANCHOR_DEFER=0` selects the synchronous control path.
+Prefill-only requests keep the synchronous path. A failed GPU snapshot
+allocation also uses that path while the input state is still unchanged.
+The serial loop reuses its existing snapshot. The two-stage pipeline uses
+about 113 MiB of temporary GPU memory across both stages. It releases this
+memory after the host copy.
+
+The measured service profile also enables `STRATA_CKPT_POOL=1` and
+`STRATA_CKPT_THREADS=1`. These settings reuse checkpoint storage and copy
+the stage checkpoints in parallel. They do not change the KV capacity,
+KV format, or model quantization.
+
+See the [2026-10-21 TTFT report](../benchmarks/v100-incremental-ttft-2026-10-21.md).
+It measures client-observed streaming output, not full response time.
+The copy still occurs during the request. Do not interpret a lower
+prompt time as an equal increase in decode throughput.
+
 ## More opt-in switches (CUDA 12 experimental build)
 
 None of these is on by default. Each was measured by its contributor on a V100, not by the maintainers.

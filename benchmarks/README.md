@@ -21,6 +21,7 @@ This directory is the contributor-facing index for Strata benchmark results acro
 | 2 × NVIDIA Tesla V100-PCIE-16GB + Ryzen 5 3600 | Qwen3.8-Flash-Next | IQ3_S | 2K | [Selected v0.1.43 performance ports, 2026-10-11](v100-upstream-v0.1.43-2026-10-11.md) |
 | 2 × NVIDIA Tesla V100-PCIE-16GB | Qwen3.8-Flash-Next | IQ3_S | 0–2K differences / 2K–32K cold | [Agentic prefill runtime and kernel changes, 2026-10-13](v100-agentic-prefill-2026-10-13.md) |
 | 2 × NVIDIA Tesla V100-PCIE-16GB | Qwen3.8-Flash-Next | Mixed IQ3_XXS / IQ2_S / IQ3_S / IQ4_XS | 0–2K differences / 2K–32K cold | [Mixed-format kernels and safe early refill, 2026-10-14](v100-agentic-occupancy-2026-10-14.md) |
+| 2 × NVIDIA Tesla V100-PCIE-16GB, Gen3 x4 + x16 | Qwen3.8-Flash-Next | IQ3_S | 0–3K incremental tool-result targets | [Deferred input checkpoints and streaming TTFT, 2026-10-21](v100-incremental-ttft-2026-10-21.md) |
 
 ## Contributing results
 1. Run the existing [`bench/run_v100_bench.py`](../bench/run_v100_bench.py) runner for the published workload, or add the closest equivalent runner under `bench/`.
@@ -28,7 +29,7 @@ This directory is the contributor-facing index for Strata benchmark results acro
 3. Add a Markdown summary in this directory named `<accelerator>-<quant>-<date>.md` and put raw output in `bench/results/<date>-<short-hardware-name>/`.
 4. Include enough system information to explain performance: GPU model and count, VRAM, CPU, RAM, storage, operating system, CUDA/driver versions, Strata commit, and thermal or power limits.
 5. Link the new result from the table above.
-6. For a per-turn agentic comparison, use [`tools/agent_turns_bench.py`](../tools/agent_turns_bench.py) with `--workload agentic`. Report the measured values of each turn (`added`, `prompt_n`, `cache_n`, `request_ms`). Do not report a requested size as a measured value.
+6. For a per-turn agentic comparison, use [`tools/agent_turns_bench.py`](../tools/agent_turns_bench.py) with `--workload agentic`. Report each turn's measured `added`, `new_tokens`, `reused`, `ttft_ms`, and `request_ms`. The streaming TTFT includes parser buffering. It excludes role-only and control-only events. A turn with no generated output has no TTFT value. Do not report a requested size as a measured value.
 7. For a direct chained measurement with no HTTP layer, use [`bench/run_v100_prefill.py`](../bench/run_v100_prefill.py) with `--chain`. One prefix turn reads the shared context. Then each turn adds an exact number of tokens. Report the engine's own counts for each turn: `reused`, `prompt_read`, `prompt_ms`, and `decode_tps`. The requested diff is not a read count.
 
 Do not include API keys, usernames, home-directory paths, hostnames, private IP addresses, or other machine-specific identifiers. Results should distinguish measured values from estimates and mention throttling, warm caches, or other conditions that can materially affect comparisons. Write the report in ASD-STE100 Simplified Technical English: short sentences, one instruction or fact in each, active voice, and one term for one thing throughout.
