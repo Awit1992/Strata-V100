@@ -1,0 +1,110 @@
+{
+ "label": "r_512",
+ "env": {
+  "STRATA_EXPERT_PAIR": "1",
+  "STRATA_SPLIT_RING": "512",
+  "STRATA_ARENA_LOCK": "0",
+  "STRATA_WATCHDOG_S": "300"
+ },
+ "argv": [
+  "$REPO/engine/strata",
+  "--serve",
+  "--pack",
+  "$MODEL_ROOT/packs/iq3_s",
+  "--native",
+  "$MODEL_ROOT/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+  "--ple-gguf",
+  "$MODEL_ROOT/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+  "--expert-profile",
+  "$MODEL_ROOT/data/expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto",
+  "--spec",
+  "8",
+  "--mtp",
+  "$MODEL_ROOT/mtp/rt",
+  "--max-context",
+  "524288",
+  "--rope-scaling",
+  "yarn",
+  "--rope-scale",
+  "2",
+  "--kv",
+  "int8",
+  "--spec-min-p",
+  "0.70",
+  "--vision",
+  "--vram-reserve-mib",
+  "750",
+  "--conversation-cache-mib",
+  "25600",
+  "--conversation-cache-slots",
+  "32",
+  "--pipeline-windows",
+  "2",
+  "--layer-split",
+  "16",
+  "--prompt-cache",
+  "0",
+  "--prompt-cache-every",
+  "0",
+  "--prompt-cache-root",
+  "0",
+  "--conversation-cache-mib",
+  "0"
+ ],
+ "results": [
+  {
+   "kind": "prefill",
+   "target": 32768,
+   "rep": 0,
+   "prompt_tokens": 32768,
+   "prompt_ms": 19092.3,
+   "prefill_tok_s": 1716.2940033416614,
+   "wall_s": 19.326,
+   "pp": [
+    [
+     "8192",
+     "32768",
+     "7049",
+     "1162.2"
+    ],
+    [
+     "16384",
+     "32768",
+     "10883",
+     "1505.4"
+    ],
+    [
+     "24576",
+     "32768",
+     "14771",
+     "1663.8"
+    ],
+    [
+     "32767",
+     "32768",
+     "18722",
+     "1750.2"
+    ]
+   ]
+  },
+  {
+   "kind": "decode",
+   "target": 512,
+   "rep": 0,
+   "prompt_tokens": 512,
+   "prompt_ms": 2282.8,
+   "generated": 128,
+   "decode_ms": 1943.5,
+   "decode_tok_s": 65.86056084383844,
+   "draft_acc": 111,
+   "offloaded": 5244,
+   "wall_s": 4.235,
+   "tok_sha": "6429838701948fbc",
+   "n_tok": 128
+  }
+ ]
+}

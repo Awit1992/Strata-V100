@@ -1,0 +1,141 @@
+{
+ "label": "pf_32k",
+ "env": {
+  "STRATA_EXPERT_PAIR": "1",
+  "STRATA_SPLIT_RING": "192",
+  "STRATA_ARENA_LOCK": "0",
+  "STRATA_WATCHDOG_S": "300",
+  "STRATA_DECODE_TIMING": "1"
+ },
+ "argv": [
+  "$REPO/engine/strata",
+  "--serve",
+  "--pack",
+  "$MODEL_ROOT/packs/iq3_s",
+  "--native",
+  "$MODEL_ROOT/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+  "--ple-gguf",
+  "$MODEL_ROOT/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+  "--expert-profile",
+  "$MODEL_ROOT/data/expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto:32768",
+  "--spec",
+  "8",
+  "--mtp",
+  "$MODEL_ROOT/mtp/rt",
+  "--max-context",
+  "524288",
+  "--rope-scaling",
+  "yarn",
+  "--rope-scale",
+  "2",
+  "--kv",
+  "int8",
+  "--spec-min-p",
+  "0.70",
+  "--vision",
+  "--vram-reserve-mib",
+  "750",
+  "--conversation-cache-mib",
+  "25600",
+  "--conversation-cache-slots",
+  "32",
+  "--pipeline-windows",
+  "2",
+  "--layer-split",
+  "16",
+  "--prompt-cache",
+  "0",
+  "--prompt-cache-every",
+  "0",
+  "--prompt-cache-root",
+  "0",
+  "--conversation-cache-mib",
+  "0"
+ ],
+ "results": [
+  {
+   "kind": "prefill",
+   "target": 32768,
+   "rep": 0,
+   "prompt_tokens": 32768,
+   "prompt_ms": 20425.3,
+   "prefill_tok_s": 1604.2848819845976,
+   "wall_s": 20.665,
+   "pp": [
+    [
+     "10240",
+     "32768",
+     "7881",
+     "1299.3"
+    ],
+    [
+     "20480",
+     "32768",
+     "12546",
+     "1632.4"
+    ],
+    [
+     "30720",
+     "32768",
+     "17351",
+     "1770.5"
+    ],
+    [
+     "32767",
+     "32768",
+     "20058",
+     "1633.6"
+    ]
+   ]
+  },
+  {
+   "kind": "decode",
+   "target": 512,
+   "rep": 0,
+   "prompt_tokens": 512,
+   "prompt_ms": 2196.3,
+   "generated": 256,
+   "decode_ms": 3988.3,
+   "decode_tok_s": 64.18774916631145,
+   "draft_acc": 152,
+   "offloaded": 4980,
+   "wall_s": 6.193,
+   "tok_sha": "a9b23b9901ed6e08",
+   "n_tok": 256
+  },
+  {
+   "kind": "decode",
+   "target": 512,
+   "rep": 1,
+   "prompt_tokens": 512,
+   "prompt_ms": 2218.3,
+   "generated": 256,
+   "decode_ms": 3851.0,
+   "decode_tok_s": 66.47623993767853,
+   "draft_acc": 148,
+   "offloaded": 4701,
+   "wall_s": 6.078,
+   "tok_sha": "f42cad1fe3fbbce1",
+   "n_tok": 256
+  },
+  {
+   "kind": "decode",
+   "target": 512,
+   "rep": 2,
+   "prompt_tokens": 512,
+   "prompt_ms": 2209.6,
+   "generated": 256,
+   "decode_ms": 3363.3,
+   "decode_tok_s": 76.11571968007611,
+   "draft_acc": 174,
+   "offloaded": 5242,
+   "wall_s": 5.581,
+   "tok_sha": "1fe48ca66820b3c7",
+   "n_tok": 256
+  }
+ ]
+}
