@@ -349,6 +349,16 @@ public:
         static const std::vector<uint8_t> none;
         return block_ ? *block_ : none;
     }
+    // The writable form for a caller that overwrites every byte (conversation_checkpoint_save's device copy
+    // does): a block shared with another holder (an archived checkpoint, a batch slot) is replaced by a fresh
+    // one of the same size WITHOUT copying the bytes that are about to be overwritten.  The shared holder keeps
+    // its immutable copy; a checkpoint pool that reuses a dropped checkpoint's vectors therefore never pays a
+    // copy-on-write of the whole running state.
+    uint8_t* writable_all() {
+        if (!block_) return nullptr;
+        if (!block_.unique()) block_ = std::make_shared<std::vector<uint8_t>>(block_->size());
+        return block_->data();
+    }
     // The writable form detaches this payload from every other holder first.
     std::vector<uint8_t>& vec() {
         if (block_ && !block_.unique()) block_ = std::make_shared<std::vector<uint8_t>>(*block_);

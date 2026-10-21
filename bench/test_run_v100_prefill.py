@@ -263,6 +263,17 @@ class Accounting(unittest.TestCase):
         self.assertEqual(d["reused"], 0)
         self.assertNotIn("prompt_read", d)
 
+    def test_named_extensions_do_not_shift_prompt_accounting(self):
+        fields = self.fields() + ["chunk=0", "experts_streamed=91"]
+        done = P.parse_done(fields)
+        row = P.chain_row_metrics(done, round_index=0, turn=1, phase="chain",
+                                  requested_diff=32, requested_prompt_tokens=8225,
+                                  cache_every=2048)
+        self.assertEqual(row["prompt_read"], 33)
+        self.assertEqual(row["reused"], 8192)
+        self.assertEqual(row["prompt_tps"], 330.0)
+        self.assertEqual(done["experts_streamed"], 91)
+
     def test_the_read_count_drives_the_rate_and_the_requested_diff_does_not(self):
         row = self.row()
         self.assertEqual(row["reused"], 8192)

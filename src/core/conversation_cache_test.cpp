@@ -315,6 +315,17 @@ void test_shared_prefix() {
         second.gdn.assign(64, 9);
         check(shared_first.gdn.data() == payload && shared_first.gdn.vec()[0] == 7 && second.gdn.vec()[0] == 9,
               "writing the copy leaves the original payload alone");
+        // writable_all: a checkpoint save overwrites every byte, so a shared block is replaced, not copied
+        ConversationCheckpoint third = first;
+        uint8_t* const fresh = third.gdn.writable_all();
+        check(fresh != nullptr && fresh != payload && third.gdn.vec().size() == first.gdn.vec().size(),
+              "writable_all detaches a shared payload into a block of the same size");
+        check(shared_first.gdn.data() == payload && shared_first.gdn.vec()[0] == 7,
+              "writable_all leaves the shared original alone");
+        check(third.gdn.writable_all() == fresh, "writable_all keeps its own detached block");
+        fresh[0] = 11;
+        check(first.gdn.vec()[0] == 7 && third.gdn.vec()[0] == 11,
+              "a write through writable_all lands in the detached block");
         check(!ConversationCheckpoint{}.has_state() && first.has_state(), "has_state() reports a captured state");
         ConversationCheckpoint stripped = first;
         stripped.drop_state();

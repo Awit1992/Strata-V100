@@ -232,8 +232,11 @@ bool admit_merge_first_env() {
 }
 // STRATA_CKPT_POOL=1 (read once; off by default): the serve loop keeps the running-state vectors of the conversation
 // checkpoints it drops (evicted, pruned, a batch slot's old one) and saves the next checkpoint into them, so a save
-// resizes nothing (no zero-fill of ~118 MB of fresh vectors) and a slot's copy reuses their pages.  Every byte is
-// overwritten by the copy, so the checkpoints are the same
+// resizes nothing (no zero-fill of ~118 MB of fresh vectors) and the next save's copies land in pages that are already
+// faulted in.  On the two-V100 split a boundary save measured 72-94 ms while its device sync measured 0.1 ms, so the
+// payload copy is the cost; the pool recovers only a few percent of the small increments because an L2/L3 archive
+// capture usually still shares the retired checkpoint's payloads (writable_all then detaches a fresh block).  Every
+// byte is overwritten by the copy, so the checkpoints are the same
 bool ckpt_pool_env() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_CKPT_POOL");
@@ -1784,11 +1787,19 @@ struct DecodeCheckpoint {
     std::vector<strata::core::QsaState> qsa;
     std::vector<Copy> copies;
 
-    ~DecodeCheckpoint() {
+    ~DecodeCheckpoint() { release(); }
+    /// Frees the arena and its stream.  The serial loop keeps them across windows and requests (it captures every
+    /// window); the pipelined decode releases them once its one capture has reached the host, so the extra arena is
+    /// not held through the whole reply.
+    void release() {
         if (device < 0) return;
         const strata::core::OnDevice on(device);
         if (stream) cudaStreamDestroy(stream);
         if (arena) cudaFree(arena);
+        stream = nullptr;
+        arena = nullptr;
+        copies.clear();
+        device = -1;
     }
 
     bool init(const strata::core::SessionState& ss, const strata::core::ModelGeometry& g,
@@ -1981,6 +1992,9 @@ public:
 private:
     static void clear_marks(ConvCheckpoint& c) {
         c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false;
+        // A pooled checkpoint's vectors are reused, so every run-time mark must go with them: a stale
+        // PromptPlan would attach a later periodic checkpoint to a segment it was not taken in.
+        c.plan = ConvCheckpoint::PromptPlan{};
         for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
     }
     bool on_;
@@ -8603,6 +8617,27 @@ int main(int argc, char** argv) {
             /// normal `refill` must only wait, never copy the same slots a second time.  Cleared by `refill_wait`
             /// (the loan is back) and by `lend` (a new loan).  The aggregate initializers below leave it false.
             bool refill_issued = false;
+            /// STRATA_PREFILL_PROMOTE: the prompt's routing counts for THIS part's own layers, `(le - lb) x n_expert`.
+            /// Written only by this part's `on_routes` callback (a split's stages own disjoint layer ranges), read
+            /// by the promotion plan after that part's own read has finished.  Empty: the experiment is off.
+            std::vector<double> prompt_count{};
+            /// The current loan's rotation, aligned with `lent`: the non-resident hot expert to bring into the
+            /// stable head and the cold resident expert to move into the lent slot; -1: an ordinary restore.
+            std::vector<int32_t> promote_hot{}, promote_cold{};
+            /// Per entry: 0 = nothing queued, 1 = the cold->lent D2D is queued, 2 = both copies are queued.  A
+            /// retried issue queues only what is missing: the D2D must never run twice (the H2D overwrites the
+            /// source slot a second D2D would read).
+            std::vector<uint8_t> promote_queued{};
+            bool promote_planned = false;   // the loan's decisions are fixed; a retry reuses them
+            /// STRATA_PREFILL_PROMOTE: the largest slot count any request's loan can need, priced once before READY
+            /// over every positive chunk up to the original `--prefill` (#2090: this is NOT monotonic in the
+            /// chunk), and the cache geometry it was priced against.  A changed geometry is priced again at plan
+            /// time.  `promote_head` is the head chosen for the CURRENT loan, used by the plan and the issue check.
+            int64_t stable_need = -1;
+            int64_t stable_slots = -1;
+            int64_t stable_bytes = -1;
+            const uint64_t* stable_offsets = nullptr;
+            int32_t promote_head = 0;
         };
         // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
         // per layer), otherwise max_blob each.
@@ -10571,16 +10606,22 @@ int main(int argc, char** argv) {
         };
 
         StageThreads ckpt_threads;   // STRATA_CKPT_THREADS: the later stages' parts of a checkpoint (started on first use)
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
-                                 const std::vector<int32_t>* tokens = nullptr) -> bool {
-            ckpt_why.clear();
-            if (o.prompt_cache <= 0 || L < 1) return true;
+        // `checks` already holds a state at L: a use, not a save (the LRU clock and the tail flag advance exactly as
+        // they do when checkpoint_at meets it).
+        auto checkpoint_present = [&](int64_t L, bool as_tail) -> bool {
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
                     c.used = ++check_clock;
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
                     return true;
                 }
+            return false;
+        };
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
+                                 const std::vector<int32_t>* tokens = nullptr) -> bool {
+            ckpt_why.clear();
+            if (o.prompt_cache <= 0 || L < 1) return true;
+            if (checkpoint_present(L, as_tail)) return true;
             ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
             if (tokens) c.ids.assign(tokens->begin(), tokens->begin() + L);
             else c.ids.assign(cur.begin(), cur.begin() + L);
@@ -11926,16 +11967,86 @@ int main(int argc, char** argv) {
         sp.should_stop = [&] { return stop_req.load(); };
         // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
         // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
-        // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched
-        if (ram_adapt2.on && ram_adapt2.prompt_w > 0.0f) {
+        // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched.
+        // STRATA_PREFILL_PROMOTE=N (opt-in, default 0): the prompt's routing also selects up to N stable-head
+        // rotations per part per loan (see plan_promotions below).  It is limited to the path where the tables it
+        // reads are coherent: the full-RAM arena without the resident complement, peer or helper tiers.  The elastic
+        // K/V is SUPPORTED: its slot moves leave ExpertCache's table stale, so every candidate is accepted only when
+        // the cache's own entry still matches the active host slot (an untouched entry), and a mismatch is skipped,
+        // never repaired.  An explicit opt-in anywhere else says why and stays exactly today's path.
+        const int64_t promote_chunk_hi = o.prefill_chunk;   // the original cap: relend only lowers and restores it
+        static const int64_t promote_cap = [] {
+            const char* v = std::getenv("STRATA_PREFILL_PROMOTE");
+            return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : 0;
+        }();
+        bool promote_on = promote_cap > 0;
+        if (promote_on) {
+            const char* promote_help = std::getenv("STRATA_PREFILL_HELP");
+            const char* why =
+                srcp == nullptr ? "there is no expert source"
+                : srcp != &arena_src ? "it needs the full-RAM expert arena (--mmap-experts is not supported)"
+                : src.complement_ready() ? "the resident RAM complement is running"
+                : peer.valid() ? "--peer-device"
+                : drive.d.remote_count > 0 || remote_opt ? "a helper/remote expert cache"
+                : promote_help != nullptr && std::atoi(promote_help) != 0 ? "STRATA_PREFILL_HELP"
+                : o.prefill_head_alias ? "--prefill-head-alias"
+                : o.batch > 0 ? "the batch slots (--batch): a concurrent prefill pump can read a head slot being rotated"
+                : std::none_of(pf_parts.begin(), pf_parts.end(), [](const PfPart& p) { return p.first >= 0; })
+                      ? "the prompt path does not lend cache slots"
+                      : nullptr;
+            if (why != nullptr) {
+                std::fprintf(stderr, "strata serve: STRATA_PREFILL_PROMOTE=%lld is off: %s\n", (long long) promote_cap,
+                             why);
+                promote_on = false;
+            } else {
+                // Price the worst loan ONCE per part, over every positive chunk a request can use: the ring layout
+                // is not monotonic in the chunk (#2090), so `p.first` is not a lower bound for a later request.
+                // Every loan leaves the lend rule's 128 slots below it; that floor is the only fallback needed.
+                for (PfPart& p : pf_parts) {
+                    p.prompt_count.assign((size_t) (p.le - p.lb) * (size_t) g.n_expert, 0.0);
+                    if (p.first < 0) continue;   // this part never lends, so it never promotes
+                    // bytes_needed prices device-dependent modes: price on this part's own card
+                    const strata::core::OnDevice on(p.dev);
+                    int64_t worst = 0;
+                    for (int64_t c = 1; c <= promote_chunk_hi; ++c) {
+                        const int64_t k = part_slots(p, c);
+                        if (k > worst) worst = k;
+                    }
+                    p.stable_need = worst > 0 ? worst : -1;
+                    p.stable_slots = p.cache->slots();
+                    p.stable_bytes = p.cache->bytes();
+                    p.stable_offsets = p.cache->slot_offsets();
+                }
+                std::fprintf(stderr, "strata serve: STRATA_PREFILL_PROMOTE=%lld: up to %lld stable-head rotations per "
+                                     "part per loan\n", (long long) promote_cap, (long long) promote_cap);
+            }
+        }
+        auto seed_ram_routes = [&](int64_t l, const int32_t* ids, int64_t n) {
+            if (!(ram_adapt2.on && ram_adapt2.prompt_w > 0.0f) || ram_adapt2.seed.empty()) return;
+            if (l < 0 || l >= g.n_layers || n <= 0) return;
+            const float per = ram_adapt2.prompt_w * 20.0f * (float) g.n_expert_used / (float) n;   // = w x 20 / tokens
+            float* sd = ram_adapt2.seed.data() + l * g.n_expert;
+            for (int64_t i = 0; i < n; ++i)
+                if (ids[i] >= 0 && ids[i] < g.n_expert) sd[ids[i]] += per;
+        };
+        if (promote_on) {
+            if (ram_adapt2.on && ram_adapt2.prompt_w > 0.0f)
+                ram_adapt2.seed.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            // One callback per part: a stage's layers are disjoint, so each counter vector has exactly one writer
+            // and the plan (on that part's own thread or after its read) never races another part's counts.
+            for (size_t pi = 0; pi < pf_parts.size(); ++pi) {
+                pf_parts[pi].sp->on_routes = [&, pi](int64_t l, const int32_t* ids, int64_t n) {
+                    PfPart& p = pf_parts[pi];
+                    if (l < p.lb || l >= p.le || n <= 0 || p.prompt_count.empty()) return;
+                    double* pc = p.prompt_count.data() + (size_t) (l - p.lb) * (size_t) g.n_expert;
+                    for (int64_t i = 0; i < n; ++i)
+                        if (ids[i] >= 0 && ids[i] < g.n_expert) pc[ids[i]] += 1.0;
+                    if (p.sp == &sp) seed_ram_routes(l, ids, n);
+                };
+            }
+        } else if (ram_adapt2.on && ram_adapt2.prompt_w > 0.0f) {
             ram_adapt2.seed.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-            sp.on_routes = [&](int64_t l, const int32_t* ids, int64_t n) {
-                if (l < 0 || l >= g.n_layers || n <= 0) return;
-                const float per = ram_adapt2.prompt_w * 20.0f * (float) g.n_expert_used / (float) n;   // = w x 20 / tokens
-                float* sd = ram_adapt2.seed.data() + l * g.n_expert;
-                for (int64_t i = 0; i < n; ++i)
-                    if (ids[i] >= 0 && ids[i] < g.n_expert) sd[ids[i]] += per;
-            };
+            sp.on_routes = seed_ram_routes;
         }
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
@@ -14545,14 +14656,181 @@ int main(int argc, char** argv) {
             // STRATA_REFILL_PARTS=1 (gfx1151's table): a lent slot of a GGUF read in place is refilled from the pieces in the mapping.
             // The default assembles the blob in a staging buffer first (a 4 MB copy on this thread), then copies that.
             static const bool refill_parts = [] { const char* v = std::getenv("STRATA_REFILL_PARTS"); return v != nullptr && std::atoi(v) != 0; }();
+            // STRATA_PREFILL_PROMOTE: fix, once per loan, which lent slots rotate with the stable head.  A promotion
+            // pairs one hot NON-resident expert (the prompt routes it) with one cold resident expert in the STABLE
+            // HEAD and the old loan expert whose slot L it takes: D2D S->L preserves the cold expert, then the
+            // ordinary refill H2D brings the hot expert into S.  S < min(first, first_now) - below the smallest
+            // region any later loan of this part can borrow - so the hot expert is still there when the next
+            // batched request starts; promoting into L would only be overwritten again.  Strictly count-beats-both,
+            // bounded per part, and never a second plan for one loan: a retry of the copies must not re-derive a
+            // different rotation after S has been overwritten.
+            // The head a rotation may use for the CURRENT loan, computed once and stored in `promote_head` for the
+            // issue check.  A cache geometry change (a vram-elastic shrink/grow) re-prices the worst loan on this
+            // part's card; an unpriced worst, or one that no longer leaves the lend rule's 128 slots, falls back to
+            // min(128, slots, first_now).  `p.first` is never used: #2090 makes it non-monotonic in the chunk.
+            auto loan_head_for = [&](PfPart& p) -> int32_t {
+                const int64_t slots = p.cache->slots();
+                if (p.stable_slots != slots || p.stable_bytes != p.cache->bytes() ||
+                    p.stable_offsets != p.cache->slot_offsets()) {
+                    const strata::core::OnDevice on(p.dev);
+                    int64_t worst = 0;
+                    for (int64_t c = 1; c <= promote_chunk_hi; ++c) {
+                        const int64_t k = part_slots(p, c);
+                        if (k > worst) worst = k;
+                    }
+                    p.stable_need = worst > 0 ? worst : -1;
+                    p.stable_slots = slots;
+                    p.stable_bytes = p.cache->bytes();
+                    p.stable_offsets = p.cache->slot_offsets();
+                }
+                int64_t head;
+                if (p.stable_need <= 0 || p.stable_need + 128 > slots)
+                    head = std::min<int64_t>(128, std::min<int64_t>(slots, p.first_now));
+                else
+                    head = std::min<int64_t>(p.first_now, std::max<int64_t>(128, slots - p.stable_need));
+                if (head < 0) head = 0;
+                p.promote_head = (int32_t) head;
+                return p.promote_head;
+            };
+            auto plan_promotions = [&](PfPart& p) {
+                p.promote_hot.assign(p.lent.size(), -1);
+                p.promote_cold.assign(p.lent.size(), -1);
+                p.promote_queued.assign(p.lent.size(), 0);
+                p.promote_planned = true;
+                p.promote_head = 0;
+                if (!promote_on || promote_cap <= 0 || p.prompt_count.empty() || p.first_now <= 0) return;
+                // The worst loan over every chunk a request can use was priced before READY; `first_now` only
+                // tightens it for this request.  S below it is outside every current and later loan of this part.
+                const int32_t head = loan_head_for(p);
+                if (head <= 0) return;
+                // The adaptive tier's copies in flight may still write a slot; a request drains them before its
+                // prompt (adapt_tick(true)), and anything pending here means this loan is not quiet enough.
+                if (!pending.empty()) {
+                    if (trace)
+                        std::fprintf(stderr, "strata trace: prefill promote: skipped, the adaptive tier has %zu copies "
+                                             "in flight\n", pending.size());
+                    return;
+                }
+                const int64_t E = g.n_expert;
+                int64_t chosen = 0;
+                struct Cand { double c; int32_t e; };
+                struct Victim { double c; size_t k; int32_t e; int32_t slot; };
+                std::vector<Cand> hot, cold;   // reused for every layer: a plan must not allocate per group
+                std::vector<Victim> old;
+                std::vector<char> in_loan((size_t) E, 0);
+                hot.reserve((size_t) E);
+                cold.reserve((size_t) E);
+                old.reserve((size_t) E);
+                for (int64_t l = p.lb; l < p.le && chosen < promote_cap; ++l) {
+                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                    const double* pc = p.prompt_count.data() + (size_t) (l - p.lb) * (size_t) E;
+                    hot.clear();
+                    cold.clear();
+                    old.clear();
+                    std::fill(in_loan.begin(), in_loan.end(), 0);
+                    for (size_t k = 0; k < p.lent.size(); ++k) {
+                        const int32_t i = p.lent[k].first;
+                        if (i / E != l) continue;
+                        const int32_t e = i % E;
+                        in_loan[(size_t) e] = 1;
+                        const int32_t slot = p.lent[k].second;
+                        // the cache's own entry must still name the active lent slot (an untouched expert; a
+                        // mismatched entry is KVG-stale and is never repaired here)
+                        if (p.cache->slot_of(l, e) != slot) continue;
+                        if ((uint64_t) nb > p.cache->slot_room(slot)) continue;
+                        old.push_back({pc[e], k, e, slot});
+                    }
+                    if (old.empty()) continue;
+                    for (int32_t e = 0; e < (int32_t) E; ++e) {
+                        if (in_loan[(size_t) e]) continue;
+                        if (pc[e] <= 0.0) continue;
+                        const size_t i = (size_t) (l * E) + (size_t) e;
+                        if (host_res[i] != strata::core::kNotResident) continue;
+                        if (p.cache->slot_of(l, e) != strata::core::kNotResident) continue;
+                        if (srcp->blob_stable(l, e) == nullptr) continue;
+                        hot.push_back({pc[e], e});
+                    }
+                    for (int32_t e = 0; e < (int32_t) E; ++e) {
+                        const int32_t s = host_res[(size_t) (l * E) + (size_t) e];
+                        if (s < 0 || s >= head) continue;                          // the stable head only
+                        if (p.cache->slot_of(l, e) != s) continue;                  // both tables agree
+                        if ((uint64_t) nb > p.cache->slot_room(s)) continue;        // the layer's blob fits
+                        cold.push_back({pc[e], e});
+                    }
+                    if (hot.empty() || cold.empty()) continue;
+                    std::sort(hot.begin(), hot.end(), [](const Cand& a, const Cand& b) { return a.c > b.c; });
+                    std::sort(cold.begin(), cold.end(), [](const Cand& a, const Cand& b) { return a.c < b.c; });
+                    std::sort(old.begin(), old.end(), [](const Victim& a, const Victim& b) { return a.c < b.c; });
+                    size_t ci = 0, oi = 0;
+                    for (const Cand& h : hot) {
+                        if (chosen >= promote_cap) break;
+                        // ascending victims: once the coolest one is not beaten, no later hot expert beats it
+                        while (ci < cold.size() && cold[ci].c >= h.c) ++ci;
+                        while (oi < old.size() && old[oi].c >= h.c) ++oi;
+                        if (ci >= cold.size() || oi >= old.size()) break;
+                        const int32_t cslot = p.cache->slot_of(l, cold[ci].e);
+                        const int32_t oslot = old[oi].slot;
+                        // both remapped slots must have exactly one owner in the cache table; a KVG-stale or
+                        // duplicated entry here would make promote_remap refuse only after the copies, so skip it
+                        bool unique = cslot >= 0 && oslot >= 0 && cslot != oslot;
+                        for (int32_t e2 = 0; e2 < (int32_t) E && unique; ++e2) {
+                            const int32_t s2 = p.cache->slot_of(l, e2);
+                            if (e2 != cold[ci].e && s2 == cslot) unique = false;
+                            if (e2 != old[oi].e && s2 == oslot) unique = false;
+                        }
+                        if (!unique) { ++ci; continue; }   // an ambiguous table must not be rotated
+                        const size_t k = old[oi].k;
+                        p.promote_hot[k] = h.e;
+                        p.promote_cold[k] = cold[ci].e;
+                        ++chosen; ++ci; ++oi;
+                    }
+                }
+                if (trace)
+                    std::fprintf(stderr, "strata trace: prefill promote: %lld of %lld lent slots on CUDA%d rotate a "
+                                         "head slot\n", (long long) chosen, (long long) p.lent.size(),
+                                 p.dev < 0 ? 0 : p.dev);
+            };
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 // STRATA_PREFILL_REFILL_OVERLAP: the hook may already have queued this loan's copies while the
                 // next stage still computed, so a second issue is a no-op - `refill` then only waits for them.
                 if (p.refill_issued) return true;
                 if (p.lent.empty()) return true;
-                tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
-                for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                // Nothing reads this part's cache between these copies and refill_wait's fence: the prompt path for
+                // the part has finished (or this hook fires only when the loan is about to be returned), the
+                // adaptive tier is drained at the request's start (the plan also declines if `pending` is not
+                // empty), and --batch is declined at startup because its prefill pump can read a head slot.
+                if (promote_on && !p.promote_planned) plan_promotions(p);
+                tr("refill start", (long long) p.lent.size());
+                for (size_t k = 0; k < p.lent.size(); ++k) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                    const int32_t i = p.lent[k].first;
+                    const int32_t slot = p.lent[k].second;
+                    const int32_t hot = p.promote_hot.empty() ? -1 : p.promote_hot[k];
+                    if (hot >= 0) {   // stable-head rotation: cold S->L first, then the hot expert into S
+                        const int32_t cold = p.promote_cold[k];
+                        const int64_t l = i / g.n_expert;
+                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                        const int32_t s = host_res[(size_t) (l * g.n_expert + cold)];
+                        if (p.promote_head <= 0 || s < 0 || s >= p.promote_head) {
+                            e = "prefill promotion: the cold head slot moved before its copy was issued";
+                            return false;
+                        }
+                        // The D2D is one-shot: the H2D overwrites S, so replaying the D2D on a retry would copy the
+                        // hot (or a partial) expert over the cold one.  H2D may be replayed - it is idempotent.
+                        if (p.promote_queued[k] < 1) {
+                            if (!p.cache->copy_slot_queued(slot, s, nb, e)) return false;
+                            p.promote_queued[k] = 1;
+                        }
+                        if (p.promote_queued[k] < 2) {
+                            const uint8_t* b = srcp->blob_stable(l, hot);
+                            if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(s, b, e, nb)
+                                                                    : p.cache->fill_slot_queued(s, b, e, nb)))
+                                return false;
+                            if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
+                            p.promote_queued[k] = 2;
+                        }
+                        continue;   // the mapping waits for the fence in refill_wait
+                    }
                     strata::core::BlobPart parts[3];
                     const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
                     if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
@@ -14579,8 +14857,27 @@ int main(int argc, char** argv) {
                 for (const auto& [i, slot] : p.lent)
                     srcp->release(i / g.n_expert, i % g.n_expert);
 #endif
+                // The rotation's metadata is published ONLY here, after the fence: until now host_res still has the
+                // cold expert in S and the old loan expert not resident.  A copy failure above already returned
+                // false through refill's fatal path, so no read can fall back to a mapping whose bytes are gone.
+                for (size_t k = 0; k < p.lent.size(); ++k) {
+                    if (p.promote_hot.empty() || p.promote_hot[k] < 0) continue;
+                    const int32_t i = p.lent[k].first, slot = p.lent[k].second;
+                    const int32_t cold = p.promote_cold[k], hot = p.promote_hot[k];
+                    const int64_t l = i / g.n_expert;
+                    const int32_t s = host_res[(size_t) (l * g.n_expert + cold)];
+                    if (!p.cache->promote_remap(l, i % g.n_expert, cold, hot, slot, s, e)) return false;
+                    host_res[(size_t) (l * g.n_expert + cold)] = slot;
+                    host_res[(size_t) (l * g.n_expert + hot)] = s;
+                    host_res[(size_t) i] = strata::core::kNotResident;   // already during the loan; the invariant
+                }
                 p.lent.clear();
                 p.lent_chunk = 0;
+                p.promote_hot.clear();
+                p.promote_cold.clear();
+                p.promote_queued.clear();
+                p.promote_planned = false;
+                p.promote_head = 0;
                 p.refill_issued = false;   // the loan is back: the next lend and issue start clean
                 return true;
             };
@@ -14681,6 +14978,14 @@ int main(int argc, char** argv) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
+                    // a new (or re-laid-out) loan: no rotation is planned or queued for it yet, and the counts this
+                    // plan will use are the routing of THIS loan's read only (no service-lifetime LFU carryover)
+                    p.promote_hot.clear();
+                    p.promote_cold.clear();
+                    p.promote_queued.clear();
+                    p.promote_planned = false;
+                    p.promote_head = 0;
+                    std::fill(p.prompt_count.begin(), p.prompt_count.end(), 0.0);
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t i = (size_t) (l * g.n_expert + ex);
@@ -15516,14 +15821,129 @@ int main(int argc, char** argv) {
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
                                      "them\n", (long long) il_parts + 1, il_ms);
+            // The input anchor (the running state after the first n-1 prompt tokens): the final prompt token is
+            // evaluated by the first decode window, and a reply rewrite resumes just before it.  Its host copy is
+            // 72-94 ms on a two-V100 split and used to sit before the first token.  The running state only changes
+            // at a commit, so it is captured on the device at this point instead; the host copy runs after the first
+            // window has emitted all of its tokens and flushed them, and the checkpoint enters `checks` at the
+            // response end, where the decode is quiescent.  The arena is this request's own (nothing else writes or
+            // aliases it) and is freed as soon as the host copy is complete.
+            // STRATA_INPUT_ANCHOR_DEFER=0: the old synchronous save before the first token, for an A/B on one binary.
+            static const bool input_anchor_defer = [] {
+                const char* v = std::getenv("STRATA_INPUT_ANCHOR_DEFER");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            int64_t input_anchor_at = -1;        // n - 1: captured on the device, not yet in the host
+            int64_t input_anchor_saved_at = -1;  // n - 1: already in `checks` (the response-end save reuses it)
+            bool input_anchor_dedicated = false; // the pipelined decode's own arenas (the serial loop captures its own)
+            bool input_anchor_ready = false;     // a capture at n - 1 is in the arena `input_anchor_host_copy` reads
+            bool input_anchor_copied = false;    // the host image is complete; the arenas are gone and not read again
+            std::vector<int32_t> input_anchor_ids;
+            std::vector<ConvCheckpoint> input_anchor_parts;
+            std::vector<std::unique_ptr<DecodeCheckpoint>> input_anchor_arenas;
+            auto input_anchor_release = [&] { input_anchor_arenas.clear(); };
+            // Capture every stage's running state at the anchor on the device.  Each device is synchronized first,
+            // as checkpoint_at does: the capture stream is not ordered against the prompt's or the drafter's streams
+            // (both parities included).  A failure leaves the state untouched; the caller saves it synchronously.
+            // Only the pipelined decode uses this (its windows never capture into `decode_checkpoints`, which a
+            // speculative rollback may own); the serial loop's own per-window capture is the anchor there.
+            auto input_anchor_capture = [&]() -> bool {
+                try {
+                    input_anchor_release();
+                    input_anchor_arenas.resize(decode_checkpoints.size());
+                    for (size_t i = 0; i < input_anchor_arenas.size(); ++i) {
+                        const strata::core::OnDevice on(stage_device(i));
+                        if (cudaDeviceSynchronize() != cudaSuccess) {
+                            cudaGetLastError();
+                            input_anchor_release();
+                            return false;
+                        }
+                        auto cp = std::make_unique<DecodeCheckpoint>();
+                        std::string e;
+                        if (!cp->init(stage_session(i), g, e) || !cp->capture(e)) {
+                            input_anchor_release();
+                            return false;
+                        }
+                        input_anchor_arenas[i] = std::move(cp);
+                    }
+                    input_anchor_dedicated = true;
+                    input_anchor_ready = true;
+                    return true;
+                } catch (const std::bad_alloc&) {
+                    // The host side of the capture (the arena list, a view's qsa vector, an error string) is the only
+                    // thing that can throw here; the caller still holds the live state at the anchor and saves that
+                    // synchronously.  The promised memory fallback must not unwind the request.
+                    cudaGetLastError();
+                    input_anchor_release();
+                    return false;
+                }
+            };
+            // The anchor's host image, from the captured arena.  The dedicated arena goes back to the driver as soon
+            // as every stage's bytes are in RAM, so no reply holds the extra device copy.
+            auto input_anchor_host_copy = [&]() -> bool {
+                std::vector<std::unique_ptr<DecodeCheckpoint>>& arenas =
+                    input_anchor_dedicated ? input_anchor_arenas : decode_checkpoints;
+                if (!input_anchor_ready || arenas.size() != decode_checkpoints.size()) return false;
+                const Clock::time_point t0 = Clock::now();
+                try {
+                    input_anchor_parts.assign(arenas.size(), ConvCheckpoint{});
+                    for (size_t i = 0; i < input_anchor_parts.size(); ++i) {
+                        const strata::core::OnDevice on(stage_device(i));
+                        input_anchor_parts[i].ids = input_anchor_ids;
+                        if (!checkpoint_save(input_anchor_parts[i], arenas[i]->view, g)) {
+                            input_anchor_parts.clear();
+                            input_anchor_release();
+                            return false;
+                        }
+                    }
+                } catch (const std::bad_alloc&) {
+                    // A host allocation failure is the old save's failure too: the caller keeps its existing error
+                    // path instead of unwinding through the decode loop.
+                    input_anchor_parts.clear();
+                    input_anchor_release();
+                    return false;
+                }
+                if (ckpt_trace)
+                    std::fprintf(stderr, "strata trace: input anchor at %lld: host copy %.1f ms after the first window "
+                                         "(%zu stage(s))\n", (long long) input_anchor_at,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                 input_anchor_parts.size());
+                input_anchor_copied = true;
+                input_anchor_ready = false;
+                input_anchor_release();
+                return true;
+            };
+            // The old synchronous path, for a request that cannot defer (no first token, a merged first window), an
+            // opt-out, or a capture that failed: the state is still at the anchor here.
+            auto input_anchor_save_now = [&](int64_t L) -> bool {
+                input_anchor_at = -1;
+                input_anchor_ready = false;
+                input_anchor_copied = false;
+                input_anchor_parts.clear();
+                input_anchor_release();
+                const bool saved = checkpoint_at(L);
+                if (saved) input_anchor_saved_at = L;   // (the response-end copy reuses it too)
+                return saved;
+            };
             // Keep the predecode input boundary inside the existing active
             // checkpoint limit. The final prompt token is evaluated by the
             // first decode window; a reply rewrite can resume just before it
             // without loading a parked copy of the previous generated tail.
-            if (!cancelled && req_ckpt && o.prompt_cache > 0 && n > 1 && at == n - 1 &&
-                !checkpoint_at(n - 1)) {
-                std::printf("ERR saving the input checkpoint failed%s\n", ckpt_why.c_str());
-                return 1;
+            if (!cancelled && req_ckpt && o.prompt_cache > 0 && n > 1 && at == n - 1) {
+                if (checkpoint_present(n - 1, false)) {
+                    input_anchor_saved_at = n - 1;   // already in the chain: the response-end copy reuses it
+                } else {
+                    const bool can_defer = input_anchor_defer && max_new > 0 && merge_at < 0;
+                    if (!can_defer) {
+                        if (!input_anchor_save_now(n - 1)) {
+                            std::printf("ERR saving the input checkpoint failed%s\n", ckpt_why.c_str());
+                            return 1;
+                        }
+                    } else {
+                        input_anchor_at = n - 1;
+                        input_anchor_ids.assign(cur.begin(), cur.begin() + (n - 1));
+                    }
+                }
             }
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
@@ -15615,6 +16035,24 @@ int main(int argc, char** argv) {
                 if (!pl_prepare(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
+                }
+                // The pipeline never captures into `decode_checkpoints` (a speculative rollback may own those), so
+                // its input anchor gets its own device image here, before any window launches or commits.  If it
+                // cannot be allocated, save it synchronously now: this is the last point at which the state is
+                // still exactly the anchor.
+                if (input_anchor_at > 0 && !input_anchor_capture()) {
+                    const int64_t L = input_anchor_at;
+                    bool saved = false;
+                    try {
+                        saved = input_anchor_save_now(L);
+                    } catch (const std::bad_alloc&) {
+                        input_anchor_at = -1;
+                        input_anchor_release();
+                    }
+                    if (!saved) {
+                        std::printf("ERR saving the input checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
                 }
                 struct PW {
                     int T = 0, seq = 0;
@@ -16138,6 +16576,16 @@ int main(int argc, char** argv) {
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
                     }
                     std::fflush(stdout);
+                    // The first accepted window has emitted and flushed every token it accepted: its pre-window
+                    // running state is still in the anchor arena, so copy it now, off the first token's path.
+                    if (A.seq == 0 && input_anchor_at > 0 && !input_anchor_copied) {
+                        if (nf) {
+                            input_anchor_at = -1;   // #879: the next request drops every checkpoint anyway
+                            input_anchor_release();
+                        } else if (!input_anchor_host_copy()) {
+                            return die("saving the input checkpoint failed");
+                        }
+                    }
                     if (nf) finish = "nonfinite";
                     else if (eos) finish = "stop";
                     else if (stop_req.load()) finish = "cancel";
@@ -16493,6 +16941,10 @@ int main(int argc, char** argv) {
                         }
                     }
                     decode_checkpoint_at = (int64_t) consumed.size();
+                    // The serial loop's capture is the input anchor when it is taken at n - 1 (the first window);
+                    // its host copy runs after that window has emitted.
+                    if (input_anchor_at > 0 && !input_anchor_copied && decode_checkpoint_at == input_anchor_at)
+                        input_anchor_ready = true;
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
                 if (kvg_on() && p + T + 64 > kvg_cells() &&
@@ -16586,6 +17038,12 @@ int main(int argc, char** argv) {
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
                 }
                 std::fflush(stdout);
+                // The first window has emitted and flushed every token it accepted: its pre-window running state is
+                // still in the anchor arena (nothing else writes it), so its host copy no longer delays the first token.
+                if (input_anchor_at > 0 && !input_anchor_copied && !input_anchor_host_copy()) {
+                    std::printf("ERR saving the input checkpoint failed\n");
+                    return 1;
+                }
                 ++rounds;
                 if (drive.d.fs) drive.d.fs->completed.fetch_add(1, std::memory_order_release);
                 const Clock::time_point tw2 = Clock::now();
@@ -16632,23 +17090,81 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-            if (decode_checkpoint_at > 0) {
-                std::vector<ConvCheckpoint> parts(decode_checkpoints.size());
-                for (size_t i = 0; i < parts.size(); ++i) {
-                    const strata::core::OnDevice on(stage_device(i));
-                    parts[i].ids.assign(consumed.begin(), consumed.begin() + decode_checkpoint_at);
-                    if (!checkpoint_save(parts[i], decode_checkpoints[i]->view, g)) {
-                        std::printf("ERR saving response-end checkpoint failed\n");
-                        return 1;
+            // The input anchor's host image (copied after the first window) enters the chain here, where the decode
+            // is quiescent: nothing is in flight and every checkpoint operation has the device to itself.
+            if (input_anchor_at > 0) {
+                const int64_t L = input_anchor_at;
+                if (nf_hit) {
+                    input_anchor_at = -1;   // #879: the next request drops every cached state first
+                    input_anchor_parts.clear();
+                    input_anchor_release();
+                } else {
+                    if (input_anchor_parts.empty()) {
+                        if (input_anchor_ready && (int64_t) consumed.size() == L) {
+                            // A capture was taken but no window committed anything (a STOP or a context break before
+                            // the first window): the arena still holds exactly n-1, so its host copy is exact.  A
+                            // failure here is the same save failure the old path had: error, never a silent drop.
+                            if (!input_anchor_host_copy()) {
+                                std::printf("ERR saving the input checkpoint failed\n");
+                                return 1;
+                            }
+                        } else if ((int64_t) consumed.size() == L) {
+                            // No capture was taken and nothing committed: the live session is still exactly at the
+                            // anchor, so the old synchronous save applies unchanged.
+                            bool saved = false;
+                            try {
+                                saved = input_anchor_save_now(L);
+                            } catch (const std::bad_alloc&) {
+                                saved = false;
+                            }
+                            if (!saved) {
+                                std::printf("ERR saving the input checkpoint failed%s\n", ckpt_why.c_str());
+                                return 1;
+                            }
+                        } else {
+                            // A commit happened without the host copy: an invariant breach.  The promised checkpoint
+                            // must not be silently omitted.
+                            std::printf("ERR saving the input checkpoint failed: its host copy was not taken after "
+                                        "the first window\n");
+                            return 1;
+                        }
+                    }
+                    if (input_anchor_at > 0) {   // (the synchronous fallback above already inserted it)
+                        input_anchor_at = -1;
+                        if (!checkpoint_at(L, &input_anchor_parts, false, &input_anchor_ids)) {
+                            std::printf("ERR saving the input checkpoint failed%s\n", ckpt_why.c_str());
+                            return 1;
+                        }
+                        input_anchor_saved_at = L;
                     }
                 }
-                if (!checkpoint_at(decode_checkpoint_at, &parts, false, &consumed)) {
-                    std::printf("ERR retaining response-end checkpoint failed%s\n", ckpt_why.c_str());
-                    return 1;
+            }
+            if (decode_checkpoint_at > 0) {
+                if (decode_checkpoint_at == input_anchor_saved_at) {
+                    // The first decode window was also the last: the response-end state IS the input anchor that is
+                    // already in `checks`, so its host image is not copied a second time.
+                    if (!checkpoint_at(decode_checkpoint_at, nullptr, false, &consumed)) {
+                        std::printf("ERR retaining response-end checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
+                } else {
+                    std::vector<ConvCheckpoint> parts(decode_checkpoints.size());
+                    for (size_t i = 0; i < parts.size(); ++i) {
+                        const strata::core::OnDevice on(stage_device(i));
+                        parts[i].ids.assign(consumed.begin(), consumed.begin() + decode_checkpoint_at);
+                        if (!checkpoint_save(parts[i], decode_checkpoints[i]->view, g)) {
+                            std::printf("ERR saving response-end checkpoint failed\n");
+                            return 1;
+                        }
+                    }
+                    if (!checkpoint_at(decode_checkpoint_at, &parts, false, &consumed)) {
+                        std::printf("ERR retaining response-end checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata serve: response-end checkpoint %lld tokens; live tail %lld tokens\n",
+                                 (long long) decode_checkpoint_at,
+                                 (long long) ((int64_t) consumed.size() - decode_checkpoint_at));
                 }
-                std::fprintf(stderr, "strata serve: response-end checkpoint %lld tokens; live tail %lld tokens\n",
-                             (long long) decode_checkpoint_at,
-                             (long long) ((int64_t) consumed.size() - decode_checkpoint_at));
             }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();

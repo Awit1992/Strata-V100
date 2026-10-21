@@ -172,13 +172,20 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     const size_t layers = owned_qsa(ss);
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+    // writable_all(): every byte below is overwritten by the device copy, so a payload still shared with an
+    // archived copy or a slot is detached with a fresh block instead of copying ~118 MB that is about to go.
+    uint8_t* const gdn = c.gdn.writable_all();
+    uint8_t* const ple = c.ple.writable_all();
+    uint8_t* const tails = c.tails.writable_all();
+    uint8_t* const dead = c.dead.writable_all();
+    uint8_t* const block_pos = c.block_pos.writable_all();
+    if (!copy(gdn, ss.gdn_state, c.gdn.size(), error) ||
+        !copy(ple, ss.ple_hist, c.ple.size(), error)) return false;
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
-            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
-            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+        if (!copy(tails + j * z.tail, st.idx_tail, z.tail, error) ||
+            !copy(dead + j * z.dead, st.idx_dead, z.dead, error) ||
+            !copy(block_pos + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
     }
     return true;
 }

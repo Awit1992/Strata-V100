@@ -670,6 +670,35 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
     return (int32_t) next_free_++;
 }
 
+bool ExpertCache::promote_remap(int64_t layer, int32_t old_expert, int32_t cold_expert, int32_t hot_expert,
+                                int32_t old_slot, int32_t cold_slot, std::string& err) {
+    const auto bad = [&](const char* what) {
+        err = std::string("ExpertCache::promote_remap: ") + what;
+        return false;
+    };
+    if (layer < 0 || layer >= n_layers_ || old_expert < 0 || old_expert >= n_expert_ || cold_expert < 0 ||
+        cold_expert >= n_expert_ || hot_expert < 0 || hot_expert >= n_expert_)
+        return bad("an index is out of range");
+    if (old_slot < 0 || old_slot >= live_slots_ || cold_slot < 0 || cold_slot >= live_slots_ || old_slot == cold_slot)
+        return bad("the slots are out of range or the same");
+    const size_t base = (size_t) layer * (size_t) n_expert_;
+    if (residency_[base + (size_t) old_expert] != old_slot)
+        return bad("the old expert is not in its lent slot");
+    if (residency_[base + (size_t) cold_expert] != cold_slot)
+        return bad("the cold expert is not in the head slot");
+    if (residency_[base + (size_t) hot_expert] != kNotResident)
+        return bad("the hot expert is already resident");
+    for (int32_t e = 0; e < (int32_t) n_expert_; ++e) {
+        const int32_t slot = residency_[base + (size_t) e];
+        if (e != old_expert && slot == old_slot) return bad("another expert owns the lent slot");
+        if (e != cold_expert && slot == cold_slot) return bad("another expert owns the head slot");
+    }
+    residency_[base + (size_t) hot_expert] = cold_slot;
+    residency_[base + (size_t) cold_expert] = old_slot;
+    residency_[base + (size_t) old_expert] = kNotResident;
+    return true;
+}
+
 uint8_t* ExpertCache::device_slot(int32_t slot) {
     if (slot < 0 || slot >= slots_) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
@@ -771,6 +800,30 @@ bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, in
             err = std::string("ExpertCache::fill_slot_queued_parts: ") + cudaGetErrorString(e);
             return false;
         }
+    }
+    ++fills_;
+    return true;
+}
+
+bool ExpertCache::copy_slot_queued(int32_t dst_slot, int32_t src_slot, int64_t bytes, std::string& err) {
+    uint8_t* dst = device_slot(dst_slot);
+    const uint8_t* src = device_slot(src_slot);
+    if (dst == nullptr || src == nullptr || dst_slot >= live_slots_ || src_slot >= live_slots_) {
+        err = "ExpertCache::copy_slot_queued: a slot is outside the arena";
+        return false;
+    }
+    if (bytes <= 0) {
+        err = "ExpertCache::copy_slot_queued: the copy size is not positive";
+        return false;
+    }
+    if ((uint64_t) bytes > slot_room(src_slot) || (uint64_t) bytes > slot_room(dst_slot)) {
+        err = "ExpertCache::copy_slot_queued: the copy does not fit the slots' room";
+        return false;
+    }
+    const cudaError_t e = cudaMemcpyAsync(dst, src, (size_t) bytes, cudaMemcpyDeviceToDevice, (cudaStream_t) 0);
+    if (e != cudaSuccess) {
+        err = std::string("ExpertCache::copy_slot_queued: ") + cudaGetErrorString(e);
+        return false;
     }
     ++fills_;
     return true;

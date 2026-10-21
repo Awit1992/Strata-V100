@@ -1,14 +1,18 @@
 """Tests for tools/agent_turns_bench.py without a GPU, a model or a server: the metric arithmetic and its
-boundaries, the agentic workload's shape, and the per-arm isolation.
+boundaries, the streamed turn's first output and reconstruction, the agentic workload's shape, and the per-arm
+isolation.
 
     python -m unittest tools.test_agent_turns_bench
 """
 from __future__ import annotations
 
+import io
 import json
 import sys
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -115,6 +119,171 @@ class Report(unittest.TestCase):
     def test_a_missing_prompt_count_leaves_the_addition_unknown(self):
         res = {"A": {"s.0": [{"round": 0, "prompt_tokens": None}], "s.1": [{"round": 0, "prompt_tokens": 164}]}}
         self.assertIsNone(B.session_additions("A", self.WORK, res)["s.1"])
+
+
+class _Clock:
+    """A stand-in for `time.perf_counter` that moves only when the scripted stream hands over a line."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def tick(self, ms: float) -> None:
+        self.t += ms / 1000.0
+
+
+class _Stream:
+    """The parts of an HTTP response `post` uses: headers, a context manager, and lines of bytes.
+
+    Each line's delay is applied to the clock just before it is handed over, so the value `post` reads at the
+    first output says which line that output came from.
+    """
+
+    def __init__(self, lines, clock: _Clock, content_type: str = "text/event-stream"):
+        self._lines = lines
+        self._clock = clock
+        self.headers = {"Content-Type": content_type}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        for delay_ms, line in self._lines:
+            self._clock.tick(delay_ms)
+            yield line if isinstance(line, bytes) else line.encode()
+
+
+def _sse(payload: dict, delay_ms: float = 10.0) -> tuple[float, str]:
+    """One SSE data line and how long the clock runs before the client reads it."""
+    return delay_ms, "data: " + json.dumps(payload) + "\n"
+
+
+def _delta(**delta) -> dict:
+    """One streamed choice with a delta and no finish reason."""
+    return {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+
+
+class StreamedTurn(unittest.TestCase):
+    """`post` on a scripted stream with a clock the test moves line by line: what the client sees, and when."""
+
+    MESSAGES = [{"role": "user", "content": "go"}]
+    USAGE = {"prompt_tokens": 32, "completion_tokens": 4}
+    TIMINGS = {"prompt_n": 32, "cache_n": 0, "prompt_ms": 5.0, "predicted_ms": 6.0}
+
+    def setUp(self):
+        self.clock = _Clock()
+
+    def post(self, lines, content_type: str = "text/event-stream"):
+        """Run `post` over `lines` on `self.clock`; the transport is a response fake, not a socket."""
+        stream = _Stream(lines, self.clock, content_type)
+        with mock.patch.object(B.time, "perf_counter", self.clock), \
+                mock.patch.object(B.urllib.request, "urlopen", lambda req, timeout=None: stream):
+            return B.post(9999, self.MESSAGES, 16, 7)
+
+    def test_the_first_output_is_content_reasoning_or_a_calls_name_or_arguments(self):
+        """Role, keep-alive and id/type/index (an empty function included) are controls, not output."""
+        outputs = {
+            "content": {"content": "x"},
+            "reasoning": {"reasoning_content": "x"},
+            "name": {"tool_calls": [{"index": 0, "function": {"name": "read_file"}}]},
+            "arguments": {"tool_calls": [{"index": 0, "function": {"arguments": "{"}}]},
+        }
+        for label, output in outputs.items():
+            with self.subTest(label):
+                self.clock = _Clock()
+                lines = [
+                    _sse(_delta(role="assistant")),                                              # 10 ms
+                    (10.0, ": keep-alive\n"),                                                    # 20 ms
+                    _sse(_delta(tool_calls=[{"index": 0, "id": "call_1", "type": "function"}])),  # 30 ms
+                    _sse(_delta(tool_calls=[{"index": 0, "function": {}}])),                      # 40 ms
+                    _sse(_delta(**output)),                                                      # 50 ms: output
+                    _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                    _sse({"choices": [], "usage": self.USAGE}),
+                    (10.0, "data: [DONE]\n"),
+                ]
+                out, ttft = self.post(lines)
+                self.assertEqual(ttft, 50.0)
+                self.assertEqual(out["choices"][0]["finish_reason"], "stop")
+
+    def test_a_stream_with_only_controls_has_no_ttft(self):
+        """None, not the whole call's time: the client saw no generated output."""
+        lines = [
+            _sse(_delta(role="assistant")),
+            (10.0, ": keep-alive\n"),
+            _sse(_delta(tool_calls=[{"index": 0, "id": "call_1", "type": "function"}])),
+            _sse(_delta(tool_calls=[{"index": 0, "function": {"name": "", "arguments": ""}}])),
+            _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            _sse({"choices": [], "usage": self.USAGE}),
+            (10.0, "data: [DONE]\n"),
+        ]
+        out, ttft = self.post(lines)
+        self.assertIsNone(ttft)
+        message = out["choices"][0]["message"]
+        self.assertIsNone(message["content"])
+        self.assertNotIn("tool_calls", message)
+
+    def test_interleaved_tool_pieces_and_usage_are_rebuilt(self):
+        self.clock = _Clock()
+        lines = [
+            _sse(_delta(reasoning_content="think ")),
+            _sse(_delta(content="Look")),
+            _sse(_delta(tool_calls=[{"index": 0, "id": "call_a", "type": "function",
+                                     "function": {"name": "read_", "arguments": "{\"path\":"}}])),
+            _sse(_delta(tool_calls=[{"index": 1, "id": "call_b", "type": "function",
+                                     "function": {"name": "grep", "arguments": "{\"pattern\":"}}])),
+            _sse(_delta(reasoning_content="ing")),
+            _sse(_delta(content="ing")),
+            _sse(_delta(tool_calls=[{"index": 0, "function": {"arguments": "\"a.txt\"}"}}])),
+            _sse(_delta(tool_calls=[{"index": 1, "function": {"arguments": "\"cache\"}"}}])),
+            _sse({"id": "chatcmpl-1", "created": 123, "model": "m",
+                  "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+            _sse({"choices": [], "usage": self.USAGE, "timings": self.TIMINGS}),
+            (10.0, "data: [DONE]\n"),
+        ]
+        out, ttft = self.post(lines)
+        self.assertEqual(ttft, 10.0)                        # the first reasoning piece
+        message = out["choices"][0]["message"]
+        self.assertEqual(message["content"], "Looking")
+        self.assertEqual(message["reasoning_content"], "think ing")
+        calls = message["tool_calls"]
+        self.assertEqual([c["id"] for c in calls], ["call_a", "call_b"])
+        self.assertEqual([c["function"]["name"] for c in calls], ["read_", "grep"])
+        self.assertEqual([c["function"]["arguments"] for c in calls],
+                         ["{\"path\":\"a.txt\"}", "{\"pattern\":\"cache\"}"])
+        self.assertEqual(out["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(out["usage"], self.USAGE)
+        self.assertEqual(out["timings"], self.TIMINGS)
+        self.assertEqual((out["id"], out["created"], out["model"]), ("chatcmpl-1", 123, "m"))
+
+    def test_a_stream_without_done_is_rejected(self):
+        lines = [
+            _sse(_delta(content="half")),
+            _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ]
+        with self.assertRaisesRegex(RuntimeError, r"\[DONE\]"):
+            self.post(lines)
+
+    def test_an_error_event_is_rejected(self):
+        lines = [
+            _sse(_delta(content="half")),
+            _sse({"error": {"message": "the context is too small"}}),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "the context is too small"):
+            self.post(lines)
+
+    def test_an_http_error_keeps_the_servers_words(self):
+        failure = urllib.error.HTTPError(
+            "http://127.0.0.1:9999/v1/chat/completions", 400, "Bad Request", None,
+            io.BytesIO(b'{"error": {"message": "no such model"}}'))
+        with mock.patch.object(B.time, "perf_counter", self.clock), \
+                mock.patch.object(B.urllib.request, "urlopen", mock.Mock(side_effect=failure)):
+            with self.assertRaisesRegex(RuntimeError, "400: .*no such model"):
+                B.post(9999, self.MESSAGES, 16, 7)
 
 
 class Isolation(unittest.TestCase):

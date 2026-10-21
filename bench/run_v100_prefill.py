@@ -888,20 +888,33 @@ def chain_settings_check(argv: list[str], env: dict, chain: dict, expected_split
 
 # --------------------------------------------------------------------------- compare
 def parse_done(fields: list[str]) -> dict:
-    """The DONE line's named fields (generate.cpp): the engine's own counts, never a request's target.
-
-    The tail fields are appended, so an engine that predates one stops early and the field is absent."""
+    """Parse the positional protocol fields and the engine's named extension tail."""
     out: dict[str, object] = {}
-    for i, name in enumerate(DONE_FIELDS):
-        if i >= len(fields):
-            break
-        value = fields[i]
+    positional = []
+    named = {}
+    for value in fields:
+        key, sep, tail_value = value.partition("=")
+        if sep:
+            named[key] = tail_value
+        elif named:
+            raise ValueError("positional DONE field after named extension")
+        else:
+            positional.append(value)
+    for name, value in zip(DONE_FIELDS, positional):
         if name == "finish":
             out[name] = value
         elif name in ("prompt_ms", "decode_ms", "file_mb"):
             out[name] = float(value)
         else:
             out[name] = int(value)
+    for name, value in named.items():
+        try:
+            out[name] = int(value)
+        except ValueError:
+            try:
+                out[name] = float(value)
+            except ValueError:
+                out[name] = value
     return out
 
 
