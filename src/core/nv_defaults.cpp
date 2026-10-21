@@ -37,8 +37,9 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
         if (off("STRATA_SM70_PERF")) return t;
         t = {
             // Volta (Tesla V100), measured on this fork's dual-V100 16 GB rig (IQ3_S, layer split 16,
-            // --pipeline-windows 2): the switch is bitwise the default engine's output and faster there.
+            // --pipeline-windows 2): exact-kernel switches measured faster there.
             {"STRATA_SM70_TABLE", "1"},        // the Volta master switch: the interleaved dense table, expert mode 8, the hidden HC up
+            {"STRATA_DEQUANT_WIDE", "1"},     // vector stores for native weights; avoids repeated narrow Q6_K dequant work
         };
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;

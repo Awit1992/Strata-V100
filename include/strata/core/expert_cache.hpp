@@ -168,6 +168,15 @@ public:
         old = kNotResident;
     }
 
+    /// STRATA_PREFILL_PROMOTE: the checked three-way remap of the stable-head rotation, published only after the
+    /// queued copies have landed (`sync_queued`).  `cold_expert` (which must sit in `cold_slot`) takes the lent
+    /// `old_slot`, `hot_expert` (which must be non-resident) takes `cold_slot`, and `old_expert` (which must sit in
+    /// `old_slot`) becomes non-resident.  Every precondition is checked - including that no second expert of the
+    /// layer owns either slot - and the table is left unchanged on failure: a stale or duplicated table must
+    /// decline the rotation, never hand two experts one slot.  `replace` alone cannot express this order safely.
+    bool promote_remap(int64_t layer, int32_t old_expert, int32_t cold_expert, int32_t hot_expert,
+                       int32_t old_slot, int32_t cold_slot, std::string& err);
+
     /// **R4.2g: GIVE EACH LAYER ITS OWN SLOTS.  ROUND 328 MEASURED WHY THE GLOBAL FORM CANNOT WORK.**
     ///
     /// `admit`'s original policy hands out slots in ARRIVAL ORDER from one counter shared by every layer
@@ -211,6 +220,10 @@ public:
     /// `fill_slot_queued` for a blob that is not in one piece: each `parts[i].n` bytes at `parts[i].p` go to byte `parts[i].at`
     /// of the slot (the pieces tile the blob).  Same queue, same `sync_queued`.
     bool fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err);
+    /// STRATA_PREFILL_PROMOTE: queues a checked DEVICE-to-DEVICE copy of `bytes` from `src_slot` into `dst_slot` on
+    /// the same legacy stream `fill_slot_queued` uses, so a rotation's D2D is ordered before the H2D that rewrites
+    /// its source slot.  The caller checks the layer geometry; this checks both slots and their room.
+    bool copy_slot_queued(int32_t dst_slot, int32_t src_slot, int64_t bytes, std::string& err);
     bool sync_queued(std::string& err);
 
     /// Reads `slot` back to the host and compares it to `host_blob`, byte for byte.  **THE ONLY THING THAT SAYS

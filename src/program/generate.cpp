@@ -8617,6 +8617,27 @@ int main(int argc, char** argv) {
             /// normal `refill` must only wait, never copy the same slots a second time.  Cleared by `refill_wait`
             /// (the loan is back) and by `lend` (a new loan).  The aggregate initializers below leave it false.
             bool refill_issued = false;
+            /// STRATA_PREFILL_PROMOTE: the prompt's routing counts for THIS part's own layers, `(le - lb) x n_expert`.
+            /// Written only by this part's `on_routes` callback (a split's stages own disjoint layer ranges), read
+            /// by the promotion plan after that part's own read has finished.  Empty: the experiment is off.
+            std::vector<double> prompt_count{};
+            /// The current loan's rotation, aligned with `lent`: the non-resident hot expert to bring into the
+            /// stable head and the cold resident expert to move into the lent slot; -1: an ordinary restore.
+            std::vector<int32_t> promote_hot{}, promote_cold{};
+            /// Per entry: 0 = nothing queued, 1 = the cold->lent D2D is queued, 2 = both copies are queued.  A
+            /// retried issue queues only what is missing: the D2D must never run twice (the H2D overwrites the
+            /// source slot a second D2D would read).
+            std::vector<uint8_t> promote_queued{};
+            bool promote_planned = false;   // the loan's decisions are fixed; a retry reuses them
+            /// STRATA_PREFILL_PROMOTE: the largest slot count any request's loan can need, priced once before READY
+            /// over every positive chunk up to the original `--prefill` (#2090: this is NOT monotonic in the
+            /// chunk), and the cache geometry it was priced against.  A changed geometry is priced again at plan
+            /// time.  `promote_head` is the head chosen for the CURRENT loan, used by the plan and the issue check.
+            int64_t stable_need = -1;
+            int64_t stable_slots = -1;
+            int64_t stable_bytes = -1;
+            const uint64_t* stable_offsets = nullptr;
+            int32_t promote_head = 0;
         };
         // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
         // per layer), otherwise max_blob each.
@@ -11946,16 +11967,86 @@ int main(int argc, char** argv) {
         sp.should_stop = [&] { return stop_req.load(); };
         // 149-prefetch STRATA_RAM_ADAPT2: the prompt's routing seeds the RAM policy with a limited weight
         // (STRATA_RAM_ADAPT_PROMPT_W, default 0.25: an expert every prompt token routes to counts like ~5 decode routings),
-        // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched
-        if (ram_adapt2.on && ram_adapt2.prompt_w > 0.0f) {
+        // fading by 5% a decode window; the decode's own counts and the GPU tier are untouched.
+        // STRATA_PREFILL_PROMOTE=N (opt-in, default 0): the prompt's routing also selects up to N stable-head
+        // rotations per part per loan (see plan_promotions below).  It is limited to the path where the tables it
+        // reads are coherent: the full-RAM arena without the resident complement, peer or helper tiers.  The elastic
+        // K/V is SUPPORTED: its slot moves leave ExpertCache's table stale, so every candidate is accepted only when
+        // the cache's own entry still matches the active host slot (an untouched entry), and a mismatch is skipped,
+        // never repaired.  An explicit opt-in anywhere else says why and stays exactly today's path.
+        const int64_t promote_chunk_hi = o.prefill_chunk;   // the original cap: relend only lowers and restores it
+        static const int64_t promote_cap = [] {
+            const char* v = std::getenv("STRATA_PREFILL_PROMOTE");
+            return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : 0;
+        }();
+        bool promote_on = promote_cap > 0;
+        if (promote_on) {
+            const char* promote_help = std::getenv("STRATA_PREFILL_HELP");
+            const char* why =
+                srcp == nullptr ? "there is no expert source"
+                : srcp != &arena_src ? "it needs the full-RAM expert arena (--mmap-experts is not supported)"
+                : src.complement_ready() ? "the resident RAM complement is running"
+                : peer.valid() ? "--peer-device"
+                : drive.d.remote_count > 0 || remote_opt ? "a helper/remote expert cache"
+                : promote_help != nullptr && std::atoi(promote_help) != 0 ? "STRATA_PREFILL_HELP"
+                : o.prefill_head_alias ? "--prefill-head-alias"
+                : o.batch > 0 ? "the batch slots (--batch): a concurrent prefill pump can read a head slot being rotated"
+                : std::none_of(pf_parts.begin(), pf_parts.end(), [](const PfPart& p) { return p.first >= 0; })
+                      ? "the prompt path does not lend cache slots"
+                      : nullptr;
+            if (why != nullptr) {
+                std::fprintf(stderr, "strata serve: STRATA_PREFILL_PROMOTE=%lld is off: %s\n", (long long) promote_cap,
+                             why);
+                promote_on = false;
+            } else {
+                // Price the worst loan ONCE per part, over every positive chunk a request can use: the ring layout
+                // is not monotonic in the chunk (#2090), so `p.first` is not a lower bound for a later request.
+                // Every loan leaves the lend rule's 128 slots below it; that floor is the only fallback needed.
+                for (PfPart& p : pf_parts) {
+                    p.prompt_count.assign((size_t) (p.le - p.lb) * (size_t) g.n_expert, 0.0);
+                    if (p.first < 0) continue;   // this part never lends, so it never promotes
+                    // bytes_needed prices device-dependent modes: price on this part's own card
+                    const strata::core::OnDevice on(p.dev);
+                    int64_t worst = 0;
+                    for (int64_t c = 1; c <= promote_chunk_hi; ++c) {
+                        const int64_t k = part_slots(p, c);
+                        if (k > worst) worst = k;
+                    }
+                    p.stable_need = worst > 0 ? worst : -1;
+                    p.stable_slots = p.cache->slots();
+                    p.stable_bytes = p.cache->bytes();
+                    p.stable_offsets = p.cache->slot_offsets();
+                }
+                std::fprintf(stderr, "strata serve: STRATA_PREFILL_PROMOTE=%lld: up to %lld stable-head rotations per "
+                                     "part per loan\n", (long long) promote_cap, (long long) promote_cap);
+            }
+        }
+        auto seed_ram_routes = [&](int64_t l, const int32_t* ids, int64_t n) {
+            if (!(ram_adapt2.on && ram_adapt2.prompt_w > 0.0f) || ram_adapt2.seed.empty()) return;
+            if (l < 0 || l >= g.n_layers || n <= 0) return;
+            const float per = ram_adapt2.prompt_w * 20.0f * (float) g.n_expert_used / (float) n;   // = w x 20 / tokens
+            float* sd = ram_adapt2.seed.data() + l * g.n_expert;
+            for (int64_t i = 0; i < n; ++i)
+                if (ids[i] >= 0 && ids[i] < g.n_expert) sd[ids[i]] += per;
+        };
+        if (promote_on) {
+            if (ram_adapt2.on && ram_adapt2.prompt_w > 0.0f)
+                ram_adapt2.seed.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            // One callback per part: a stage's layers are disjoint, so each counter vector has exactly one writer
+            // and the plan (on that part's own thread or after its read) never races another part's counts.
+            for (size_t pi = 0; pi < pf_parts.size(); ++pi) {
+                pf_parts[pi].sp->on_routes = [&, pi](int64_t l, const int32_t* ids, int64_t n) {
+                    PfPart& p = pf_parts[pi];
+                    if (l < p.lb || l >= p.le || n <= 0 || p.prompt_count.empty()) return;
+                    double* pc = p.prompt_count.data() + (size_t) (l - p.lb) * (size_t) g.n_expert;
+                    for (int64_t i = 0; i < n; ++i)
+                        if (ids[i] >= 0 && ids[i] < g.n_expert) pc[ids[i]] += 1.0;
+                    if (p.sp == &sp) seed_ram_routes(l, ids, n);
+                };
+            }
+        } else if (ram_adapt2.on && ram_adapt2.prompt_w > 0.0f) {
             ram_adapt2.seed.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
-            sp.on_routes = [&](int64_t l, const int32_t* ids, int64_t n) {
-                if (l < 0 || l >= g.n_layers || n <= 0) return;
-                const float per = ram_adapt2.prompt_w * 20.0f * (float) g.n_expert_used / (float) n;   // = w x 20 / tokens
-                float* sd = ram_adapt2.seed.data() + l * g.n_expert;
-                for (int64_t i = 0; i < n; ++i)
-                    if (ids[i] >= 0 && ids[i] < g.n_expert) sd[ids[i]] += per;
-            };
+            sp.on_routes = seed_ram_routes;
         }
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
@@ -14565,14 +14656,181 @@ int main(int argc, char** argv) {
             // STRATA_REFILL_PARTS=1 (gfx1151's table): a lent slot of a GGUF read in place is refilled from the pieces in the mapping.
             // The default assembles the blob in a staging buffer first (a 4 MB copy on this thread), then copies that.
             static const bool refill_parts = [] { const char* v = std::getenv("STRATA_REFILL_PARTS"); return v != nullptr && std::atoi(v) != 0; }();
+            // STRATA_PREFILL_PROMOTE: fix, once per loan, which lent slots rotate with the stable head.  A promotion
+            // pairs one hot NON-resident expert (the prompt routes it) with one cold resident expert in the STABLE
+            // HEAD and the old loan expert whose slot L it takes: D2D S->L preserves the cold expert, then the
+            // ordinary refill H2D brings the hot expert into S.  S < min(first, first_now) - below the smallest
+            // region any later loan of this part can borrow - so the hot expert is still there when the next
+            // batched request starts; promoting into L would only be overwritten again.  Strictly count-beats-both,
+            // bounded per part, and never a second plan for one loan: a retry of the copies must not re-derive a
+            // different rotation after S has been overwritten.
+            // The head a rotation may use for the CURRENT loan, computed once and stored in `promote_head` for the
+            // issue check.  A cache geometry change (a vram-elastic shrink/grow) re-prices the worst loan on this
+            // part's card; an unpriced worst, or one that no longer leaves the lend rule's 128 slots, falls back to
+            // min(128, slots, first_now).  `p.first` is never used: #2090 makes it non-monotonic in the chunk.
+            auto loan_head_for = [&](PfPart& p) -> int32_t {
+                const int64_t slots = p.cache->slots();
+                if (p.stable_slots != slots || p.stable_bytes != p.cache->bytes() ||
+                    p.stable_offsets != p.cache->slot_offsets()) {
+                    const strata::core::OnDevice on(p.dev);
+                    int64_t worst = 0;
+                    for (int64_t c = 1; c <= promote_chunk_hi; ++c) {
+                        const int64_t k = part_slots(p, c);
+                        if (k > worst) worst = k;
+                    }
+                    p.stable_need = worst > 0 ? worst : -1;
+                    p.stable_slots = slots;
+                    p.stable_bytes = p.cache->bytes();
+                    p.stable_offsets = p.cache->slot_offsets();
+                }
+                int64_t head;
+                if (p.stable_need <= 0 || p.stable_need + 128 > slots)
+                    head = std::min<int64_t>(128, std::min<int64_t>(slots, p.first_now));
+                else
+                    head = std::min<int64_t>(p.first_now, std::max<int64_t>(128, slots - p.stable_need));
+                if (head < 0) head = 0;
+                p.promote_head = (int32_t) head;
+                return p.promote_head;
+            };
+            auto plan_promotions = [&](PfPart& p) {
+                p.promote_hot.assign(p.lent.size(), -1);
+                p.promote_cold.assign(p.lent.size(), -1);
+                p.promote_queued.assign(p.lent.size(), 0);
+                p.promote_planned = true;
+                p.promote_head = 0;
+                if (!promote_on || promote_cap <= 0 || p.prompt_count.empty() || p.first_now <= 0) return;
+                // The worst loan over every chunk a request can use was priced before READY; `first_now` only
+                // tightens it for this request.  S below it is outside every current and later loan of this part.
+                const int32_t head = loan_head_for(p);
+                if (head <= 0) return;
+                // The adaptive tier's copies in flight may still write a slot; a request drains them before its
+                // prompt (adapt_tick(true)), and anything pending here means this loan is not quiet enough.
+                if (!pending.empty()) {
+                    if (trace)
+                        std::fprintf(stderr, "strata trace: prefill promote: skipped, the adaptive tier has %zu copies "
+                                             "in flight\n", pending.size());
+                    return;
+                }
+                const int64_t E = g.n_expert;
+                int64_t chosen = 0;
+                struct Cand { double c; int32_t e; };
+                struct Victim { double c; size_t k; int32_t e; int32_t slot; };
+                std::vector<Cand> hot, cold;   // reused for every layer: a plan must not allocate per group
+                std::vector<Victim> old;
+                std::vector<char> in_loan((size_t) E, 0);
+                hot.reserve((size_t) E);
+                cold.reserve((size_t) E);
+                old.reserve((size_t) E);
+                for (int64_t l = p.lb; l < p.le && chosen < promote_cap; ++l) {
+                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                    const double* pc = p.prompt_count.data() + (size_t) (l - p.lb) * (size_t) E;
+                    hot.clear();
+                    cold.clear();
+                    old.clear();
+                    std::fill(in_loan.begin(), in_loan.end(), 0);
+                    for (size_t k = 0; k < p.lent.size(); ++k) {
+                        const int32_t i = p.lent[k].first;
+                        if (i / E != l) continue;
+                        const int32_t e = i % E;
+                        in_loan[(size_t) e] = 1;
+                        const int32_t slot = p.lent[k].second;
+                        // the cache's own entry must still name the active lent slot (an untouched expert; a
+                        // mismatched entry is KVG-stale and is never repaired here)
+                        if (p.cache->slot_of(l, e) != slot) continue;
+                        if ((uint64_t) nb > p.cache->slot_room(slot)) continue;
+                        old.push_back({pc[e], k, e, slot});
+                    }
+                    if (old.empty()) continue;
+                    for (int32_t e = 0; e < (int32_t) E; ++e) {
+                        if (in_loan[(size_t) e]) continue;
+                        if (pc[e] <= 0.0) continue;
+                        const size_t i = (size_t) (l * E) + (size_t) e;
+                        if (host_res[i] != strata::core::kNotResident) continue;
+                        if (p.cache->slot_of(l, e) != strata::core::kNotResident) continue;
+                        if (srcp->blob_stable(l, e) == nullptr) continue;
+                        hot.push_back({pc[e], e});
+                    }
+                    for (int32_t e = 0; e < (int32_t) E; ++e) {
+                        const int32_t s = host_res[(size_t) (l * E) + (size_t) e];
+                        if (s < 0 || s >= head) continue;                          // the stable head only
+                        if (p.cache->slot_of(l, e) != s) continue;                  // both tables agree
+                        if ((uint64_t) nb > p.cache->slot_room(s)) continue;        // the layer's blob fits
+                        cold.push_back({pc[e], e});
+                    }
+                    if (hot.empty() || cold.empty()) continue;
+                    std::sort(hot.begin(), hot.end(), [](const Cand& a, const Cand& b) { return a.c > b.c; });
+                    std::sort(cold.begin(), cold.end(), [](const Cand& a, const Cand& b) { return a.c < b.c; });
+                    std::sort(old.begin(), old.end(), [](const Victim& a, const Victim& b) { return a.c < b.c; });
+                    size_t ci = 0, oi = 0;
+                    for (const Cand& h : hot) {
+                        if (chosen >= promote_cap) break;
+                        // ascending victims: once the coolest one is not beaten, no later hot expert beats it
+                        while (ci < cold.size() && cold[ci].c >= h.c) ++ci;
+                        while (oi < old.size() && old[oi].c >= h.c) ++oi;
+                        if (ci >= cold.size() || oi >= old.size()) break;
+                        const int32_t cslot = p.cache->slot_of(l, cold[ci].e);
+                        const int32_t oslot = old[oi].slot;
+                        // both remapped slots must have exactly one owner in the cache table; a KVG-stale or
+                        // duplicated entry here would make promote_remap refuse only after the copies, so skip it
+                        bool unique = cslot >= 0 && oslot >= 0 && cslot != oslot;
+                        for (int32_t e2 = 0; e2 < (int32_t) E && unique; ++e2) {
+                            const int32_t s2 = p.cache->slot_of(l, e2);
+                            if (e2 != cold[ci].e && s2 == cslot) unique = false;
+                            if (e2 != old[oi].e && s2 == oslot) unique = false;
+                        }
+                        if (!unique) { ++ci; continue; }   // an ambiguous table must not be rotated
+                        const size_t k = old[oi].k;
+                        p.promote_hot[k] = h.e;
+                        p.promote_cold[k] = cold[ci].e;
+                        ++chosen; ++ci; ++oi;
+                    }
+                }
+                if (trace)
+                    std::fprintf(stderr, "strata trace: prefill promote: %lld of %lld lent slots on CUDA%d rotate a "
+                                         "head slot\n", (long long) chosen, (long long) p.lent.size(),
+                                 p.dev < 0 ? 0 : p.dev);
+            };
             auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
                 // STRATA_PREFILL_REFILL_OVERLAP: the hook may already have queued this loan's copies while the
                 // next stage still computed, so a second issue is a no-op - `refill` then only waits for them.
                 if (p.refill_issued) return true;
                 if (p.lent.empty()) return true;
-                tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
-                for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                // Nothing reads this part's cache between these copies and refill_wait's fence: the prompt path for
+                // the part has finished (or this hook fires only when the loan is about to be returned), the
+                // adaptive tier is drained at the request's start (the plan also declines if `pending` is not
+                // empty), and --batch is declined at startup because its prefill pump can read a head slot.
+                if (promote_on && !p.promote_planned) plan_promotions(p);
+                tr("refill start", (long long) p.lent.size());
+                for (size_t k = 0; k < p.lent.size(); ++k) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                    const int32_t i = p.lent[k].first;
+                    const int32_t slot = p.lent[k].second;
+                    const int32_t hot = p.promote_hot.empty() ? -1 : p.promote_hot[k];
+                    if (hot >= 0) {   // stable-head rotation: cold S->L first, then the hot expert into S
+                        const int32_t cold = p.promote_cold[k];
+                        const int64_t l = i / g.n_expert;
+                        const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                        const int32_t s = host_res[(size_t) (l * g.n_expert + cold)];
+                        if (p.promote_head <= 0 || s < 0 || s >= p.promote_head) {
+                            e = "prefill promotion: the cold head slot moved before its copy was issued";
+                            return false;
+                        }
+                        // The D2D is one-shot: the H2D overwrites S, so replaying the D2D on a retry would copy the
+                        // hot (or a partial) expert over the cold one.  H2D may be replayed - it is idempotent.
+                        if (p.promote_queued[k] < 1) {
+                            if (!p.cache->copy_slot_queued(slot, s, nb, e)) return false;
+                            p.promote_queued[k] = 1;
+                        }
+                        if (p.promote_queued[k] < 2) {
+                            const uint8_t* b = srcp->blob_stable(l, hot);
+                            if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(s, b, e, nb)
+                                                                    : p.cache->fill_slot_queued(s, b, e, nb)))
+                                return false;
+                            if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
+                            p.promote_queued[k] = 2;
+                        }
+                        continue;   // the mapping waits for the fence in refill_wait
+                    }
                     strata::core::BlobPart parts[3];
                     const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
                     if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
@@ -14599,8 +14857,27 @@ int main(int argc, char** argv) {
                 for (const auto& [i, slot] : p.lent)
                     srcp->release(i / g.n_expert, i % g.n_expert);
 #endif
+                // The rotation's metadata is published ONLY here, after the fence: until now host_res still has the
+                // cold expert in S and the old loan expert not resident.  A copy failure above already returned
+                // false through refill's fatal path, so no read can fall back to a mapping whose bytes are gone.
+                for (size_t k = 0; k < p.lent.size(); ++k) {
+                    if (p.promote_hot.empty() || p.promote_hot[k] < 0) continue;
+                    const int32_t i = p.lent[k].first, slot = p.lent[k].second;
+                    const int32_t cold = p.promote_cold[k], hot = p.promote_hot[k];
+                    const int64_t l = i / g.n_expert;
+                    const int32_t s = host_res[(size_t) (l * g.n_expert + cold)];
+                    if (!p.cache->promote_remap(l, i % g.n_expert, cold, hot, slot, s, e)) return false;
+                    host_res[(size_t) (l * g.n_expert + cold)] = slot;
+                    host_res[(size_t) (l * g.n_expert + hot)] = s;
+                    host_res[(size_t) i] = strata::core::kNotResident;   // already during the loan; the invariant
+                }
                 p.lent.clear();
                 p.lent_chunk = 0;
+                p.promote_hot.clear();
+                p.promote_cold.clear();
+                p.promote_queued.clear();
+                p.promote_planned = false;
+                p.promote_head = 0;
                 p.refill_issued = false;   // the loan is back: the next lend and issue start clean
                 return true;
             };
@@ -14701,6 +14978,14 @@ int main(int argc, char** argv) {
                         if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
+                    // a new (or re-laid-out) loan: no rotation is planned or queued for it yet, and the counts this
+                    // plan will use are the routing of THIS loan's read only (no service-lifetime LFU carryover)
+                    p.promote_hot.clear();
+                    p.promote_cold.clear();
+                    p.promote_queued.clear();
+                    p.promote_planned = false;
+                    p.promote_head = 0;
+                    std::fill(p.prompt_count.begin(), p.prompt_count.end(), 0.0);
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t i = (size_t) (l * g.n_expert + ex);

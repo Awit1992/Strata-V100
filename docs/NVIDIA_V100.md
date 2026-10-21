@@ -95,6 +95,11 @@ them on a V100 with the 0.1.41 code. The individual settings
 Without the master setting, Volta retains the previous decode selection
 (what 0.1.40.3 ran).
 
+The Volta defaults also select `STRATA_DEQUANT_WIDE=1`. This setting uses
+the existing vector-store dequantization kernels. The CUDA parity test
+checks that their output is bitwise equal to the narrow kernels.
+Set `STRATA_DEQUANT_WIDE=0` to select the narrow control.
+
 Set `STRATA_EMB_REUSE_ACCOUNT=1` to let the prompt planner use the embedding
 buffer space reused by half outputs. Default accounting remains conservative.
 On the measured 8K chunk, this option reduces each stage's prompt loan by
@@ -233,9 +238,10 @@ pattern is not gone. Use it with the stall watchdog (`STRATA_WATCHDOG_S=300`) as
 `src/core/nv_defaults.cpp` has a table per architecture for the switches that are **bitwise
 the default engine's output** and faster on that card. The sm_70 table holds the Volta
 master switch (`STRATA_SM70_TABLE=1`: the interleaved dense table, the expert mode 8 layout
-and the latency-hidden hyper-connection up projection), which the fork's own service set by
-hand. `STRATA_SM70_PERF=0` turns the table off, and a switch the user set is never
-overridden. The measured service profile is in
+and the latency-hidden hyper-connection up projection) and
+`STRATA_DEQUANT_WIDE=1` for native weight conversion.
+`STRATA_SM70_PERF=0` turns the table off. A setting supplied by the user
+always takes precedence. The measured service profile is in
 [service/strata-v100.service.d](../service/strata-v100.service.d/README.md).
 
 ## Dual-PCIe pipeline service profile
@@ -479,6 +485,30 @@ See the [2026-10-21 TTFT report](../benchmarks/v100-incremental-ttft-2026-10-21.
 It measures client-observed streaming output, not full response time.
 The copy still occurs during the request. Do not interpret a lower
 prompt time as an equal increase in decode throughput.
+
+### Expert cache admission after prefill
+
+`STRATA_PREFILL_PROMOTE=N` permits up to `N` expert replacements per stage
+when prefill returns a cache loan. The default is `0` (off). This setting
+keeps frequently used experts in GPU slots that later loans do not use.
+It replaces less-used experts in the same layer. Route counts reset for
+each new loan.
+
+Each replacement first copies the cold expert to a loan slot on the GPU.
+It then copies the hot expert from host memory into the stable slot.
+The host-copy budget and GPU cache capacity do not increase. Cache maps
+change only after these copies finish. Failed preconditions leave the
+maps unchanged.
+
+This path requires a full host arena and no batch slots. It is off with
+a RAM complement, a peer or helper tier, a remote tier, or a prefill head
+alias. The engine logs the reason when it rejects an explicit setting.
+Growable KV is supported. Entries with inconsistent active slot maps
+are skipped.
+
+This option changes expert placement. Existing resident-aware routing
+and CPU/GPU rounding can change the model output. It does not change
+expert weights, model quantization, KV format, or KV capacity.
 
 ## More opt-in switches (CUDA 12 experimental build)
 

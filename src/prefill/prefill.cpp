@@ -4076,7 +4076,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         size_t cpu_cap = 0;
                         if (rows_cpu > 0) {
                             cpu_cap = (size_t) std::min<int64_t>(T, rows_cpu);
-                            const size_t rows_want = (size_t) rows_cpu * 2 * N;   // headroom: few reallocations
+                            // the pool's actual output rows: the pre-size above already covers them, so this only
+                            // grows (with 2x headroom) when that allocation could not be had
+                            const size_t rows_need = (size_t) rows_cpu * N;
                             const size_t act_want = cpu_cap * N;
                             auto buf_off = [&](const char* what) {
                                 cpu_share_off(what);
@@ -4088,18 +4090,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             };
                             // the last layer's gather and download are done (its thread was joined): its buffers
                             // may be given back before this layer's are taken
-                            if ((m.cpu_rows_n < rows_want || m.cpu_x_n < act_want || m.cpu_gdev_n < act_want ||
+                            if ((m.cpu_rows_n < rows_need || m.cpu_x_n < act_want || m.cpu_gdev_n < act_want ||
                                  m.cpu_gidx_n < cpu_cap) && m.cpu_xs)
                                 cudaStreamSynchronize(m.cpu_xs);
-                            if (m.cpu_rows_n < rows_want) {
+                            if (m.cpu_rows_n < rows_need) {
                                 if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
                                 m.cpu_rows = nullptr;
                                 m.cpu_rows_n = 0;
-                                if (cudaHostAlloc((void**) &m.cpu_rows, rows_want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                                const size_t rows_cap = rows_need * 2;   // headroom: few reallocations
+                                if (cudaHostAlloc((void**) &m.cpu_rows, rows_cap * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
                                     (void) cudaGetLastError();
                                     buf_off("the rows buffer");
                                 } else {
-                                    m.cpu_rows_n = rows_want;
+                                    m.cpu_rows_n = rows_cap;
                                 }
                             }
                             if (rows_cpu > 0 && m.cpu_x_n < act_want) {
