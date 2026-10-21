@@ -210,6 +210,24 @@ latency on a six-core host is larger than the copy it waits for), `--pcie-frac 0
 `--pool-workers 10`, `--adapt-swaps 24`, `--adapt-every 8` and `--adapt-every 0` were all
 inside the noise of two baseline arms.
 
+### The DMA path with the device-raised flag
+
+`--pcie-mode dma` copies the PCIe share of the missed experts on a second stream, beside the layer's
+compute, so the wait the copy kernel causes inside the layer's chain disappears. Its landing signal is a
+one-thread kernel on the copy stream: the kernel runs after the copy (the stream orders them) and writes the
+mapped flag with a system fence, so the graph that spins on the flag sees the value without the host calling
+into the driver inside a window. The engine already uses the same pattern for the split hand-off and for the
+doorbell.
+
+On the rig above: **15.39 / 15.79 ms per token with the copy kernel, 14.58 / 14.53 with the DMA path**
+(-6.6 %), and 66.5 / 65.8 against 72.9 / 70.2 pooled tok/s (+8.1 %). The path with the old host callback
+measured 19.07 ms per token.
+
+**The default stays the copy kernel.** The DMA path queues a copy to a card whose window spins on a host
+flag, and that is the pattern of upstream issue #31 (a copy that blocks in the driver until the window ends).
+The device-raised flag removes the host callback from the window; the host's `cudaMemcpyAsync` remains, so the
+pattern is not gone. Use it with the stall watchdog (`STRATA_WATCHDOG_S=300`) as the backstop.
+
 ### The Volta defaults table
 
 `src/core/nv_defaults.cpp` has a table per architecture for the switches that are **bitwise
