@@ -489,7 +489,8 @@ prompt time as an equal increase in decode throughput.
 ### Expert cache admission after prefill
 
 `STRATA_PREFILL_PROMOTE=N` permits up to `N` expert replacements per stage
-when prefill returns a cache loan. The default is `0` (off). This setting
+when prefill returns a cache loan. The engine default is `0` (off).
+The measured service profile selects `2048`. This setting
 keeps frequently used experts in GPU slots that later loans do not use.
 It replaces less-used experts in the same layer. Route counts reset for
 each new loan.
@@ -501,14 +502,18 @@ change only after these copies finish. Failed preconditions leave the
 maps unchanged.
 
 This path requires a full host arena and no batch slots. It is off with
-a RAM complement, a peer or helper tier, a remote tier, or a prefill head
-alias. The engine logs the reason when it rejects an explicit setting.
+a RAM complement, a peer or helper tier, `STRATA_PREFILL_HELP`, a remote
+tier, or a prefill head alias. The engine logs the reason when it rejects
+an explicit setting.
 Growable KV is supported. Entries with inconsistent active slot maps
 are skipped.
 
 This option changes expert placement. Existing resident-aware routing
 and CPU/GPU rounding can change the model output. It does not change
 expert weights, model quantization, KV format, or KV capacity.
+
+See the [cache admission and dequantization report](../benchmarks/v100-prefill-cache-admission-2026-10-21.md)
+for the measured read counts, four-arm TTFT results, and full-request costs.
 
 ## More opt-in switches (CUDA 12 experimental build)
 

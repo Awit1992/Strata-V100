@@ -12,6 +12,11 @@ This is primarily a scheduling improvement. The checkpoint copy still occurs
 during the request. Do not interpret the TTFT reduction as an equal reduction
 in full response time or complete tool-call latency.
 
+The [cache admission study](v100-prefill-cache-admission-2026-10-21.md)
+adds a four-arm comparison of checkpoint scheduling, native dequantization,
+and expert-cache placement. The measurements below remain the original
+checkpoint results. Do not combine timings from the two studies.
+
 ## Test system and fixed settings
 
 - Two Tesla V100-PCIE-16GB GPUs, 16 GiB each.
