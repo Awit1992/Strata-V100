@@ -1,0 +1,165 @@
+{
+ "label": "p6_4k",
+ "env": {
+  "STRATA_EXPERT_PAIR": "1",
+  "STRATA_SPLIT_RING": "192",
+  "STRATA_ARENA_LOCK": "0",
+  "STRATA_WATCHDOG_S": "300",
+  "STRATA_DECODE_TIMING": "1"
+ },
+ "argv": [
+  "$REPO/engine/strata",
+  "--serve",
+  "--pack",
+  "$MODEL_ROOT/packs/iq3_s",
+  "--native",
+  "$MODEL_ROOT/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+  "--ple-gguf",
+  "$MODEL_ROOT/models/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+  "--expert-profile",
+  "$MODEL_ROOT/data/expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "4096",
+  "--spec",
+  "8",
+  "--mtp",
+  "$MODEL_ROOT/mtp/rt",
+  "--max-context",
+  "524288",
+  "--rope-scaling",
+  "yarn",
+  "--rope-scale",
+  "2",
+  "--kv",
+  "int8",
+  "--spec-min-p",
+  "0.70",
+  "--vision",
+  "--vram-reserve-mib",
+  "750",
+  "--conversation-cache-mib",
+  "25600",
+  "--conversation-cache-slots",
+  "32",
+  "--pipeline-windows",
+  "2",
+  "--layer-split",
+  "16",
+  "--prompt-cache",
+  "0",
+  "--prompt-cache-every",
+  "0",
+  "--prompt-cache-root",
+  "0",
+  "--conversation-cache-mib",
+  "0"
+ ],
+ "results": [
+  {
+   "kind": "prefill",
+   "target": 32768,
+   "rep": 0,
+   "prompt_tokens": 32768,
+   "prompt_ms": 24626.5,
+   "prefill_tok_s": 1330.5991513207318,
+   "wall_s": 24.859,
+   "pp": [
+    [
+     "4096",
+     "32768",
+     "5007",
+     "818.1"
+    ],
+    [
+     "8192",
+     "32768",
+     "7729",
+     "1059.8"
+    ],
+    [
+     "12288",
+     "32768",
+     "10469",
+     "1173.8"
+    ],
+    [
+     "16384",
+     "32768",
+     "13231",
+     "1238.3"
+    ],
+    [
+     "20480",
+     "32768",
+     "16007",
+     "1279.5"
+    ],
+    [
+     "24576",
+     "32768",
+     "18808",
+     "1306.7"
+    ],
+    [
+     "28672",
+     "32768",
+     "21622",
+     "1326.1"
+    ],
+    [
+     "32767",
+     "32768",
+     "24448",
+     "1340.3"
+    ]
+   ]
+  },
+  {
+   "kind": "decode",
+   "target": 512,
+   "rep": 0,
+   "prompt_tokens": 512,
+   "prompt_ms": 2194.8,
+   "generated": 256,
+   "decode_ms": 3076.4,
+   "decode_tok_s": 83.21414640488884,
+   "draft_acc": 221,
+   "offloaded": 6651,
+   "wall_s": 5.28,
+   "tok_sha": "e8fe242a02134a16",
+   "n_tok": 256
+  },
+  {
+   "kind": "decode",
+   "target": 512,
+   "rep": 1,
+   "prompt_tokens": 512,
+   "prompt_ms": 2098.1,
+   "generated": 256,
+   "decode_ms": 3921.4,
+   "decode_tok_s": 65.2828071607079,
+   "draft_acc": 155,
+   "offloaded": 5989,
+   "wall_s": 6.028,
+   "tok_sha": "9f531fb30b94c38a",
+   "n_tok": 256
+  },
+  {
+   "kind": "decode",
+   "target": 512,
+   "rep": 2,
+   "prompt_tokens": 512,
+   "prompt_ms": 2121.9,
+   "generated": 256,
+   "decode_ms": 3663.7,
+   "decode_tok_s": 69.87471681633322,
+   "draft_acc": 155,
+   "offloaded": 4742,
+   "wall_s": 5.794,
+   "tok_sha": "ea193ced396af433",
+   "n_tok": 256
+  }
+ ]
+}

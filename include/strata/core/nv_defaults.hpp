@@ -1,4 +1,4 @@
-// strata/core/nv_defaults.hpp - the per-architecture defaults of switches that are exact (bitwise) on NVIDIA sm_86 and sm_60.
+// strata/core/nv_defaults.hpp - the per-architecture defaults of switches that are exact (bitwise) on NVIDIA sm_86, sm_70 and sm_60.
 //
 // 148-nv measured every switch of the 0.1.45 bit-exact ON set, one at a time and in the stacked set, on an RTX 3060, an RTX A4000
 // (sm_86) and a Tesla P100 (sm_60): a switch is in a table only when its token ids equal the default's and it was faster on that
@@ -7,6 +7,7 @@
 // on a card (STRATA_EXCHANGE_ROTATE, STRATA_PCIE_BALANCE, STRATA_QSA_WARP, ...) are not in any table.
 //
 //   STRATA_SM86_PERF=0   turns the sm_86 table off (cards of compute capability 8.6: RTX 3050-3090, RTX A2000-A6000)
+//   STRATA_SM70_PERF=0   turns the sm_70 table off (Volta: Tesla V100, Titan V)
 //   STRATA_SM60_PERF=0   turns the sm_60 table off (Pascal GP100: Tesla P100)
 //
 // A switch the user set (to anything, including 0) is never overridden.  Applied once at start, before any engine code reads its

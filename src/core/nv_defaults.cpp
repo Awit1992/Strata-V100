@@ -33,6 +33,13 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_QSA_ROWS", "1"},            // -0.5, -1.2
             {"STRATA_B6_MMVQ_ROWS", "1"},        // A4000 0, 3060 -1.7
         };
+    } else if (mj == 7 && mn == 0) {
+        if (off("STRATA_SM70_PERF")) return t;
+        t = {
+            // Volta (Tesla V100), measured on this fork's dual-V100 16 GB rig (IQ3_S, layer split 16,
+            // --pipeline-windows 2): the switch is bitwise the default engine's output and faster there.
+            {"STRATA_SM70_TABLE", "1"},        // the Volta master switch: the interleaved dense table, expert mode 8, the hidden HC up
+        };
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;
         t = {
@@ -61,9 +68,11 @@ std::vector<std::string> apply_nv_defaults(int major, int minor) {
         set.push_back(kv.first);
     }
     if (!set.empty()) {
-        const bool sm86 = strata::cc_major_of(major) == 8;
+        const int mj = strata::cc_major_of(major);
+        const char* card = mj == 8 ? "sm_86 (Ampere)" : mj == 7 ? "sm_70 (Volta)" : "sm_60 (Pascal)";
+        const char* off_switch = mj == 8 ? "STRATA_SM86_PERF" : mj == 7 ? "STRATA_SM70_PERF" : "STRATA_SM60_PERF";
         std::fprintf(stderr, "strata: %s: %zu exact speed switches on by default (%s=0 turns them off; a switch you set is kept): ",
-                     sm86 ? "sm_86 (Ampere)" : "sm_60 (Pascal)", set.size(), sm86 ? "STRATA_SM86_PERF" : "STRATA_SM60_PERF");
+                     card, set.size(), off_switch);
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");
     }

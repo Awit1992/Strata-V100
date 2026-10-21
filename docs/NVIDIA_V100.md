@@ -163,6 +163,81 @@ ports and the changes that do not apply to Volta.
 These controls do not establish a speed gain for every V100 configuration.
 See the [verification report](../benchmarks/v100-upstream-v0.1.43-2026-10-11.md).
 
+## The measured Volta profile (2026-10-20)
+
+This section is the fork's own measurement on a dual V100 PCIe 16 GB rig (GPU 0 on a PCIe 3.0
+**x4** link, GPU 1 on **x16**, a Ryzen 5 3600 with six cores, 94 GiB of RAM), the IQ3_S pack,
+the 524,288-token context, the int8 KV cache, the MTP draft, the layer split `16` and
+`--pipeline-windows 2`. The raw arms and the method are in
+[the report](../bench/results/2026-10-20-v100-sm70-speed-stack/README.md).
+
+### The prompt path is at a local optimum: keep the 8,192-token chunk
+
+`STRATA_PREFILL_TIMING=1` shows where a prompt chunk goes. On that rig one 8,192-token chunk
+costs about 2.1 s of PCIe pass over the experts and about 1.96 s of compute, and the chunk
+takes 3.9 s: the rig's b/a is about 8,800 tokens.
+
+- A **bigger** chunk borrows more of the expert cache for its buffers, so the cache holds fewer
+  experts and the PCIe pass grows: `auto:16384` fell back to 10,240 tokens and read the
+  32,768-token prompt 7.5 % slower (1,607 against 1,736 tok/s).
+- A **smaller** chunk pays the fixed pass again for every chunk: 4,096 tokens read it 23 %
+  slower, 2,048 tokens 54 % slower.
+- A **deeper streamed ring** prefetches further over PCIe but is VRAM the expert cache does not
+  keep: 384 slots and 512 slots both read the same prompt no faster than 192.
+
+**Do not raise `STRATA_PREFILL_AUTO_MAX` on this rig.** The general 8,192 ceiling is the measured
+one here, and the fork's service keeps it.
+
+### The decode window waits on three things, and the profile names them
+
+`STRATA_VERIFY_PROFILE=1` prints the GPU's own stamps per window. On the rig above one
+verify window (2.4 to 2.5 tokens) takes about 40 ms, and the second stage's time is:
+
+| Stamp | What it waits for | Stage 1 (ms per window) |
+| --- | --- | ---: |
+| the dense projections, the head, the VRAM experts | the real work | about 20 |
+| `waitB` | the PCIe share of the missed experts, copied into the staging buffer inside the layer's chain | 6.5 - 8.0 |
+| `waitCPU` | the CPU pool's rows for the layer | 4.2 - 5.2 |
+| `waitA` | the host's plan for the layer (the doorbell handshake) | 1.4 - 1.6 |
+
+A decode rate of about 70 tok/s against a bandwidth floor of roughly 10 ms per window is not a
+bandwidth problem: it is these three waits, and the PCIe traffic behind `waitB` (about 82 MiB
+per window for the missed experts, plus about 45 MiB for the adaptive tier's swaps).
+
+The candidates measured on this rig did not move it: upstream's six- and thirteen-switch Volta
+stacks, `--pcie-mode dma` (worse: the DMA's landing signal is a host callback, and the callback's
+latency on a six-core host is larger than the copy it waits for), `--pcie-frac 0`,
+`--pool-workers 10`, `--adapt-swaps 24`, `--adapt-every 8` and `--adapt-every 0` were all
+inside the noise of two baseline arms.
+
+### The DMA path with the device-raised flag
+
+`--pcie-mode dma` copies the PCIe share of the missed experts on a second stream, beside the layer's
+compute, so the wait the copy kernel causes inside the layer's chain disappears. Its landing signal is a
+one-thread kernel on the copy stream: the kernel runs after the copy (the stream orders them) and writes the
+mapped flag with a system fence, so the graph that spins on the flag sees the value without the host calling
+into the driver inside a window. The engine already uses the same pattern for the split hand-off and for the
+doorbell.
+
+On the rig above: **15.39 / 15.79 ms per token with the copy kernel, 14.58 / 14.53 with the DMA path**
+(-6.6 %), and 66.5 / 65.8 against 72.9 / 70.2 pooled tok/s (+8.1 %). The path with the old host callback
+measured 19.07 ms per token.
+
+**The default stays the copy kernel.** The DMA path queues a copy to a card whose window spins on a host
+flag, and that is the pattern of upstream issue #31 (a copy that blocks in the driver until the window ends).
+The device-raised flag removes the host callback from the window; the host's `cudaMemcpyAsync` remains, so the
+pattern is not gone. Use it with the stall watchdog (`STRATA_WATCHDOG_S=300`) as the backstop.
+
+### The Volta defaults table
+
+`src/core/nv_defaults.cpp` has a table per architecture for the switches that are **bitwise
+the default engine's output** and faster on that card. The sm_70 table holds the Volta
+master switch (`STRATA_SM70_TABLE=1`: the interleaved dense table, the expert mode 8 layout
+and the latency-hidden hyper-connection up projection), which the fork's own service set by
+hand. `STRATA_SM70_PERF=0` turns the table off, and a switch the user set is never
+overridden. The measured service profile is in
+[service/strata-v100.service.d](../service/strata-v100.service.d/README.md).
+
 ## Dual-PCIe pipeline service profile
 
 The [recent upstream PR review](../benchmarks/v100-upstream-pr-inventory-2026-10-15.md)

@@ -110,6 +110,11 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
+/// Raise a mapped host flag from the device: *flag = value after a system fence, so a graph that spins on it
+/// (wait_flag_ge) sees the value without a host callback.  The DMA path uses it: the copy stream's kernel runs
+/// after its copy, so the flag says "the copy has landed" without the host calling into the driver inside a
+/// verify window (a host callback's latency on a busy host is larger than the copy it waits for).
+void raise_flag_dev(uint32_t* flag, uint32_t value, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
                                  void* stream);
