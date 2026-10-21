@@ -3127,10 +3127,12 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
             std::abort();
         }
     }
-    FlagSet& fs = v->flag_sets_[v->cur_layer_ % (sizeof v->flag_sets_ / sizeof v->flag_sets_[0])];
-    fs.flag = v->h_flagB_;
-    fs.value = want;
-    cudaLaunchHostFunc(v->copy_, [](void* p) { FlagSet* s = (FlagSet*) p; raise_flag(s->flag, s->value); }, &fs);
+    // The flag B is raised by the DEVICE, on the copy stream: the kernel runs after the copy above (the stream
+    // orders them), so the graph that spins on the flag sees "the copy has landed" without a host callback.
+    // A host callback (cudaLaunchHostFunc) puts the driver's callback thread between the copy and the waiting
+    // graph, and its latency on a busy host (the expert pool owns the cores) is larger than the copy it waits
+    // for: the DMA path measured 19.07 ms per token against the copy kernel's 15.6 with it.
+    strata::kernels::raise_flag_dev(v->m_flagB_, want, v->copy_);
 }
 
 void Verifier::publish_plan(void* ctx) {

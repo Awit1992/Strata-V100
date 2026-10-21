@@ -163,17 +163,73 @@ The table is inside the noise of this rig's own run-to-run spread. The change is
 speed** here: it moves a switch that the service set by hand into the engine's own defaults, so that a
 Volta card gets the measured kernels without a hand-set environment variable.
 
-## What this fork changes
+## The before/after table
 
-1. **`src/core/nv_defaults.cpp`: a Volta defaults table.** The sm_86 and sm_60 tables hold the switches that
+The same rig, the same model, the same configuration, one change: the engine's **DMA path with the device-raised
+flag** (`--pcie-mode dma`) instead of the copy kernel in the layer's chain.
+
+| Measurement | Before (the released engine, the copy kernel) | After (the device flag, the DMA path) | Change |
+| --- | ---: | ---: | ---: |
+| **Prefill**, 32,768-token prompt | 1,730.8 tok/s | 1,729.9 tok/s | -0.05 % (the prefill path is not touched) |
+| **Decode**, ms per token | 15.39 / 15.79 | 14.58 / 14.53 | **-6.6 %** |
+| **Decode**, pooled tok/s | 66.5 / 65.8 | 72.9 / 70.2 | **+8.1 %** |
+
+Two arms per cell, four requests of 256 tokens each per arm, alternating between the arms. The prefill numbers
+are a single 32,768-token prompt per arm; the prefill rate repeats to 0.006 % on this rig, so the two cells
+are the same measurement.
+
+### Why the DMA path was slower before, and what the device flag changes
+
+The decode's second stage waits 6.5 to 8.0 ms per window for the PCIe share of the missed experts: the copy
+of the missed experts into the staging buffer sits **inside the layer's chain**, between the VRAM experts and
+the PCIe experts. The engine's `--pcie-mode dma` copies the same blobs on a second stream, beside the layer's
+compute, so the wait is gone.
+
+That path was slower than the copy kernel, because the copy's landing signal was a **host callback**
+(`cudaLaunchHostFunc`): the driver's callback thread sits between the copy and the waiting graph, and its
+latency on a six-core host that also runs the expert pool is larger than the copy itself. Measured: **19.07 ms
+per token** with the host callback, against the copy kernel's 15.6.
+
+The device can raise the flag instead. A one-thread kernel on the copy stream runs after the copy (the stream
+orders them) and writes the mapped flag with a system fence, so the graph that spins on the flag sees the
+value without the host calling into the driver inside a window. The engine already uses the same pattern for
+the split hand-off (`handoff_publish`) and for the doorbell. With it, the DMA path measures **14.56 ms per
+token**: 24 % faster than the same path with the host callback, and 6.6 % faster than the copy kernel.
+
+The copies are the same bytes in the same order, so the experts the GPU reads are the same. The engine's
+output text is not bit-reproducible from run to run (the adaptive tier's copies decide which window computes
+a swapped-in expert on the GPU and which on the CPU, and the two round differently), so the check is the
+engine's own test suite, not a text comparison.
+
+**The limit to know about:** the DMA path queues a copy to a card whose window spins on a host flag, and that
+is the pattern of upstream issue #31 (a copy that blocks in the driver until the window ends). The upstream
+therefore keeps the copy kernel as the default. The device-raised flag removes the host callback from the
+window, but the host's `cudaMemcpyAsync` remains, so the deadlock pattern is not gone: keep the copy kernel
+unless the engine's stall watchdog (300 s) is acceptable as the backstop.
+
+### The next step, with the measurement that says where it is
+
+The copy itself is 1.6 MiB per layer, about 123 us at the x16 link's 13 GB/s, and the layer's compute is
+about 450 us. So the copy fits inside the layer's compute and only has to be *moved off* the chain to
+disappear. The safe way is a second stream **inside the captured graph**: the copy kernel on the copy stream
+after the plan's flag, the layer's PCIe group waiting on an event, and the staging buffer's reuse ordered
+with a per-group event (the copy of layer L waits for the PCIe group of layer L-2). That keeps every copy
+inside the graph, so no host call can block in the driver, and it would remove the whole 6.5 to 8.0 ms.
+
+
+
+1. **`src/core/verify.cpp` and `src/kernels/cuda/verify_kernels.cu`: the device-raised flag.** The DMA path's
+   landing signal is a one-thread kernel on the copy stream instead of a host callback. The path measured 19.07
+   ms per token with the host callback and 14.56 with the device flag.
+2. **`src/core/nv_defaults.cpp`: a Volta defaults table.** The sm_86 and sm_60 tables hold the switches that
    are bitwise the default engine's output and faster on that card. The sm_70 table holds the Volta master
    switch `STRATA_SM70_TABLE=1` (the interleaved dense table, the expert mode 8 layout and the latency-hidden
    hyper-connection up projection), which the fork's service had to set by hand. `STRATA_SM70_PERF=0` turns the
    table off, and a switch the user set is never overridden.
-2. **`src/core/nv_defaults_test.cpp`**: the table's test (the architecture dispatch, the opt-out, the user's
+3. **`src/core/nv_defaults_test.cpp`**: the table's test (the architecture dispatch, the opt-out, the user's
    own setting kept, idempotence).
-3. **`docs/NVIDIA_V100.md`**: the profile and the opt-outs.
-4. **`service/strata-v100.service.d/`**: the measured service profile, as installed files.
+4. **`docs/NVIDIA_V100.md`**: the profile and the opt-outs.
+5. **`service/strata-v100.service.d/`**: the measured service profile, as installed files.
 
 The model, the quantisation, the KV format, the context, the L2/L3 conversation tiers and the layer split
 are unchanged.

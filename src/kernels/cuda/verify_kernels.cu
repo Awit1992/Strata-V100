@@ -1431,6 +1431,14 @@ __global__ void wait_flag_ge_or_kernel(const volatile uint32_t* flag, uint32_t v
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
 }
+// The device raises a mapped host flag (the DMA path's flag B): a system fence, the store, and a second fence,
+// so the graph that spins on it sees the value.  The store is volatile because on RDNA a plain store to mapped
+// memory can sit in the L2 until the stream syncs (the same reason the doorbell's store is volatile).
+__global__ void raise_flag_dev_kernel(volatile uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *(volatile uint32_t*) flag = value;
+    __threadfence_system();
+}
 __global__ void copy_i32_unless_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n,
                                        const uint32_t* skip, uint32_t value) {
     if (*skip == value) return;
@@ -1472,6 +1480,10 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
     wait_flag_ge_or_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, skip);
     check("wait_flag_ge_or");
+}
+void raise_flag_dev(uint32_t* flag, uint32_t value, void* stream) {
+    raise_flag_dev_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("raise_flag_dev");
 }
 void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, const uint32_t* skip, uint32_t value,
                                  void* stream) {
