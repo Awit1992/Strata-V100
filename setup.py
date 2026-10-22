@@ -3072,16 +3072,17 @@ def installed_size(family: str, names: list, have: list) -> str | None:
     return None
 
 
-def unsloth_default_env(family: str, model: str, hip: bool, in_budget: bool) -> dict:
+def unsloth_default_env(family: str, model: str, hip: bool, in_budget: bool, cuda12: bool = False) -> dict:
     """0.1.44 (owner, review-quants.md section 5): the run-config "env" setup writes for Unsloth's files.
     STRATA_MMQ_KQ=1 (the K-quant MMQ prompt kernels) for UD-Q5_K_XL and UD-Q6_K_XL, where its prompt-path KL is equal
-    or better than the FP16 path's; UD-Q4_K_XL keeps it opt-in.  STRATA_HC_Q8=1 on CUDA for the UD-* files (the
+    or better than the FP16 path's; UD-Q4_K_XL keeps it opt-in, except on the CUDA 12 engine (V100, sm_70), where its
+    FP16 prompt path returns non-finite logits (#879) from layer 0 on.  STRATA_HC_Q8=1 on CUDA for the UD-* files (the
     GGUF's own Q8_0 hyper-connection projections, closer to the file and faster; the GSQ-RCO packs are untouched).
     STRATA_ROUTE_TAIL_SKIP=0 where every expert is in RAM (the skip costs KL there); the RAM-budget mode keeps it."""
     env = {}
     if family != "unsloth":
         return env
-    if model in ("UD-Q5_K_XL", "UD-Q6_K_XL"):
+    if model in ("UD-Q5_K_XL", "UD-Q6_K_XL") or (cuda12 and not hip and model == "UD-Q4_K_XL"):
         env["STRATA_MMQ_KQ"] = "1"
     if not hip and model.startswith("UD-"):
         env["STRATA_HC_Q8"] = "1"
@@ -8155,7 +8156,7 @@ def main() -> int:
            "lib_dirs": lib_dirs, "port": port}
     if cuda_tk == 12:                                  # the experimental CUDA 12 engine (engine-cuda12/)
         cfg["cuda"] = 12
-    if (uenv := unsloth_default_env(family, model, hip, in_budget)):
+    if (uenv := unsloth_default_env(family, model, hip, in_budget, cuda12=cuda_tk == 12)):
         cfg["env"] = uenv
     if hip:
         cfg["backend"] = "hip"
