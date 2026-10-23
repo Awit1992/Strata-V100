@@ -144,9 +144,11 @@ def scan(text: str, *, collect_english: bool, verbatim: frozenset[str] = frozens
         if not collect_english:
             continue
         if raw.strip() in verbatim and (
-            # a data row kept verbatim, or a bullet/continuation whose text is a
-            # verbatim program string, is kept on purpose; copied prose is not
-            TABLE_RE.match(raw) or re.match(r"^\s*(?:[-*+]\s+)?`", raw)
+            # a data row kept verbatim, a quoted model output, or a bullet/continuation
+            # whose text is a verbatim program string, is kept on purpose; copied
+            # prose is not
+            TABLE_RE.match(raw) or HTML_TAG_RE.match(raw) or line.lstrip().startswith(">")
+            or re.match(r"^\s*(?:[-*+]\s+)?`", raw)
         ):
             continue
         if not re.sub(r"<[^>]*>", "", line).strip():  # pure HTML markup (e.g. an anchor line)
@@ -186,7 +188,7 @@ def compare(name: str, en_text: str, zh_text: str, *, english_check: bool, ignor
     res = Result(name=name)
     en = scan(en_text, collect_english=False)
     zh = scan(zh_text, collect_english=english_check,
-              verbatim=frozenset(l.strip() for l in en_text.splitlines()))
+              verbatim=frozenset(l.strip() for l in countable(en_text).splitlines()))
     res.en, res.zh = en, zh
 
     for label, a, b in (
