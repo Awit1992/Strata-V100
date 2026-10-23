@@ -233,15 +233,15 @@ def compare(name: str, en_text: str, zh_text: str, *, english_check: bool, ignor
         target, _, anchor = raw.partition("#")
         if not target or target.startswith(("http", "/", "mailto:")):
             continue
-        name = Path(target).name
-        is_docs_page = target.endswith(".md") and name != "README.md" and (DOCS / name).exists()
+        link_name = Path(target).name  # not `name`: that is this page's file name (see .check-ignore)
+        is_docs_page = target.endswith(".md") and link_name != "README.md" and (DOCS / link_name).exists()
         if is_docs_page:
-            if target != name:
-                res.errors.append(f"link {target} should be the sibling translation {name}")
+            if target != link_name:
+                res.errors.append(f"link {target} should be the sibling translation {link_name}")
                 continue
-            resolved = ZH / name
+            resolved = ZH / link_name
             if not resolved.exists():
-                res.warnings.append(f"link {name} is not translated yet")
+                res.warnings.append(f"link {link_name} is not translated yet")
                 continue
         else:
             resolved = repo_of(ZH, target)
