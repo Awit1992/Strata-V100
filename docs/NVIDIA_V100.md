@@ -164,8 +164,15 @@ ports and the changes that do not apply to Volta.
 - `STRATA_ROUTE_RESIDENT=1` selects resident-biased routing. Its route swap now
   uses one warp per token. The option remains off by default.
 - Linux CUDA can overlap adaptive expert copies with the next decode window.
-  Layer splits remain excluded. Use `STRATA_ADAPT_OVERLAP=0` to turn it off.
+  Layer splits remain excluded. On one Volta card the option is now on by
+  default (`STRATA_SM70_PERF=0` or `STRATA_ADAPT_OVERLAP=0` turns it off).
   Resident RAM sources require `STRATA_ADAPT_OVERLAP_RESIDENT=1`.
+- In the normal serial serve path, an implicit adaptive-copy count can grow
+  from 96 to 384 swaps. Counts above 96 must fit half of the recent verify
+  work time at the measured host-to-device rate. The legacy minimum is 96,
+  also when a valid measurement is not available. An explicit `--adapt-swaps N`
+  fixes the count; `0` disables the copies. The time-based count can change
+  cache residency between runs. It does not guarantee identical token IDs.
 - The automatic route tail skip stays off at 90% expert-cache residency or
   more. `STRATA_TAIL_SKIP_MAX_CACHED` changes this limit. An explicit
   `STRATA_ROUTE_TAIL_SKIP` takes precedence.
@@ -183,7 +190,7 @@ the 524,288-token context, the int8 KV cache, the MTP draft, the layer split `16
 `--pipeline-windows 2`. The raw arms and the method are in
 [the report](../bench/results/2026-10-20-v100-sm70-speed-stack/README.md).
 
-### The prompt path is at a local optimum: keep the 8,192-token chunk
+### Layer-split prompt path: keep the 8,192-token chunk
 
 `STRATA_PREFILL_TIMING=1` shows where a prompt chunk goes. On that rig one 8,192-token chunk
 costs about 2.1 s of PCIe pass over the experts and about 1.96 s of compute, and the chunk
@@ -197,8 +204,18 @@ takes 3.9 s: the rig's b/a is about 8,800 tokens.
 - A **deeper streamed ring** prefetches further over PCIe but is VRAM the expert cache does not
   keep: 384 slots and 512 slots both read the same prompt no faster than 192.
 
-**Do not raise `STRATA_PREFILL_AUTO_MAX` on this rig.** The general 8,192 ceiling is the measured
-one here, and the fork's service keeps it.
+These measurements apply to the layer-split configuration. Keep its 8,192-token
+ceiling. The automatic single-card rule below does not apply to a layer split.
+
+One card is different. A native pack with an arena loaded whole in RAM can use
+16,384-token chunks on one Volta card. Mapped arenas, shared file-backed arenas
+and resident complements keep the previous ceiling.
+The startup VRAM plan prices those buffers with the same loan cap, the 128-slot floor and the
+low-RAM check, and the rule keeps 8,192 when the available RAM does not cover the larger loan
+plus 6 GiB. An explicit `--prefill N`, `auto:N` or `STRATA_PREFILL_AUTO_MAX` is not changed.
+`STRATA_SM70_CHUNK=0` keeps 8,192 and `STRATA_SM70_CHUNK=1` takes 16,384 anyway. A larger chunk
+changes the prompt path's rounding, so a prompt's residual bits can differ from an 8,192 chunk
+(the same caveat the general 16,384 option has on CUDA).
 
 ### The decode window waits on three things, and the profile names them
 
@@ -540,14 +557,20 @@ records the boundary regression, performance measurements, and limitations.
 
 ## More opt-in switches (CUDA 12 experimental build)
 
-None of these is on by default. Each was measured by its contributor on a V100, not by the maintainers.
+Unless stated below, these switches are off by default. The sm_70 table sets `STRATA_PF_WMMA2=1`; each switch was
+measured by its contributor on a V100, not by the maintainers.
 
-`STRATA_PF_WMMA2=1` requires the experimental CUDA build and the WMMA prompt path.
-Set `STRATA_PF_WMMA=1` as well.
-The second tile supports IQ2_S gate/up and IQ4_NL down projections.
+`STRATA_PF_WMMA2` is on by default on sm_70 (`STRATA_PF_WMMA2=0` keeps the first tile only, and
+`STRATA_SM70_PERF=0` turns the whole sm_70 table off).
+It still requires the experimental CUDA build and the WMMA prompt path; set `STRATA_PF_WMMA=1` as well.
+The second tile takes IQ3_XXS, IQ3_S and IQ2_S gate/up and IQ4_NL down.
 It reads contiguous weights or the grouped resident/streamed weight table.
 It also supports gathered activation rows.
-Other formats, directions, or unsupported alignments keep the first tile.
+Groups whose largest expert has at least 128 rows use a 128-token by 64-output tile.
+Smaller groups use a 64-token by 128-output tile.
+The wider token tile reuses each decoded weight across more input rows.
+Set `STRATA_PF_WMMA2_N64=0` to keep the 64-token tile, or `=1` to force the 128-token tile.
+Other formats, directions, devices or unsupported alignments keep the first tile.
 The option does not change stored model quantization, KV format, or KV capacity.
 Like the first WMMA tile, it uses FP16 operands and FP32 accumulation.
 Do not require bitwise agreement with the CPU or integer MMQ path.
@@ -558,7 +581,7 @@ for measured gains, fixed settings, and numerical checks.
 | --- | --- | --- |
 | `STRATA_FUSE_DECODE=1` | the decode GEMV / MoE operator fusions of #1097 (gate/up + SwiGLU in one kernel, SwiGLU + quantizer in one kernel, all activation images of a vector in one pass, two BF16 projections in one kernel); bitwise the unfused kernels | 4-16 us per token saved, not visible end to end |
 | `STRATA_PF_WMMA=1` | the FP16 tensor-core prompt experts (above); also takes IQ4_NL down projections (K=640, #1771) | +10% prompt speed (#1401) |
-| `STRATA_PF_WMMA2=1` | A second prompt-expert tile for IQ2_S gate/up and IQ4_NL down. Supports grouped resident and streamed weights. | Measure on your workload. The original contributor reported +2.5-4.3%. |
+| `STRATA_PF_WMMA2` | A second prompt-expert tile for IQ3_XXS, IQ3_S and IQ2_S gate/up and IQ4_NL down. Supports grouped resident and streamed weights. On by default on sm_70; `=0` keeps the first tile only. | Measure on your workload. The original contributor reported +2.5-4.3%. |
 | `STRATA_ARGMAX_ROWS_SM70=1` | the multi-block greedy pick on sm_7x (#2357), bitwise the one-block pick | +0.7-0.8% decode |
 | `STRATA_GR_NORM_FAST=1` | the register-split hyper-connection norm on CUDA (#2358) | +0.5-0.6% decode |
 | `STRATA_Q8_GATHER_WIDE=0` | turns off the 8-wide int8 KV gather (#1095) that the experimental build uses below compute capability 7.5 | +11% on the gather kernel |

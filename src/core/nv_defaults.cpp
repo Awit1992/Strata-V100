@@ -40,6 +40,16 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             // --pipeline-windows 2): exact-kernel switches measured faster there.
             {"STRATA_SM70_TABLE", "1"},        // the Volta master switch: the interleaved dense table, expert mode 8, the hidden HC up
             {"STRATA_DEQUANT_WIDE", "1"},     // vector stores for native weights; avoids repeated narrow Q6_K dequant work
+#if defined(__linux__)
+            // One Volta card on Linux CUDA: overlap copies with verification. The existing mode guards and an
+            // explicit STRATA_ADAPT_OVERLAP=0 still win. Windows keeps the opt-in setting.
+            {"STRATA_ADAPT_OVERLAP", "1"},
+#endif
+            // The second prompt-expert tile, for the shapes it was built for (IQ3_XXS / IQ3_S / IQ2_S gate/up and
+            // IQ4_NL down, sm_70, aligned arguments with room for the tile).  It acts only inside the opt-in
+            // STRATA_PF_WMMA=1 prompt path; every other format, direction, device or alignment keeps the first
+            // tile.  STRATA_PF_WMMA2=0 keeps the first tile only.
+            {"STRATA_PF_WMMA2", "1"},
         };
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;
@@ -72,7 +82,7 @@ std::vector<std::string> apply_nv_defaults(int major, int minor) {
         const int mj = strata::cc_major_of(major);
         const char* card = mj == 8 ? "sm_86 (Ampere)" : mj == 7 ? "sm_70 (Volta)" : "sm_60 (Pascal)";
         const char* off_switch = mj == 8 ? "STRATA_SM86_PERF" : mj == 7 ? "STRATA_SM70_PERF" : "STRATA_SM60_PERF";
-        std::fprintf(stderr, "strata: %s: %zu exact speed switches on by default (%s=0 turns them off; a switch you set is kept): ",
+        std::fprintf(stderr, "strata: %s: %zu speed switches on by default (%s=0 turns them off; a switch you set is kept): ",
                      card, set.size(), off_switch);
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");

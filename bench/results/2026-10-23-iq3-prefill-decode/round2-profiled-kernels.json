@@ -1,0 +1,24 @@
+{
+  "tool": "NVIDIA Nsight Systems",
+  "purpose": "Development execution confirmation before final tile-orientation tuning; not a throughput comparison",
+  "regular_iq3_s": true,
+  "gpu_stamp_launches": 0,
+  "kernels": [
+    {
+      "kernel": "gemm_iq_f16_w2_kernel<(int)18>",
+      "launches": 490
+    },
+    {
+      "kernel": "gemm_iq_f16_w2_kernel<(int)20>",
+      "launches": 1106
+    },
+    {
+      "kernel": "gemm_iq_f16_w2_kernel<(int)21>",
+      "launches": 283
+    },
+    {
+      "kernel": "gemm_iq_f16_w2_kernel<(int)22>",
+      "launches": 559
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "candidate_sha256": "add55d48a3ace40ed206843f09fed856b4ba6ea9edde10a2cfef9737c6167e2b",
+  "regular_iq3_s_only": true,
+  "model_quantization_changed": false,
+  "kv_quantization_changed": false,
+  "kv_format": "int8",
+  "logical_context_cells": 524288,
+  "initial_kv_cells": 16384,
+  "expert_cache_equal_within_each_cohort": true,
+  "fresh_process_comparison_runs": 20,
+  "normal_mtp_requests": 12,
+  "prefill_requests": 24,
+  "prefill_prompt_hashes_and_generated_token_match": true,
+  "ctest_passed": [
+    "pf_wmma2_parity",
+    "pf_wmma2_n64_parity",
+    "verify_parity",
+    "native_multi_parity",
+    "fusions_parity",
+    "qsa_parity",
+    "nv_defaults_test",
+    "adapt_budget_test"
+  ],
+  "wmma2_orientations": [
+    {
+      "STRATA_PF_WMMA2_N64": 0,
+      "numerical_cases": 20,
+      "numerical_failures": 0,
+      "compute_sanitizer_memory_errors": 0
+    },
+    {
+      "STRATA_PF_WMMA2_N64": 1,
+      "numerical_cases": 20,
+      "numerical_failures": 0,
+      "compute_sanitizer_memory_errors": 0
+    }
+  ],
+  "benchmark_harness_unit_tests_passed": 46,
+  "actual_cli_mode_checks_passed": 3,
+  "http_quality_checks_passed": 8,
+  "http_topologies": [
+    "single-GPU",
+    "two-GPU layer split"
+  ],
+  "tested_gpu_architectures": [
+    "sm70"
+  ],
+  "image_inference_tested": false,
+  "normal_mtp_outputs_identical": false,
+  "normal_mtp_rate_caveat": "Output contents, acceptance, and some generated lengths differ; aggregate emitted tokens per decode time is descriptive, not a fixed-trace causal speedup."
+}

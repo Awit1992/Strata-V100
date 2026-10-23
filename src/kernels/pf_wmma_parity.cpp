@@ -15,10 +15,10 @@
 // instead of passing). Every output row outside the bounds and every column past n_out must remain at its sentinel.
 // Results must be finite. The FP32 tensor-core sums use another order than the double reference: max |got - ref|
 // <= 2e-5 * (max |ref| of the matrix) + 1e-6.
-// With STRATA_PF_WMMA2=1 in the environment the same group shapes run against the opt-in IQ2_S gate/up and IQ4_NL
-// down tile (gemm_iq_f16_w2_kernel) as well, including its indirect table and its partial 16-row tiles, and the
-// odd-super-block-count IQ2_S rows (K = 3840) whose last raw word is only two bytes long; the ctest
-// `pf_wmma2_parity` is this binary with that variable set.
+// With STRATA_PF_WMMA2=1 in the environment the same group shapes run against the opt-in IQ3_XXS / IQ3_S / IQ2_S
+// gate/up and IQ4_NL down tile (gemm_iq_f16_w2_kernel) as well, including its indirect table and its partial
+// 16-row tiles, and the odd-super-block-count IQ3_XXS / IQ3_S / IQ2_S rows (K = 3840) whose last raw word is only
+// two bytes long; the ctest `pf_wmma2_parity` is this binary with that variable set.
 //
 // --bench: the model's shapes (IQ3_XXS, IQ3_S and IQ2_S gate/up 1280 x 2560, IQ4_NL down 2560 x 640), 64 experts of 2,
 // 64, 128 and 256 rows each - a short group, a moderate one, the short-row dispatch limit, and a wide group.
@@ -346,7 +346,7 @@ int main(int argc, char** argv) {
     }
     int fails = 0;
     for (int ty : {18, 21, 22, 23, 16, 29}) {
-        if (wmma2_only && ty != 22) continue;
+        if (wmma2_only && ty != 18 && ty != 21 && ty != 22) continue;
         fails += run(ty, 1280, 2560, rng, false, false);
         fails += run(ty, 1280, 2560, rng, true, false);
     }
@@ -361,21 +361,18 @@ int main(int argc, char** argv) {
         fails += run(ty, 2560, 640, rng, true, true);   // the prompt path's down launch: the table's dn half
     }
     // the gate/up formats most of the pack's experts use, over the same short-row bounds (direct and ids/table gu)
-    for (int ty : {18, 22}) {
-        if (wmma2_only) continue;
+    for (int ty : {18, 21, 22}) {
         fails += run(ty, 1280, 2560, rng, false, false, true);
         fails += run(ty, 1280, 2560, rng, true, false, true);
     }
-    if (!wmma2_only) {
-        fails += run(21, 1280, 2560, rng, false, false, true);
-        fails += run(21, 1280, 2560, rng, true, false, true);
+    // IQ3_XXS / IQ3_S / IQ2_S with an odd number of 98-, 110- and 82-byte super-blocks per row (K = 15 x 256):
+    // the rows are 2-byte aligned only and the last raw stage is two bytes long, which the W2 tile's bounded load
+    // must read without leaving the row (STRATA_PF_WMMA2=1 runs these on that tile, the default on the generic
+    // one).  Short bounds keep the double reference cheap; both the direct and the ids/table path.
+    for (int ty : {18, 21, 22}) {
+        fails += run(ty, 1280, 3840, rng, false, false, true);
+        fails += run(ty, 1280, 3840, rng, true, false, true);
     }
-    // IQ2_S with an odd number of 82-byte super-blocks per row (K = 15 x 256): the rows are 2-byte aligned only
-    // and the last raw stage is two bytes long, which the W2 tile's bounded load must read without leaving the
-    // row (STRATA_PF_WMMA2=1 runs these on that tile, the default on the generic one).  Short bounds keep the
-    // double reference cheap; both the direct and the ids/table path.
-    fails += run(22, 1280, 3840, rng, false, false, true);
-    fails += run(22, 1280, 3840, rng, true, false, true);
     if (!wmma2_only) {
         fails += run(20, 2560, 640, rng, false, false, true);
         fails += run(20, 2560, 640, rng, true, false, true);

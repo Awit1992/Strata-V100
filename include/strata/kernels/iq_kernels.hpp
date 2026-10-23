@@ -106,9 +106,10 @@ struct GroupedWeightTable {
 /// offset to the group's first row).  `ids` (may be null) gathers each output row's input row, so a caller reads an
 /// ungathered activation buffer without copying it. FP16 tensor cores with FP32 sums. By default, Q2_0 blocks cover up
 /// to 128 rows. IQ3_XXS, IQ3_S, IQ2_S and IQ4_NL use 128-row blocks when max_rows <= 128,
-/// and 256-row blocks otherwise. Other types use 256-row blocks. STRATA_PF_WMMA2 can select a 64-row tile for
-/// IQ2_S gate/up and IQ4_NL down. Set `down=true` for down products even with contiguous weights. Unsupported
-/// alignments keep the default tile.
+/// and 256-row blocks otherwise. Other types use 256-row blocks. STRATA_PF_WMMA2 (on by default on sm_70; =0 keeps the
+/// first tile) uses 64-token tiles for short groups and 128-token tiles when max_rows >= 128, for
+/// IQ3_XXS, IQ3_S or IQ2_S gate/up and IQ4_NL down. Set `down=true` for down products even with contiguous weights.
+/// Unsupported alignments, shapes or device resources keep the default tile.
 /// false: not launched (shape, type or device not covered). CUDA sm_70+ only.
 bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, int K, const void* X, int ldx,
                          const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream,
