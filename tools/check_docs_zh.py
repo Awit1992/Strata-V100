@@ -87,7 +87,7 @@ def countable(text: str) -> str:
     A translated heading keeps its English slug in an <a id="..."> line, which would
     otherwise count the heading's numbers twice.
     """
-    text = re.sub(r"<[^>]*>", " ", text)
+    text = re.sub(r"<[^>\n]*>", " ", text)  # never across lines: a stray "<" would eat the file
     text = re.sub(r"\]\([^)\s]*\)", "](L)", text)
     return text
 
