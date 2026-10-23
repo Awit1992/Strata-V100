@@ -1,0 +1,58 @@
+[
+  {
+    "case": "ready",
+    "passed": true,
+    "answer": "READY",
+    "finish": "stop",
+    "usage": {
+      "prompt_tokens": 23,
+      "completion_tokens": 2,
+      "total_tokens": 25,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    }
+  },
+  {
+    "case": "arithmetic",
+    "passed": true,
+    "answer": "42",
+    "finish": "stop",
+    "usage": {
+      "prompt_tokens": 28,
+      "completion_tokens": 3,
+      "total_tokens": 31,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    }
+  },
+  {
+    "case": "json",
+    "passed": true,
+    "answer": "{\"status\":\"ok\",\"count\":3}",
+    "finish": "stop",
+    "usage": {
+      "prompt_tokens": 31,
+      "completion_tokens": 10,
+      "total_tokens": 41,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    }
+  },
+  {
+    "case": "long-prefill",
+    "passed": true,
+    "answer": "READY",
+    "finish": "stop",
+    "usage": {
+      "prompt_tokens": 4009,
+      "completion_tokens": 2,
+      "total_tokens": 4011,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    }
+  }
+]

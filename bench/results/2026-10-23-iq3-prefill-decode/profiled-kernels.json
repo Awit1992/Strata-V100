@@ -1,0 +1,28 @@
+{
+  "tool": "NVIDIA Nsight Systems 2024.5.1.113",
+  "purpose": "Actual regular IQ3_S HTTP execution confirmation; not a performance comparison",
+  "kernels": [
+    {
+      "Time (%)": "11.0",
+      "Total Time (ns)": "243832328",
+      "Instances": "957",
+      "Avg (ns)": "254788.2",
+      "Med (ns)": "230878.0",
+      "Min (ns)": "26592",
+      "Max (ns)": "794426",
+      "StdDev (ns)": "103294.7",
+      "Name": "void strata::kernels::<unnamed>::gemm_iq_f16_w2_kernel<(int)20>(const unsigned char *, unsigned long, unsigned long, int, const __half *, int, const int *, const int *, int, float *, int, int, strata::kernels::GroupedWeightTable)"
+    },
+    {
+      "Time (%)": "10.0",
+      "Total Time (ns)": "221334748",
+      "Instances": "444",
+      "Avg (ns)": "498501.7",
+      "Med (ns)": "478491.5",
+      "Min (ns)": "97087",
+      "Max (ns)": "1325396",
+      "StdDev (ns)": "170877.8",
+      "Name": "void strata::kernels::<unnamed>::gemm_iq_f16_w2_kernel<(int)22>(const unsigned char *, unsigned long, unsigned long, int, const __half *, int, const int *, const int *, int, float *, int, int, strata::kernels::GroupedWeightTable)"
+    }
+  ]
+}

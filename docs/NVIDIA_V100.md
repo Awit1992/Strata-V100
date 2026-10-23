@@ -522,15 +522,43 @@ expert weights, model quantization, KV format, or KV capacity.
 See the [cache admission and dequantization report](../benchmarks/v100-prefill-cache-admission-2026-10-21.md)
 for the measured read counts, four-arm TTFT results, and full-request costs.
 
+## Decode mixer overlap
+
+Set `STRATA_SIDE_MIXER=2` to test input-only mixer work on graph branches.
+This setting remains opt-in on Volta. The default stays unchanged.
+The indexer branch takes its tail snapshot before it appends speculative rows.
+The main stream must not overwrite that snapshot.
+The commit graph then restores the accepted prefix without rejected keys.
+
+Set `STRATA_SIDE_MIXER=0` to use the inline path.
+Use the same model, KV settings, cache state, and workload in both arms.
+Normal MTP throughput can differ from a fixed-work decode measurement.
+The setting does not change stored weights, model quantization, KV format,
+or logical context capacity.
+The [IQ3_S study](../benchmarks/v100-iq3_s-prefill-decode-2026-10-23.md)
+records the boundary regression, performance measurements, and limitations.
+
 ## More opt-in switches (CUDA 12 experimental build)
 
 None of these is on by default. Each was measured by its contributor on a V100, not by the maintainers.
+
+`STRATA_PF_WMMA2=1` requires the experimental CUDA build and the WMMA prompt path.
+Set `STRATA_PF_WMMA=1` as well.
+The second tile supports IQ2_S gate/up and IQ4_NL down projections.
+It reads contiguous weights or the grouped resident/streamed weight table.
+It also supports gathered activation rows.
+Other formats, directions, or unsupported alignments keep the first tile.
+The option does not change stored model quantization, KV format, or KV capacity.
+Like the first WMMA tile, it uses FP16 operands and FP32 accumulation.
+Do not require bitwise agreement with the CPU or integer MMQ path.
+See the [IQ3_S prefill and decode study](../benchmarks/v100-iq3_s-prefill-decode-2026-10-23.md)
+for measured gains, fixed settings, and numerical checks.
 
 | Switch | What it does | Contributor's number |
 | --- | --- | --- |
 | `STRATA_FUSE_DECODE=1` | the decode GEMV / MoE operator fusions of #1097 (gate/up + SwiGLU in one kernel, SwiGLU + quantizer in one kernel, all activation images of a vector in one pass, two BF16 projections in one kernel); bitwise the unfused kernels | 4-16 us per token saved, not visible end to end |
 | `STRATA_PF_WMMA=1` | the FP16 tensor-core prompt experts (above); also takes IQ4_NL down projections (K=640, #1771) | +10% prompt speed (#1401) |
-| `STRATA_PF_WMMA2=1` | a second prompt-expert kernel for IQ2_S gate/up and IQ4_NL down (#2356) | +2.5-4.3% prompt speed |
+| `STRATA_PF_WMMA2=1` | A second prompt-expert tile for IQ2_S gate/up and IQ4_NL down. Supports grouped resident and streamed weights. | Measure on your workload. The original contributor reported +2.5-4.3%. |
 | `STRATA_ARGMAX_ROWS_SM70=1` | the multi-block greedy pick on sm_7x (#2357), bitwise the one-block pick | +0.7-0.8% decode |
 | `STRATA_GR_NORM_FAST=1` | the register-split hyper-connection norm on CUDA (#2358) | +0.5-0.6% decode |
 | `STRATA_Q8_GATHER_WIDE=0` | turns off the 8-wide int8 KV gather (#1095) that the experimental build uses below compute capability 7.5 | +11% on the gather kernel |
