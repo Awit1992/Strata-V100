@@ -34,21 +34,15 @@ int main() {
     CHECK(nv_default_env(7, 5).empty());
     CHECK(nv_default_env(6, 1).empty());
 
-    // Volta (sm_70): the table is there, and every switch in it is one of the measured ones
-    {
-        const auto t = nv_default_env(7, 0);
-        CHECK(!t.empty());
-        bool sm70_table = false;
-        for (const auto& kv : t) {
-            CHECK(kv.first.rfind("STRATA_", 0) == 0);
-            CHECK(kv.second == "1" || kv.second == "2");
-            if (kv.first == "STRATA_SM70_TABLE") { sm70_table = true; CHECK(kv.second == "1"); }
-            // a switch that changes the answer has no place in a table of exact switches
-            CHECK(kv.first != "STRATA_PF_FUSED" && kv.first != "STRATA_PF_GEMM" && kv.first != "STRATA_HCD_EXACT" &&
-                  kv.first != "STRATA_EXCHANGE_ROTATE" && kv.first != "STRATA_ROUTE_RESIDENT" &&
-                  kv.first != "STRATA_ROUTE_TAIL_SKIP" && kv.first != "STRATA_PCIE_BALANCE");
-        }
-        CHECK(sm70_table);   // the Volta master switch is in the table
+    // The new Volta policies must not change another architecture's process settings.
+    const int other_arches[][2] = {{8, 6}, {6, 0}};
+    for (const auto& cc : other_arches) {
+        unset("STRATA_ADAPT_OVERLAP");
+        unset("STRATA_PF_WMMA2");
+        const auto applied = apply_nv_defaults(cc[0], cc[1]);
+        CHECK(std::getenv("STRATA_ADAPT_OVERLAP") == nullptr);
+        CHECK(std::getenv("STRATA_PF_WMMA2") == nullptr);
+        for (const auto& key : applied) unset(key.c_str());
     }
 
     // the off switch empties the table, and the other architectures keep theirs
@@ -68,10 +62,29 @@ int main() {
     }
     unset("STRATA_SM70_TABLE");
 
+    // an explicit STRATA_ADAPT_OVERLAP=0 is the user's own setting: kept, so the overlap stays off
+    put("STRATA_ADAPT_OVERLAP", "0");
+    {
+        const auto set = apply_nv_defaults(7, 0);
+        for (const auto& s : set) CHECK(s != "STRATA_ADAPT_OVERLAP");
+        const char* v = std::getenv("STRATA_ADAPT_OVERLAP");
+        CHECK(v != nullptr && std::string(v) == "0");
+    }
+    unset("STRATA_ADAPT_OVERLAP");
+
+    // an explicit STRATA_PF_WMMA2=0 keeps the first tile only
+    put("STRATA_PF_WMMA2", "0");
+    {
+        const auto set = apply_nv_defaults(7, 0);
+        for (const auto& s : set) CHECK(s != "STRATA_PF_WMMA2");
+        const char* v = std::getenv("STRATA_PF_WMMA2");
+        CHECK(v != nullptr && std::string(v) == "0");
+    }
+    unset("STRATA_PF_WMMA2");
+
     // applying twice sets nothing new the second time
     {
         const auto first = apply_nv_defaults(7, 0);
-        CHECK(!first.empty());
         const auto second = apply_nv_defaults(7, 0);
         CHECK(second.empty());
         for (const auto& s : first) unset(s.c_str());

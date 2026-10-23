@@ -1,0 +1,46 @@
+{
+  "candidate_sha256": "add55d48a3ace40ed206843f09fed856b4ba6ea9edde10a2cfef9737c6167e2b",
+  "cases": [
+    {
+      "case": "explicit-ceiling-96",
+      "selected_prefill_cap": 8192,
+      "maximum_expected_cap": 8192,
+      "explicit_adapt_swaps": 96,
+      "automatic_copy_budget_enabled": false,
+      "swap_averages_per_window": [
+        19.2
+      ],
+      "generated": 32,
+      "error": null,
+      "performance_measurement": false
+    },
+    {
+      "case": "explicit-ceiling-zero",
+      "selected_prefill_cap": 4096,
+      "maximum_expected_cap": 4096,
+      "explicit_adapt_swaps": 0,
+      "automatic_copy_budget_enabled": false,
+      "swap_averages_per_window": [
+        0.0,
+        0.0
+      ],
+      "generated": 32,
+      "error": null,
+      "performance_measurement": false
+    },
+    {
+      "case": "resident-complement-small",
+      "selected_prefill_cap": 4864,
+      "maximum_expected_cap": 8192,
+      "explicit_adapt_swaps": null,
+      "automatic_copy_budget_enabled": false,
+      "swap_averages_per_window": [
+        0.0
+      ],
+      "generated": 1,
+      "error": null,
+      "performance_measurement": false
+    }
+  ],
+  "note": "The resident complement selects a smaller chunk under the existing memory-fit rules. auto:N retains its existing minimum of 8192; explicit numeric 4096 is tested separately."
+}

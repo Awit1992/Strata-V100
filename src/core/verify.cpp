@@ -1655,13 +1655,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                 }
                 stamp(l, 8, grp);
-                if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
-                    for (int t = tb; t < te; ++t)
-                        if (t == tb || brow_[t] != brow_[t - 1])
-                            copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
-                                             slot_ss(t).qsa_states[qi].idx_tail, TS, cs);
-                } else
-                if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+                // the tail the commit restores: with the side mixer it was taken on the branch, BEFORE its
+                // append (/after/ the append here it would hold this window's rejected rows)
+                if (!sidem) idx_snap(cs);
                 // The group's cells in ONE launch per format: every cell's position comes from its own step
                 // record (kStepPos), so the captured graph replays it for any window, and the cells' writes are
                 // pairwise disjoint - bitwise the per-token calls this replaced made in order.  A batch slot's
