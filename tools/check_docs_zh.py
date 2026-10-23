@@ -92,8 +92,13 @@ def countable(text: str) -> str:
     return text
 
 
-def scan(text: str, *, collect_english: bool) -> Metrics:
-    """Walk the markdown once: count structure, collect English-only prose lines."""
+def scan(text: str, *, collect_english: bool, verbatim: frozenset[str] = frozenset()) -> Metrics:
+    """Walk the markdown once: count structure, collect English-only prose lines.
+
+    `verbatim` holds the English page's stripped lines: a translation line equal to
+    one of them is intentionally kept as-is (data rows, program strings), not left
+    over untranslated prose.
+    """
     m = Metrics()
     text = countable(text)
     in_fence = False
@@ -138,6 +143,12 @@ def scan(text: str, *, collect_english: bool) -> Metrics:
 
         if not collect_english:
             continue
+        if raw.strip() in verbatim and (
+            # a data row kept verbatim, or a bullet/continuation whose text is a
+            # verbatim program string, is kept on purpose; copied prose is not
+            TABLE_RE.match(raw) or re.match(r"^\s*(?:[-*+]\s+)?`", raw)
+        ):
+            continue
         if not re.sub(r"<[^>]*>", "", line).strip():  # pure HTML markup (e.g. an anchor line)
             continue
         if line.lstrip().startswith("|") and line.count("|") > 0:
@@ -174,7 +185,8 @@ def slugify(text: str) -> str:
 def compare(name: str, en_text: str, zh_text: str, *, english_check: bool, ignore: set[str], max_number_drift: float) -> Result:
     res = Result(name=name)
     en = scan(en_text, collect_english=False)
-    zh = scan(zh_text, collect_english=english_check)
+    zh = scan(zh_text, collect_english=english_check,
+              verbatim=frozenset(l.strip() for l in en_text.splitlines()))
     res.en, res.zh = en, zh
 
     for label, a, b in (
@@ -226,7 +238,7 @@ def compare(name: str, en_text: str, zh_text: str, *, english_check: bool, ignor
         return found
 
     paired = list(zip(zh_order, en_order)) if len(zh_order) == len(en_order) else []
-    if not paired:
+    if not paired and en_order:
         res.warnings.append("link order cannot be paired with the English page")
 
     for raw in TARGET_RE.findall(zh_text):
