@@ -181,7 +181,9 @@ also fails, the warning preserves both the GPU allocation or mapping error and t
 - With `STRATA_MMQ_KQ=1` the engine multiplies the Q4_K / Q5_K / Q5_1 experts of a prompt with llama.cpp's MMQ
   kernels (as the other models' formats always are) instead of dequantizing them to FP16: 4x less GPU time for those
   products, but on this PC the prompt waits for the SSD either way (29 s per 4K chunk with or without). Opt-in: it
-  rounds differently from the FP16 path. On CUDA these kernels are a library next to the engine (`libstrata_kq.so` /
+  rounds differently from the FP16 path. Exception: setup writes it for this file on the CUDA 12 engine (V100,
+  sm_70), because the FP16 path returns non-finite logits (#879) from layer 0 ([NVIDIA_V100.md](NVIDIA_V100.md)).
+  On CUDA these kernels are a library next to the engine (`libstrata_kq.so` /
   `strata_kq.dll`), opened only then, so they take no VRAM from other models ([QUANTS.md](QUANTS.md)); before, they were
   the build option `-DSTRATA_MMQ_KQUANTS=ON` and took 1-3 expert slots from every model.
 - The speed varies from run to run (6.7-8.6 tok/s at 40 GiB for the same prompt), with what the OS file cache holds.
