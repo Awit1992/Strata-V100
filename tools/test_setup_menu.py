@@ -132,6 +132,13 @@ class UnslothDefaultEnv(unittest.TestCase):
         for m in ("UD-Q4_K_XL", "UD-IQ4_XS", "Q8_0"):
             self.assertNotIn("STRATA_MMQ_KQ", f("unsloth", m, False, False), m)
 
+    def test_q4_k_xl_turns_the_k_quant_prompt_kernels_on_for_the_cuda12_engine(self):
+        f = setup.unsloth_default_env
+        self.assertEqual(f("unsloth", "UD-Q4_K_XL", False, False, cuda12=True)["STRATA_MMQ_KQ"], "1")
+        self.assertNotIn("STRATA_MMQ_KQ", f("unsloth", "UD-Q4_K_XL", True, False, cuda12=True))
+        for m in ("UD-IQ4_XS", "Q8_0"):
+            self.assertNotIn("STRATA_MMQ_KQ", f("unsloth", m, False, False, cuda12=True), m)
+
     def test_hc_q8_on_cuda_for_the_ud_files_only(self):
         f = setup.unsloth_default_env
         for m in ("UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL"):

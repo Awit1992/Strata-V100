@@ -44,6 +44,14 @@ select "old" kernels everywhere: which kernel runs is decided per architecture w
 All three are bitwise the kernels they replace; on a V100-SXM2 they take a verify window's GPU work from 22.8 to 21.2 ms
 ([bench/results/2026-10-07-v100-decode-kernels](../bench/results/2026-10-07-v100-decode-kernels/README.md)).
 
+## Setup default for UD-Q4_K_XL
+
+On sm_70, the FP16 prompt path returns non-finite logits (#879) from layer 0 for `UD-Q4_K_XL`. The first non-finite
+values are in the down projection, which uses Q5_1 in this file. The K-quant MMQ kernels give finite output for this
+file. Therefore, setup writes `STRATA_MMQ_KQ=1` for this file on the CUDA 12 engine only. CUDA 13 and HIP keep the flag
+opt-in. `UD-IQ4_XS` keeps the FP16 path because its down projection is IQ4_NL; its default does not change. Run setup
+again to add the entry to an existing config.
+
 ## Measured
 
 One V100-PCIE-32GB, i9-7960X, Unsloth `UD-IQ4_XS` (not a setup model), int8 KV, MTP `--spec 2`; prompt read speed of random-word prompts, tokens/s,
