@@ -349,4 +349,44 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }
 }
 
+void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,
+                          const void* const* act, int nt, float* const* ff, int r0, int r1,
+                          float swiglu_limit) {
+    // GLM's CPU lane: gate rows and up rows for [r0, r1) of one expert, then GLM's clamped SwiGLU.  ggml's per-row
+    // dot keeps the rows bit for bit the ones a single token computes alone (the multi-token split kernels are not
+    // ported with the GLM engine yet).
+    const bool clamp = swiglu_limit != std::numeric_limits<float>::infinity();
+    const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
+    const int n = (int) f.n_embd;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gr = gate_base + (size_t) r * f.gu_row;
+        const uint8_t* ur = up_base + (size_t) r * f.gu_row;
+        for (int t = 0; t < nt; ++t) {
+            float g = 0.f, u = 0.f;
+            dot(n, &g, 0, gr, 0, act[t], 0, 1);
+            dot(n, &u, 0, ur, 0, act[t], 0, 1);
+            if (clamp) {   // GLM's clamped swiglu (glm_ffn's semantics), matching the device path
+                g = std::fmin(g, swiglu_limit);
+                u = std::fmin(std::fmax(u, -swiglu_limit), swiglu_limit);
+            }
+            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+        }
+    }
+}
+
+void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const void* const* hq,
+                            int nt, float* const* out, int r0, int r1) {
+    // ggml's per-row dot: the rows are bit for bit the ones a lone token computes (see native_gu_rows_split).
+    const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;
+    const int n = (int) f.n_ff;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* dr = down_base + (size_t) r * f.d_row;
+        for (int t = 0; t < nt; ++t) {
+            float s = 0.f;
+            dot(n, &s, 0, dr, 0, hq[t], 0, 1);
+            out[t][r] = s;
+        }
+    }
+}
+
 }  // namespace strata::kernels::cpu

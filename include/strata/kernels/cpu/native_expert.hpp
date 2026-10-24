@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace strata::kernels::cpu {
@@ -59,6 +60,12 @@ int native_gu_mt_min(int gu_type);
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1);
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1).
+/// The rows [r0, r1) of one expert's gate/up (swiglu applied) and down, for GLM's CPU lane.
+void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,
+                          const void* const* act, int nt, float* const* ff, int r0, int r1,
+                          float swiglu_limit = std::numeric_limits<float>::infinity());
+void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const void* const* hq,
+                            int nt, float* const* out, int r0, int r1);
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);
 

@@ -109,6 +109,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
   set(_strata_tests_default ON)
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
+option(STRATA_GLM_PORT "WIP: build the GLM-5.3-Flash engine ported from Project Maya (does not link yet - docs/GLM53-V100-PORT.md)" OFF)
 option(STRATA_BUILD_CONVERSATION_TESTS "Build standalone conversation cache tests" OFF)
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 # #2027: defined here, before the GPU section reads it to register the native-expert tests (it was defined at the
@@ -559,12 +560,29 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
+  if(STRATA_GLM_PORT)
+    target_sources(strata_kernels PRIVATE
+      src/kernels/cuda/glm_hc.cu
+      src/kernels/cuda/glm_kda.cu
+      src/kernels/cuda/glm_ffn.cu
+      src/kernels/cuda/glm_dsa.cu
+      src/kernels/cuda/glm_fast.cu
+      src/kernels/cuda/glm_batch.cu
+      src/kernels/cuda/glm_kv_stream.cu
+)
+  endif()
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp
     src/core/conversation_disk.cpp src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp
     src/core/conversation_file.cpp src/core/peer_experts.cpp)
+  if(STRATA_GLM_PORT)
+    target_sources(strata_engine PRIVATE
+          src/core/glm_model.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu src/core/glm_prefill.cu
+      src/core/glm_multi.cu src/core/glm_rows.cu src/core/glm_window.cu src/core/glm_fast_path.cu
+      src/core/glm_dflash.cu src/core/glm_expert_helper.cpp)
+  endif()
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -1744,7 +1762,7 @@ if(STRATA_NATIVE_EXPERTS)
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
                 src/prefill/moe_fp16tc.cu src/prefill/mmq_nvfp4_w4a8.cu
-                src/prefill/ggml_cuda_host.cu ${_strata_quantize_cu})
+                src/prefill/ggml_cuda_host.cu ${_strata_quantize_cu} ${_strata_mmq}/convert.cu)
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1 q6_k, the experts of Unsloth's UD-Q4/Q5/Q6_K_XL (docs/QUANTS.md; the dispatch
     # follows eddoursul/Strata 7706c1b).  MODEL-UPDATE Phase 1: on CUDA they are a library of their own, strata_kq

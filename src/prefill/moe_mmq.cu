@@ -6,6 +6,7 @@
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
+#include "convert.cuh"
 #if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
 #include "moe_mmq_tab.hpp"   // declarations only: the tab kernels live in the per-type mmq-tab-*.cu TUs
 #endif
@@ -687,5 +688,38 @@ void set_bounds(int32_t* dst, int32_t rows, void* stream) {
     ck(cudaGetLastError(), "set_bounds");
 }
 #endif
+
+
+bool glu_supported(int t, int64_t n_ff) {
+    (void) t;
+    (void) n_ff;
+    return false;   // no mmq-fused-swiglu patch in this tree: the caller runs the plain product + SwiGLU
+}
+
+void Context::run_glu(const Product& p, float limit, void* stream) {
+    // Reached only when glu_supported() is true, which it never is here.
+    (void) p;
+    (void) limit;
+    (void) stream;
+    std::fprintf(stderr, "prefill mmq: this build has no fused gate/up product\n");
+    std::exit(1);
+}
+
+size_t q8_block_bytes() { return sizeof(block_q8_1_mmq); }
+
+bool to_f16_supported(int t) { return ggml_get_to_fp16_cuda((ggml_type) t) != nullptr; }
+
+bool to_f16(int t, const void* w, uint16_t* dst, int64_t n, void* stream) {
+    const to_fp16_cuda_t f = ggml_get_to_fp16_cuda((ggml_type) t);
+    if (f == nullptr) return false;
+    f(w, (half*) dst, n, (cudaStream_t) stream);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+void pool_slab(int dev, void* base, size_t bytes) {
+    (void) dev;
+    (void) base;
+    (void) bytes;
+}
 
 }  // namespace strata::prefill::mmq

@@ -5975,5 +5975,7 @@ bool gemm_iq_f16_grouped(int, const void*, size_t, int, int, const void*, int, c
                          const int32_t*, const GroupedWeightTable*, bool) {
     return false;
 }
+bool gemm_iq_f16_grouped_supported(int dev) { return (gemm_iq_f16_grouped_caps(dev) & 2u) != 0; }
+
 }  // namespace strata::kernels
 #endif

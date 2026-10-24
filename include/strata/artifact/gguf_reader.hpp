@@ -404,6 +404,26 @@ public:
             if (std::strcmp(t.type_name(), tn) == 0) ++n;
         return n;
     }
+    // A metadata value with every item of its arrays (metadata() keeps a sample of each): the header walked again to
+    // the key - for the few readers that want a whole array (the tokenizer's tokens).  false: no such key.
+    bool get_full(const std::string& key, MetaValue& out) const {
+        if (meta_.find(key) == meta_.end()) return false;
+        Cursor c(base_, (size_t) size_);
+        c.read<uint32_t>();   // magic, version, n_tensors (parse() checked them)
+        c.read<uint32_t>();
+        c.read<uint64_t>();
+        const uint64_t n_kv = c.read<uint64_t>();
+        for (uint64_t i = 0; i < n_kv; ++i) {
+            const std::string k = c.str();
+            const MetaType t = (MetaType)c.read<uint32_t>();
+            if (k == key) {
+                out = read_value(c, t, 0);
+                return true;
+            }
+            read_value(c, t, 0);
+        }
+        return false;
+    }
     const MetaValue* get(const std::string& key) const {
         auto it = meta_.find(key);
         return it == meta_.end() ? nullptr : &it->second;

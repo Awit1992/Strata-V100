@@ -115,6 +115,9 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
                          const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream,
                          const int32_t* ids = nullptr, const GroupedWeightTable* indirect = nullptr,
                          bool down = false);
+/// The grouped IQ->FP16 tensor-core product is usable on this device (the caps bit the GLM prompt path checks).
+bool gemm_iq_f16_grouped_supported(int dev);
+
 /// APR (prism.hadamard): y = H_block (signs * x) per block of `block` values of each of `rows` rows of `width`
 /// (x == y allowed).  `signs`: a device vector of `width` signs, or nullptr (identity).  The same floats as the CPU's
 /// hadamard_rotate.  The f16 form rotates in place, computing in float.

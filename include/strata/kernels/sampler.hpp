@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace strata::kernels {
 
@@ -26,6 +27,7 @@ struct SamplerParams {
     uint64_t counter = 0;        // absolute draw index of row 0; advance across decode calls
     bool greedy = false;
     const float* logit_bias = nullptr; // optional device array [n_vocab], added BEFORE penalties/filters; -inf bans
+    const std::vector<int32_t>* host_history = nullptr; // optional: the caller's host token history (GLM's penalties)
     bool gumbel = false;         // STRATA_SPEC_GUMBEL=1: Gumbel-max pick keyed by (seed, counter, token id) - see sampler.cu
 };
 

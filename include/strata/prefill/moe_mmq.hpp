@@ -16,6 +16,17 @@ bool built();
 /// STRATA_MMQ_KQUANTS the K-quants Q4_K / Q5_K / Q5_1 / Q6_K: Unsloth's UD-Q4_K_XL experts (CUDA), and the dense GGUF
 /// projections of the mixed-quant packs through Gemm::native's STRATA_DENSE_MMQ path (HIP); IQ1_M is not covered).
 bool supported(int ggml_type);
+/// This build has the fused gate/up + SwiGLU product (GLM's prompt path).  Strata's ggml-cuda has no
+/// mmq-fused-swiglu patch, so it reports false and the caller takes the plain product.
+bool glu_supported(int ggml_type, int64_t n_ff);
+/// One q8_1 MMQ block's bytes (the activation layout's stride unit).
+size_t q8_block_bytes();
+/// llama.cpp's dequantizer to FP16 for this type, and the dequantize itself (IEEE half bits).
+bool to_f16_supported(int ggml_type);
+bool to_f16(int ggml_type, const void* w, uint16_t* dst, int64_t n, void* stream);
+/// The expert-pool slab the MMQ scratch could borrow: no-op here (strata's pools allocate their scratch
+/// as before; GLM passes the chunk's leftover region and the call keeps it for a later port).
+void pool_slab(int dev, void* base, size_t bytes);
 /// #420: `supported`, and on every visible GPU llama.cpp's MMQ has a tile for this type and a weight matrix of
 /// `w_rows` rows that fits the card's shared memory - the same test its tile choice makes, which aborts the process
 /// ("J_best=0") when nothing fits.  false (said once per type) keeps that product on the non-MMQ path.
@@ -91,6 +102,8 @@ public:
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
     void run(const Product& p, void* stream);
+    /// The gate/up product with the SwiGLU in its write-back (GLM's prompt path): only where glu_supported().
+    void run_glu(const Product& p, float limit, void* stream);
 
 private:
     void* ctx_ = nullptr;
