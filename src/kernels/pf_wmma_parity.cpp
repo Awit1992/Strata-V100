@@ -15,6 +15,10 @@
 // instead of passing). Every output row outside the bounds and every column past n_out must remain at its sentinel.
 // Results must be finite. The FP32 tensor-core sums use another order than the double reference: max |got - ref|
 // <= 2e-5 * (max |ref| of the matrix) + 1e-6.
+// With STRATA_PF_WMMA2=1 in the environment the same group shapes run against the opt-in IQ3_XXS / IQ3_S / IQ2_S
+// gate/up and IQ4_NL down tile (gemm_iq_f16_w2_kernel) as well, including its indirect table and its partial
+// 16-row tiles, and the odd-super-block-count IQ3_XXS / IQ3_S / IQ2_S rows (K = 3840) whose last raw word is only
+// two bytes long; the ctest `pf_wmma2_parity` is this binary with that variable set.
 //
 // --bench: the model's shapes (IQ3_XXS, IQ3_S and IQ2_S gate/up 1280 x 2560, IQ4_NL down 2560 x 640), 64 experts of 2,
 // 64, 128 and 256 rows each - a short group, a moderate one, the short-row dispatch limit, and a wide group.
@@ -120,7 +124,10 @@ int run(int ty, int n_out, int K, std::mt19937& rng, bool use_ids, bool down, bo
     for (int r = 0; r < total; ++r) ids[(size_t) r] = use_ids ? pick(rng) : r;
     std::vector<float> yh((size_t) yrows * ldy, SENT);
     uint8_t* dw; __half* dx; int32_t* db; int32_t* dids; float* dy; uint16_t* dq;
-    ck(cudaMalloc(&dw, w.size() + 4096), "w");
+    // exactly the experts' bytes, no slack: a kernel that read past the last matrix (the W2 tile's raw word at
+    // the end of an IQ2_S row with an odd super-block count) has nothing to land in (compute-sanitizer flags it,
+    // and the sentinels catch a write into the guard rows)
+    ck(cudaMalloc(&dw, w.size()), "w");
     ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "w");
     ck(cudaMalloc(&dx, x.size() * 2), "x");
     ck(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "x");
@@ -229,9 +236,10 @@ int bench_shape(const BenchShape& c, std::mt19937& rng, cudaStream_t s, cudaEven
         for (int e = 0; e <= E; ++e) bounds[e] = e * rows;
         ck(cudaMemcpy(db, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice), "b");
         ck(cudaMemcpy(dy, yh.data(), yh.size() * 4, cudaMemcpyHostToDevice), "y");
-        // the direct path: contiguous weights, no ids gather, no by-value table (down is then unused)
+        // the direct path: contiguous weights, no ids gather, no by-value table; the IQ4_NL shape is the down
+        // product (down only selects the indirect table's half, so the generic tiles are unchanged by it)
         if (!k::gemm_iq_f16_grouped(c.ty, dw, eb, c.n_out, c.K, dx, ldx, db, E, rows, dy, ldy, s, nullptr, nullptr,
-                                    false)) {
+                                    c.ty == 20)) {
             std::printf("%-15s %5d x %4d, %d rows: not launched\n", c.what, c.n_out, c.K, rows);
             ++fails;
             continue;
@@ -273,7 +281,8 @@ int bench_shape(const BenchShape& c, std::mt19937& rng, cudaStream_t s, cudaEven
         cudaGraphExec_t ge;
         ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
         for (int i = 0; i < kBenchRep; ++i)
-            k::gemm_iq_f16_grouped(c.ty, dw, eb, c.n_out, c.K, dx, ldx, db, E, rows, dy, ldy, s, nullptr, nullptr, false);
+            k::gemm_iq_f16_grouped(c.ty, dw, eb, c.n_out, c.K, dx, ldx, db, E, rows, dy, ldy, s, nullptr, nullptr,
+                                   c.ty == 20);
         ck(cudaStreamEndCapture(s, &g), "capture");
         ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
         ck(cudaGraphDestroy(g), "graph");
@@ -320,8 +329,9 @@ int bench(std::mt19937& rng) {
 
 int main(int argc, char** argv) {
     const bool do_bench = argc == 2 && std::strcmp(argv[1], "--bench") == 0;
-    if (argc > 2 || (argc == 2 && !do_bench)) {
-        std::fprintf(stderr, "usage: pf_wmma_parity [--bench]\n");
+    const bool wmma2_only = argc == 2 && std::strcmp(argv[1], "--wmma2") == 0;
+    if (argc > 2 || (argc == 2 && !do_bench && !wmma2_only)) {
+        std::fprintf(stderr, "usage: pf_wmma_parity [--bench|--wmma2]\n");
         return 2;
     }
     int dev = 0, major = 0;
@@ -336,24 +346,38 @@ int main(int argc, char** argv) {
     }
     int fails = 0;
     for (int ty : {18, 21, 22, 23, 16, 29}) {
+        if (wmma2_only && ty != 18 && ty != 21 && ty != 22) continue;
         fails += run(ty, 1280, 2560, rng, false, false);
         fails += run(ty, 1280, 2560, rng, true, false);
     }
     for (int ty : {20, 42}) {
-        fails += run(ty, 2560, 640, rng, false, false);
-        fails += run(ty, 2560, 640, rng, true, false);
+        if (wmma2_only && ty != 20) continue;
+        if (!wmma2_only) {
+            fails += run(ty, 2560, 640, rng, false, false);
+            fails += run(ty, 2560, 640, rng, true, false);
+        }
+        // the prompt path's down launch, contiguous experts: the WMMA2 tile's wsrc == 0 direction (IQ4_NL)
+        if (ty == 20) fails += run(ty, 2560, 640, rng, false, true);
         fails += run(ty, 2560, 640, rng, true, true);   // the prompt path's down launch: the table's dn half
     }
     // the gate/up formats most of the pack's experts use, over the same short-row bounds (direct and ids/table gu)
-    for (int ty : {18, 22}) {
+    for (int ty : {18, 21, 22}) {
         fails += run(ty, 1280, 2560, rng, false, false, true);
         fails += run(ty, 1280, 2560, rng, true, false, true);
     }
-    fails += run(21, 1280, 2560, rng, false, false, true);
-    fails += run(21, 1280, 2560, rng, true, false, true);
-    fails += run(20, 2560, 640, rng, false, false, true);
-    fails += run(20, 2560, 640, rng, true, false, true);
-    fails += run(20, 2560, 640, rng, true, true, true);
+    // IQ3_XXS / IQ3_S / IQ2_S with an odd number of 98-, 110- and 82-byte super-blocks per row (K = 15 x 256):
+    // the rows are 2-byte aligned only and the last raw stage is two bytes long, which the W2 tile's bounded load
+    // must read without leaving the row (STRATA_PF_WMMA2=1 runs these on that tile, the default on the generic
+    // one).  Short bounds keep the double reference cheap; both the direct and the ids/table path.
+    for (int ty : {18, 21, 22}) {
+        fails += run(ty, 1280, 3840, rng, false, false, true);
+        fails += run(ty, 1280, 3840, rng, true, false, true);
+    }
+    if (!wmma2_only) {
+        fails += run(20, 2560, 640, rng, false, false, true);
+        fails += run(20, 2560, 640, rng, true, false, true);
+        fails += run(20, 2560, 640, rng, true, true, true);
+    }
     std::printf("pf_wmma_parity: %d failures\n", fails);
     return fails ? 1 : 0;
 }

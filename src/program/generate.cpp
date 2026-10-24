@@ -17,6 +17,7 @@
 
 #include "strata/platform/memory.hpp"
 #include "strata/core/arch_defaults.hpp"
+#include "strata/core/adapt_budget.hpp"
 #include "strata/core/nv_defaults.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/batch_telemetry.hpp"
@@ -651,7 +652,7 @@ struct Options {
     int vram_reserve_later_mib = -1;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
-    /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  A chunk of
+    /// `--prefill auto`: the largest chunk up to the selected ceiling whose buffers the expert cache can lend. A chunk of
     /// stream_all_min tokens or more (1024 by default) streams every expert the GPU does not hold once, routed or not
     /// (a smaller one only the experts it routes to), so a bigger chunk streams fewer bytes per token (the "ubatch"
     /// effect).
@@ -661,9 +662,10 @@ struct Options {
     int64_t prefill_auto_max = 8192;
     /// #1630: a bare `--prefill auto` stops here on a Windows HIP build (0: no cap). A chunk the user names is not capped.
     int64_t prefill_auto_cap = 0;
-    /// a bare `--prefill auto` (no ":N", no STRATA_PREFILL_AUTO_MAX): the gfx12 Linux rule below may raise its ceiling
+    /// A bare `--prefill auto` permits the architecture-specific ceiling rules below.
     bool prefill_auto_bare = false;
     bool prefill_gfx12_16k = false;   ///< the gfx12 default raised the auto chunk ceiling to 16384 (a layer split takes 8192 back, 0.1.44)
+    bool prefill_sm70_16k = false;    ///< the sm_70 rule raised a bare auto's ceiling to 16384 (one GPU, native pack, RAM enough)
     /// --prefill-pipe (opt-in): a layer split's prompt chunks sized for its pipeline (Prefill::pipeline_chunk): 0 off,
     /// 1 today's chunk count evened out, a number > 1 the rig's b/a in tokens (setup's --calibrate measures it).
     /// < 0: not given - STRATA_PREFILL_PIPE, else off.
@@ -715,7 +717,9 @@ struct Options {
     double pcie_probe_gbps = 0.0;    ///< the start-up probe's reading (for PcieAuto)
     std::string pcie_mode = "auto";   ///< auto | dma | kernel | direct
     /// Plan v0.3 P6: every `adapt_every` rounds, swap up to `adapt_swaps` of the most-routed missing experts into
-    /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.
+    /// the VRAM tier in place of the least-routed resident ones (decayed counts).  0 = static residency.  Without
+    /// --adapt-swaps, an overlapped round's count follows the recent verify window instead (96..384,
+    /// include/strata/core/adapt_budget.hpp).
     int adapt_every = 4;
     float adapt_decay = 0.7f;   ///< the usage counts are multiplied by this after each adaptation (--adapt-decay)
     /// an expert is swapped into the VRAM tier only when its decayed routing count beats the one it replaces by more than
@@ -747,6 +751,9 @@ struct Options {
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
+    /// --adapt-swaps on the command line: the count is the operator's and stays fixed (the implicit count of an
+    /// overlapped round never overrides it, 0 included)
+    bool adapt_swaps_given = false;
     /// --serve: bound ordinary recurrent checkpoints in the active window and each parked archive.
     /// Each state needs about 118 MB of host RAM. Archives keep sparse prefix anchors, not one state per turn.
     /// Explicit pins remain protected. Matching requests replay only the suffix after a retained anchor.
@@ -2182,6 +2189,23 @@ static bool pcie_auto_split_ok() {
 #endif
 }
 
+/// The primary card is Volta (compute capability 7.0).  The same rule nv_defaults.cpp applies by architecture, for the
+/// settings that live in code rather than in that table (a bare `--prefill auto`'s ceiling).  False on every other
+/// build, and on a card whose compute capability the user emulates to something else.
+static bool nv_arch_sm70() {
+#if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL)
+    return false;
+#else
+    int dev = 0;
+    cudaDeviceProp p{};
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return strata::cc_major_of(p.major) == 7 && strata::cc_minor_of(p.minor) == 0;
+#endif
+}
+
 /// 0.1.44: the pipelined decode puts the drafter on the first stage's card by default where it was measured (gfx12; the HIP builds
 /// only).  STRATA_MTP_STAGE0=0 / 1 decides either way.
 [[maybe_unused]] static bool mtp_first_default_on() {
@@ -2876,7 +2900,7 @@ int main(int argc, char** argv) {
             if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { std::fprintf(stderr, "--eos-ids: %s\n", e.c_str()); return 2; }
             o.stop_eos = true;
         }
-        else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
+        else if (a == "--adapt-swaps") { o.adapt_swaps = std::atoi(next("--adapt-swaps")); o.adapt_swaps_given = true; }
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device"));
@@ -3695,6 +3719,24 @@ int main(int argc, char** argv) {
         } else {
             o.pcie_frac = base;
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
+        }
+    }
+    // The adaptive overlap's implicit copy count (STRATA_ADAPT_OVERLAP without --adapt-swaps) sizes its round from
+    // the measured host->device rate.  The probe above runs only when the automatic PCIe share is on, and an explicit
+    // --pcie-frac turns that off, so take the same measurement here when the overlap will need it: before the VRAM
+    // plan, and with the probe's own buffers released, exactly as above.  No reading: the count keeps its default.
+    if (o.serve && adapt_overlap() && !o.adapt_swaps_given && !multi_gpu && o.layer_split.empty() &&
+        !(o.pcie_probe_gbps > 0.0)) {
+        if (g_last_h2d_gbps > 0.0) {
+            o.pcie_probe_gbps = g_last_h2d_gbps;
+        } else {
+            std::string bursts;
+            o.pcie_probe_gbps = probe_pcie_h2d_gbps(&bursts);
+            if (o.pcie_probe_gbps > 0.0)
+                std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s); the adaptive "
+                                     "overlap's copy budget\n", o.pcie_probe_gbps, bursts.c_str());
+            else
+                (void) cudaGetLastError();
         }
     }
     // STRATA_PCIE_BALANCE=1 (opt-in): each verify layer's PCIe count from measured costs (Verifier::set_pcie_balance)
@@ -6095,7 +6137,46 @@ int main(int argc, char** argv) {
                  : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
     }();
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the
-    // context, but a bare `auto` always reaches 8192.  32768 and 16384 stay opt-in (#282).
+    // context.  A bare `auto` reaches 8192; 32768 and 16384 stay opt-in (#282), except on one Volta card whose
+    // experts are a native pack held whole in RAM (the raise below).
+    //
+    // One Volta card and a native pack with its arena loaded whole in RAM: a bare
+    // `--prefill auto` may take 16384-token chunks.  The startup plan below prices those buffers against VRAM with
+    // the same loan cap and 128-slot floor, so this test covers the RAM side only: a 16384-token loan holds about
+    // twice the slots of 8192 and every lent slot's expert is read from RAM while the prompt runs.  The margin
+    // (6 GiB) and the reading are #2090's; without a reading the ceiling stays 8192.  A layer split keeps 8192 (two
+    // cards read a 32K prompt slower in 16384-token chunks), an explicit --prefill N, auto:N or
+    // STRATA_PREFILL_AUTO_MAX is never touched, and STRATA_SM70_CHUNK=0 keeps 8192 (STRATA_SM70_CHUNK=1 takes
+    // 16384 even when the free RAM would keep 8192).
+    const char* sm70_arena_map = std::getenv("STRATA_ARENA_MMAP");
+    const bool sm70_ram_arena = srcp == &arena_src && o.shared_expert_arena.empty() &&
+                               !(sm70_arena_map != nullptr && sm70_arena_map[0] == '1');
+    // Mapped/shared arenas and resident complements can read lent experts from files. Keep their old ceiling.
+    if (o.prefill_auto_bare && native_pack && !multi_gpu && o.layer_split.empty() && nv_arch_sm70() &&
+        o.prefill_auto_cap == 0 && sm70_ram_arena) {
+        const char* sm70_chunk = std::getenv("STRATA_SM70_CHUNK");
+        const bool force16 = sm70_chunk != nullptr && sm70_chunk[0] == '1';
+        const bool keep8k = sm70_chunk != nullptr && sm70_chunk[0] == '0';
+        if (!keep8k) {
+            const uint64_t need16 = strata::prefill::Prefill::bytes_needed(g, ss, 16384, -1, srcp != nullptr);
+            const uint64_t need8 = strata::prefill::Prefill::bytes_needed(g, ss, 8192, -1, srcp != nullptr);
+            const uint64_t extra_mib = (need16 > need8 ? need16 - need8 : 0) >> 20;
+            const auto hm = strata::core::sample_host_memory();   // the cgroup / --memory-limit-mib cap counts too
+            const uint64_t avail_mib = hm ? hm->available >> 20 : mem_sample().avail_mib;
+            if (force16 || (avail_mib > 0 && avail_mib >= extra_mib + 6144)) {
+                o.prefill_auto_max = 16384;
+                o.prefill_chunk = 16384;
+                o.prefill_sm70_16k = true;
+                std::fprintf(stderr, "strata generate: sm_70: --prefill auto may take chunks up to 16384 on this "
+                                     "one-GPU native pack (STRATA_SM70_CHUNK=0 keeps 8192)\n");
+            } else if (avail_mib > 0) {
+                std::fprintf(stderr, "strata generate: sm_70: prompt chunks stay at 8192: 16384 would lend %llu MiB "
+                                     "more cache slots to the prompt, and %llu MiB of RAM is available for that plus "
+                                     "6 GiB (#2090; STRATA_SM70_CHUNK=1 takes 16384 anyway)\n",
+                             (unsigned long long) extra_mib, (unsigned long long) avail_mib);
+            }
+        }
+    }
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
 
     // ---- #765: ONE startup VRAM plan, decided before the elastic expert residency is committed.  The prompt
@@ -7767,15 +7848,17 @@ int main(int argc, char** argv) {
             o.prefill_chunk = std::min<int64_t>(o.prefill_chunk, 8192);
         }
     }
-    // #2090 (bdwilton): the gfx12 16384 ceiling lends the prompt path about twice the slots of 8192 (R9700, Swift 1.5
+    // #2090 (bdwilton): a 16384 ceiling lends the prompt path about twice the slots of 8192 (R9700, Swift 1.5
     // IQ3_XXS: 3,907 slots / 6.38 GiB against 2,068 / 3.37 GiB), and every lent slot's expert is read from the RAM side
     // during the read.  On a 30 GB PC with --resident-experts that was 3.4 GB available, 20 GB in swap, 1.5M major faults
     // and a killed engine on 38-47K prompts; 8192 ran them at 95 tok/s.  The ceiling is the engine's default, not the
     // user's pick, so when the RAM available now does not cover the extra loan plus 6 GiB (that PC thrashed with 3.4 GB left and
-    // ran with ~6.4) the default stays at 8192.
-    // STRATA_GFX12_CHUNK=1 keeps 16384 anyway.
-    if (o.prefill_gfx12_16k && auto_ceiling > 8192) {
-        static const char* force16 = std::getenv("STRATA_GFX12_CHUNK");
+    // ran with ~6.4) the default stays at 8192.  The same test covers the sm_70 one-GPU rule (which took its reading
+    // before the plan too; here the cache is known, so the resident RAM copy's experts are priced as well).
+    // STRATA_GFX12_CHUNK=1 / STRATA_SM70_CHUNK=1 keeps 16384 anyway.
+    if ((o.prefill_gfx12_16k || o.prefill_sm70_16k) && auto_ceiling > 8192) {
+        const char* force16 = std::getenv(o.prefill_gfx12_16k ? "STRATA_GFX12_CHUNK" : "STRATA_SM70_CHUNK");
+        const char* arch = o.prefill_gfx12_16k ? "gfx12" : "sm_70";
         const int64_t extra_slots = std::max<int64_t>(0, lend_slots(16384) - lend_slots(8192));
         const uint64_t extra_mib = ((uint64_t) extra_slots * strata::kernels::cpu::expert_layout().max_blob) >> 20;
         const auto hm = strata::core::sample_host_memory();   // the cgroup / --memory-limit-mib cap counts too
@@ -7793,11 +7876,11 @@ int main(int argc, char** argv) {
             auto_ceiling = std::min<int64_t>(auto_ceiling, 8192);
             o.prefill_auto_max = std::min<int64_t>(o.prefill_auto_max, 8192);
             o.prefill_chunk = std::min<int64_t>(o.prefill_chunk, 8192);
-            std::fprintf(stderr, "strata generate: gfx12: prompt chunks stay at 8192: 16384 would lend %lld more cache slots "
+            std::fprintf(stderr, "strata generate: %s: prompt chunks stay at 8192: 16384 would lend %lld more cache slots "
                                  "(%llu MiB more held in RAM during a prompt), and %llu MiB of RAM is available for %llu MiB "
-                                 "of resident experts plus that (#2090; STRATA_GFX12_CHUNK=1 takes 16384 anyway)\n",
-                         (long long) extra_slots, (unsigned long long) extra_mib, (unsigned long long) avail_mib,
-                         (unsigned long long) pin_mib);
+                                 "of resident experts plus that (#2090; %s=1 takes 16384 anyway)\n",
+                         arch, (long long) extra_slots, (unsigned long long) extra_mib, (unsigned long long) avail_mib,
+                         (unsigned long long) pin_mib, o.prefill_gfx12_16k ? "STRATA_GFX12_CHUNK" : "STRATA_SM70_CHUNK");
         }
     }
     if (o.prefill_auto_cap > 0) auto_ceiling = std::min<int64_t>(auto_ceiling, o.prefill_auto_cap);   // #1630
@@ -11143,12 +11226,22 @@ int main(int argc, char** argv) {
             aov = aov_why == nullptr;
             if (aov)
                 std::fprintf(stderr, "strata serve: adaptive overlap (STRATA_ADAPT_OVERLAP=0 turns it off): the adaptive tier's copies land while the next window runs "
-                                     "(same tokens, a layer waits for its own copies)\n");
+                                     "(each layer waits for its own copies)\n");
             else if (std::getenv("STRATA_ADAPT_OVERLAP") != nullptr)   // the env var was set: say what stopped it
                 std::fprintf(stderr, "strata serve: STRATA_ADAPT_OVERLAP=1 is off: %s\n", aov_why);
         } else
             std::fprintf(stderr, "strata serve: adaptive overlap: off%s%s\n",
                          aov_why ? ": " : " (STRATA_ADAPT_OVERLAP=1 turns it on)", aov_why ? aov_why : "");
+        // The implicit adaptive copy count keeps the legacy minimum of 96. Larger prefixes must fit half of the
+        // recent verify work time at the measured host->device rate, up to 384 swaps. Only this normal serial
+        // single-GPU path is eligible. A batch, helper cache, --adapt-async, --pipeline-windows, resident RAM source
+        // or explicit --adapt-swaps keeps its fixed count. Exclude the gate wait from the measured work time.
+        strata::core::AdaptCopyBudget abudget;
+        abudget.on = aov && !o.adapt_swaps_given && o.batch <= 0 && drive.d.remote_count == 0 && !src.complement_ready();
+        abudget.link_gbps = o.pcie_probe_gbps;
+        if (abudget.on)
+            std::fprintf(stderr, "strata serve: adaptive overlap: the swaps per round follow the window (96..384; "
+                                 "--adapt-swaps N fixes them)\n");
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
         auto res_upload = [&]() -> cudaError_t {   // the first error, every table tried
             cudaError_t r = d_res != nullptr ? res_put(d_res) : cudaSuccess;
@@ -11318,7 +11411,15 @@ int main(int argc, char** argv) {
                 }
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
-            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            // --adapt-swaps N: the operator's fixed count.  Without it, an overlapped round takes as many of the
+            // best swaps as half of the recent verify window affords at the measured link rate (96..384): the copies
+            // land under the next window, so that window is what hides them.  Not on any other mode (abudget.on).
+            const int64_t swap_limit =
+                abudget.on ? abudget.count((int64_t) swaps.size(), [&](int64_t i) {
+                    return (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(swaps[(size_t) i].layer);
+                })
+                           : (int64_t) o.adapt_swaps;
+            if ((int64_t) swaps.size() > swap_limit) swaps.resize((size_t) swap_limit);
             if (aov) {   // 0.1.43: the copies go in layer order and each layer's landing is told to the verify window
                 std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.layer < b.layer; });
                 agate.landed.store(-1, std::memory_order_release);
@@ -16954,6 +17055,7 @@ int main(int argc, char** argv) {
                 }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
+                const double budget_gate_start = abudget.on ? ver.ms_gate : 0.0;
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
@@ -16996,6 +17098,13 @@ int main(int argc, char** argv) {
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
                 }
                 const Clock::time_point tw1 = Clock::now();
+                // The implicit adaptive copy count reads this window: its verify time without the overlap gate's
+                // wait (the copies'), so a round that made the window wait cannot enlarge the next round.  The first
+                // window can be a merged one (prompt tokens) and is left out.
+                if (abudget.on && !first_window) {
+                    abudget.observe(std::chrono::duration<double, std::milli>(tw1 - tw0).count() -
+                                    (ver.ms_gate - budget_gate_start));
+                }
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)

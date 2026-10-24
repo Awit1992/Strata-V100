@@ -138,7 +138,8 @@ REQUIRED_ENV = {"STRATA_EXPERT_PAIR": "1"}
 # The user service's Environment= lines (runtime consistency; overridable with --env).
 SERVICE_ENV = {"STRATA_ARENA_LOCK": "0", "STRATA_WATCHDOG_S": "300"}
 # A/B diagnostic knobs that must never leak into a clean timing arm.
-DIAGNOSTIC_ENV = ("STRATA_PREFILL_TIMING", "STRATA_TRACE", "STRATA_DECODE_TIMING", "STRATA_SPLIT_TIMING")
+DIAGNOSTIC_ENV = ("STRATA_PREFILL_TIMING", "STRATA_TRACE", "STRATA_DECODE_TIMING", "STRATA_SPLIT_TIMING",
+                  "STRATA_VERIFY_PROFILE")
 
 NVIDIA_FIELDS = (
     "index", "temperature.gpu", "clocks.current.sm", "power.draw", "enforced.power.limit",

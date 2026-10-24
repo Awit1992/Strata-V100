@@ -1,0 +1,58 @@
+[
+  {
+    "case": "before-overlap",
+    "control": "fixed-share-control",
+    "candidate": "fixed-share-mixer",
+    "identical": false,
+    "windows": 64,
+    "control_sha256": "2de810c7e60808eacafb256b5bea18823b0b9c03af23bbbd2af3775ff43e8b6a",
+    "candidate_sha256": "2521b838497ec9a8eb5503babc478f3e7405fec4b42b551e8908c801ff6a36e9",
+    "first_different_window": 33,
+    "first_different_position": 2080
+  },
+  {
+    "case": "control-repeat",
+    "control": "fixed-share-control",
+    "candidate": "fixed-share-control-repeat",
+    "identical": true,
+    "windows": 64,
+    "control_sha256": "2de810c7e60808eacafb256b5bea18823b0b9c03af23bbbd2af3775ff43e8b6a",
+    "candidate_sha256": "2de810c7e60808eacafb256b5bea18823b0b9c03af23bbbd2af3775ff43e8b6a"
+  },
+  {
+    "case": "corrected-mode-1",
+    "control": "fixed-share-control",
+    "candidate": "corrected-mixer-one",
+    "identical": true,
+    "windows": 64,
+    "control_sha256": "2de810c7e60808eacafb256b5bea18823b0b9c03af23bbbd2af3775ff43e8b6a",
+    "candidate_sha256": "2de810c7e60808eacafb256b5bea18823b0b9c03af23bbbd2af3775ff43e8b6a"
+  },
+  {
+    "case": "corrected-mode-2",
+    "control": "fixed-share-control",
+    "candidate": "corrected-mixer-two",
+    "identical": true,
+    "windows": 64,
+    "control_sha256": "2de810c7e60808eacafb256b5bea18823b0b9c03af23bbbd2af3775ff43e8b6a",
+    "candidate_sha256": "2de810c7e60808eacafb256b5bea18823b0b9c03af23bbbd2af3775ff43e8b6a"
+  },
+  {
+    "case": "final-T8-default",
+    "control": "final-t8-control",
+    "candidate": "final-t8-default",
+    "identical": true,
+    "windows": 64,
+    "control_sha256": "2f1dbb5f95fa71c35283c0c5965ad90fbc93e6149d9475faa865ba76f01c48fa",
+    "candidate_sha256": "2f1dbb5f95fa71c35283c0c5965ad90fbc93e6149d9475faa865ba76f01c48fa"
+  },
+  {
+    "case": "final-T2-default",
+    "control": "final-t2-control",
+    "candidate": "final-t2-default",
+    "identical": true,
+    "windows": 128,
+    "control_sha256": "5660c14c415e771e145ad0cf408c05b6a4a94ba7b1085afd3144df124c50a5f9",
+    "candidate_sha256": "5660c14c415e771e145ad0cf408c05b6a4a94ba7b1085afd3144df124c50a5f9"
+  }
+]

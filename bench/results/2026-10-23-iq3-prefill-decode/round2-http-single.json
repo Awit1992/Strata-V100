@@ -1,0 +1,60 @@
+{
+  "topology": "single",
+  "candidate_sha256": "add55d48a3ace40ed206843f09fed856b4ba6ea9edde10a2cfef9737c6167e2b",
+  "loaded": true,
+  "context": 524288,
+  "cases": [
+    {
+      "case": "ready",
+      "answer": "READY",
+      "usage": {
+        "prompt_tokens": 57,
+        "completion_tokens": 27,
+        "total_tokens": 84,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "passed": true
+    },
+    {
+      "case": "arithmetic",
+      "answer": "42",
+      "usage": {
+        "prompt_tokens": 68,
+        "completion_tokens": 49,
+        "total_tokens": 117,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "passed": true
+    },
+    {
+      "case": "json",
+      "answer": "{\"status\":\"ok\",\"count\":3}",
+      "usage": {
+        "prompt_tokens": 66,
+        "completion_tokens": 46,
+        "total_tokens": 112,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "passed": true
+    },
+    {
+      "case": "natural",
+      "answer": "Boiling water forms bubbles because, at its boiling point, water turns into vapor inside the liquid and rises as gas pockets.",
+      "usage": {
+        "prompt_tokens": 63,
+        "completion_tokens": 81,
+        "total_tokens": 144,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "passed": true
+    }
+  ]
+}

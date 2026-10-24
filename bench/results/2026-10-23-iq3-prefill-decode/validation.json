@@ -1,0 +1,27 @@
+{
+  "regular_iq3_s_only": true,
+  "model_quantization_changed": false,
+  "kv_format": "int8",
+  "logical_context_cells": 524288,
+  "initial_kv_cells": 16384,
+  "final_build_sha256": "68a139bda79240c930c69c1612f73e597c12f64493ffeb01c99d9eefa354d919",
+  "ctest_final_passed": [
+    "verify_parity",
+    "native_multi_parity",
+    "fusions_parity",
+    "qsa_parity",
+    "nv_defaults_test"
+  ],
+  "wmma2_memcheck": {
+    "command": "STRATA_PF_WMMA2=1 compute-sanitizer --tool memcheck --error-exitcode 99 pf_wmma_parity --wmma2",
+    "numerical_failures": 0,
+    "memory_errors": 0
+  },
+  "benchmark_harness_unit_tests_passed": 46,
+  "http_quality_checks_passed": 8,
+  "quality_topologies": [
+    "single-GPU",
+    "two-GPU layer split"
+  ],
+  "architecture_defaults_changed": false
+}

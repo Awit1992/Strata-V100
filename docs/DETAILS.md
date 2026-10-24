@@ -2567,8 +2567,9 @@ stream, beside the expert GEMMs. A layer that sends no expert to the CPU copies 
 now taken for the share the layer has, not for the chunk's worst case. The CPU quantizes the same FP32 row bytes.
 Automatic sharing still depends on timings. Identical model answers are not guaranteed.
 
-**Short-row Volta expert GEMM.** With `STRATA_PF_WMMA=1`, IQ3_XXS, IQ3_S, and IQ2_S gate/up
-and IQ4_NL down use a compact tile when the largest expert in the group has at most 128 rows.
+**First Volta expert GEMM tile.** When the second tile does not select a launch,
+`STRATA_PF_WMMA=1` uses a compact tile for IQ3_XXS, IQ3_S, and IQ2_S gate/up and IQ4_NL down
+when the largest expert in the group has at most 128 rows.
 The tile uses 128-value weight chunks and two 64-row output tiles. IQ3_XXS, IQ3_S, and IQ4_NL
 use 64-value activation chunks and 44,032 bytes of dynamic shared memory. Static shared storage
 adds 1,024, 2,048, and 16 bytes respectively. IQ2_S uses 32-value activation chunks and 39,936
@@ -2576,6 +2577,19 @@ bytes of dynamic shared memory. Its codebook adds 8,192 bytes. Each total fits t
 budget for two blocks on one V100 SM. The short kernels have a 128-register limit per thread.
 Larger groups keep the original 256-row output tile to avoid extra weight decoding. Q2_0 and
 the other quantized formats keep their existing tile selection.
+
+**Prefetched Volta expert GEMM tile.** The sm_70 defaults enable `STRATA_PF_WMMA2`.
+It supports IQ3_XXS, IQ3_S, and IQ2_S gate/up and IQ4_NL down.
+It reads the same stored weight blocks through contiguous or indirect weight pointers.
+It also supports gathered input rows.
+Groups with at least 128 rows in their largest expert use a 128-token by 64-output tile.
+Shorter groups use a 64-token by 128-output tile.
+Both orientations use the same FP16 operand decode and FP32 accumulation order.
+All variants fit the 48 KiB static shared-memory limit.
+Set `STRATA_PF_WMMA2_N64=0` to retain the 64-token orientation.
+Set it to `1` to force the 128-token orientation.
+Set `STRATA_PF_WMMA2=0` to use only the first tile.
+Unsupported types, directions, shapes, and alignments keep the first tile.
 
 Use `pf_wmma_parity` to check short and wide groups, sparse input-row indices, indirect weights,
 and output guards. Use `pf_wmma_parity --bench` on an idle GPU to measure validated IQ3_XXS,
@@ -2768,19 +2782,30 @@ the pairs in which the switched arm won). They are here so you can try them on y
   (PCIe 3.0 x16) +3.5% (6/6 pairs faster), RTX 5070 +0.2% (4/6), RTX 3060 -1.3% (0/6), so it stays opt-in.
   Where the tier does not wait for its copies (`STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG` above 1) the device's residency table now follows each eviction before the next window (a small patch kernel before every verifier launch; #1517 by sergiywith): before, the pool could compute an evicted expert on the CPU from a stale activation (`STRATA_ADAPT_CHECKRES=1` counts such layers; `STRATA_ADAPT_EVICT_SYNC=0` turns the fix off). The default (the tier waits) is untouched.
 - **`STRATA_ADAPT_OVERLAP` (`=1` turns it on, on every backend; the startup log names the state and, when it cannot run, why): the adaptive tier's copies land while the next
-  window runs, with the same tokens.** The window takes the swaps at the same moment as with #463's wait (so the same experts run
+  window runs.** With a fixed swap schedule, the window takes the swaps at the same moment as with #463's wait (so the same experts run
   on the GPU and the CPU in every window), but the copies go in layer order and the verify window holds a layer's plan back
   until that layer's copies have landed, instead of the whole window waiting for the round (about 10 ms every fourth window on
   an A4000, PCIe 3.0 x16). One GPU, the whole arena in RAM, no `--adapt-async`, `--pipeline-windows`, `STRATA_ADAPT_LAG`,
   `STRATA_ADAPT_NOWAIT` or `STRATA_DMA_BATCH`. A layer split (two or more GPUs) never runs it, in any version: the startup log says
   `off: not on a layer split` (0.1.43 printed that line only when the variable was set, and ran without the overlap on a split just the
   same, so 0.1.43.1's opt-in default changes nothing there; measured on 2x A4000, #2281). On by default on CUDA on Linux since 0.1.43, opt-in on Windows and HIP;
-  opt-in on every backend since #2010, after an RTX 5090 Laptop lost 21% decode with it. What it is worth per box: an RTX A4000 (6
+  opt-in on every backend since #2010, after an RTX 5090 Laptop lost 21% decode with it (one Volta card is on by default again, see
+  the end of this entry). What it is worth per box: an RTX A4000 (6
   interleaved pairs each, decode median tok/s: Q2_0 16 GB 62.5 -> 66.2 (+5.9%), Q2_0 as a 12 GB card 51.3 -> 54.2 (+5.7%),
   IQ3_XXS 16 GB 48.6 -> 52.6 (+8.3%), IQ3_XXS as 12 GB 39.3 -> 41.5 (+5.5%), 6/6 pairs faster every time) and a Tesla P100
   (+4.4%) gain, but an RTX 5070 on Windows loses 2.6% on Q2_0 (IQ3_XXS no faster) and an RTX 5090 Laptop (WSL2, Core Ultra 9
   275HX, native IQ3_XXS pack, `--expert-cache-per-layer`) loses 21%: 84.6 vs 106.6 tok/s medians of 5 generations of 256
   tokens from one build, the slowest of the fast run above the fastest of the slow one (#2010).
+  **One Volta card on Linux CUDA: on by default** (`include/strata/core/nv_defaults.hpp`, `STRATA_SM70_PERF=0` or `STRATA_ADAPT_OVERLAP=0`
+  turns it off; a layer split still never runs it). Without `--adapt-swaps` the round's count follows the recent verify
+  window (`include/strata/core/adapt_budget.hpp`). Counts above the legacy minimum of 96 must fit half of that
+  window's work time at the measured host-to-device rate. The hard ceiling is 384. The time excludes the overlap
+  gate's wait, so a slow copy round cannot raise the budget that caused it. The budget runs only in the normal
+  serial single-GPU serve path. A batch window, a helper cache, a resident RAM source, `--adapt-async`,
+  `--pipeline-windows`, `STRATA_ADAPT_LAG`/`STRATA_ADAPT_NOWAIT` or an explicit `--adapt-swaps N` keeps the fixed count.
+  Without a valid measured rate or window the count stays 96, also when the measured budget is below that minimum.
+  The time-based count can change cache residency between runs. It does not guarantee identical token IDs.
+  An explicit `--adapt-swaps N` fixes the count; `0` disables the copies.
 - **`STRATA_ADAPT_CALLBACK_WARMUP` (Linux, on by default since 0.1.43.1; =0 turns it off): start the GPU host-callback thread before the CPU
   pool pins the host thread.** A callback thread created later can inherit the host's one-CPU affinity and compete
   with the verifier spinning for its signal (#1975). The warm-up runs and synchronizes one no-op host callback before
@@ -3103,6 +3128,17 @@ The prompt path's half-output buffer `bo` reuses the embedding buffer `emb`, whi
 
 **gfx12 (Linux): a bare `--prefill auto` may take 16384-token chunks.** Explicit `--prefill N`, `auto:N` and `STRATA_PREFILL_AUTO_MAX` are untouched; `STRATA_GFX12_CHUNK=0` or `STRATA_GFX12_DEFAULTS=0` keeps 8192.
 
+**sm_70: larger automatic prompt chunks on one Volta card.** A native pack whose
+arena is loaded whole in RAM can use 16384-token chunks with bare `--prefill auto`.
+Mapped arenas, shared file-backed arenas, resident complements and layer splits
+keep the previous ceiling. The startup VRAM plan prices the buffers with the same
+loan cap and 128-slot floor. The rule keeps 8192 when the available RAM does not
+cover the larger loan plus 6 GiB. Explicit `--prefill N`, `auto:N` and
+`STRATA_PREFILL_AUTO_MAX` are not changed. `STRATA_SM70_CHUNK=0` keeps 8192;
+`STRATA_SM70_CHUNK=1` skips the RAM-headroom check in this eligible mode.
+A larger chunk changes the prompt path's rounding. Prompt residuals can differ
+from an 8192-token chunk.
+
 ### CUDA diagnostics: a host thread for the verify-window launch
 
 `STRATA_VERIFY_ASYNC_LAUNCH=1` runs `Verifier::run`'s CUDA graph launch on a separate
@@ -3135,7 +3171,8 @@ engine reads its switches; a switch you set yourself, to anything, is kept):
 - sm_60 (Tesla P100): `STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`, `STRATA_SIDE_MIXER=2`, `STRATA_FUSE_WAIT=2`, `STRATA_B6_MMVQ_ROWS=1`,
   `STRATA_FUSE_DECODE=1`, `STRATA_GR_UP75=1`. `STRATA_SM60_PERF=0` turns the set off.
 
-The table is used when every visible card has that one compute capability. `STRATA_ADAPT_OVERLAP=1` (opt-in) does not run beside
+The table is used when every visible card has that one compute capability. `STRATA_ADAPT_OVERLAP` (on by default on sm_70,
+opt-in elsewhere) does not run beside
 `STRATA_ADAPT_LAG` / `STRATA_ADAPT_NOWAIT`: set `STRATA_ADAPT_LAG=1 STRATA_ADAPT_NOWAIT=0` with it. Left out because they did not pay or
 were mixed: `STRATA_EXPDEC`, `STRATA_GR_NORM_FAST`, `STRATA_RAM_ADAPT`, `STRATA_KV_HOST_REGISTER`, `STRATA_HOST_CORE`,
 `STRATA_GR_DOWN_TG`, `STRATA_DEQUANT_WIDE`; `STRATA_EXCHANGE_ROTATE` never reaches READY on the 3060 and `STRATA_PCIE_BALANCE` is slower on a
@@ -3153,7 +3190,8 @@ interleaved pairs of fresh engines, the same number of expert-cache slots in eve
 Two things looked at and **not changed**. A prompt chunk above 8192 (`--prefill auto:16384` or `auto:32768`) changes prompt speed by -3% to +8%
 on 12-16 GB cards at 20K tokens (at 16384 / 32768: RTX 3060 +4.5% / +4.5%, Tesla P100 +3.1% / +7.7%, RTX A4000 -3.4% / +6.0%), but it is not bit-exact on
 CUDA (the residual dump differs on the P100 and the A4000; 32768 also changed the output tokens on the P100), so the default
-stays 8192 on NVIDIA. It is exact on gfx12, where 16384 is the default. And `STRATA_ROUTE_PRIOR=0.5` stays opt-in: on an RTX 3060
+stays 8192 on NVIDIA, except for one Volta card whose native-pack experts are whole in RAM (the sm_70 rule above raises a bare
+`auto` to 16384; the same rounding caveat applies). It is exact on gfx12, where 16384 is the default. And `STRATA_ROUTE_PRIOR=0.5` stays opt-in: on an RTX 3060
 (IQ3_XXS) its teacher-forced KL is 0.0126 against a run-to-run floor of 0.0012 (top-1 agreement 96.6% against 99.1%); on an RTX A4000
 HumanEval scored 154/164 against 157 and 159 for the default twice, and reasoning 25/30 against 24 and 26 (agent 6/6, needles 3/3, CJK
 8/8 and tool calls 5/5 for all), which is inside the run-to-run spread.

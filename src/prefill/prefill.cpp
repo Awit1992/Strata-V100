@@ -5002,7 +5002,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     pt.mark(kPfGemmD, cs);
                                     const bool ok2 = strata::kernels::gemm_iq_f16_grouped(
                                         mmq_dt, m.grp_d, mmq_db, (int) N, 640, m.Hh + r0 * 640, 640, dnb, ngx, (int) maxr,
-                                        m.Dm + r0 * N, (int) N, m.cs);
+                                        m.Dm + r0 * N, (int) N, m.cs, nullptr, nullptr, true);
                                     if (!ok1 || !ok2) { err = "prefill: the WMMA expert tiles could not launch"; return false; }
                                     return true;
                                 }

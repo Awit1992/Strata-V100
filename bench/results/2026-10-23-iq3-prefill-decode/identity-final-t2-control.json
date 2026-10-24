@@ -1,0 +1,22 @@
+{
+  "label": "final-t2-control",
+  "returncode": 0,
+  "hashes": true,
+  "env": {
+    "STRATA_SM70_TABLE": "1",
+    "STRATA_DEQUANT_WIDE": "1",
+    "STRATA_KV_GROW": "1",
+    "STRATA_PF_WMMA": "1",
+    "STRATA_PF_SKIP_UNROUTED": "1",
+    "STRATA_ROUTE_RESIDENT": "0",
+    "STRATA_ROUTE_TAIL_SKIP": "0",
+    "STRATA_PREFILL_PROMOTE": "0",
+    "STRATA_SIDE_MIXER": "0"
+  },
+  "speculation": "speculation              128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round",
+  "follow": "follow                   12 of 128 emitted tokens differ from the argmax",
+  "verify": "verify window            wait for rings 14.816  pool 49.447  host 0.024  commit 0.019 ms/round; CPU experts 9.38 distinct / 9.85 routed per layer",
+  "pool": "pool multi               gate/up 34.342  quantize 0.176  down 14.605 ms/round; 18.7 GB/s over the rows phases; CPU pool call 49.433 ms/round",
+  "dispatch": "dispatch                 plan 0.109  activation quantize 0.144  jobs 0.038  run 49.134 ms/round",
+  "decode": "decode                   128 tokens in 8412.2 ms  ->  15.22 tok/s"
+}
