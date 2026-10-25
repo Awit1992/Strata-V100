@@ -50,6 +50,23 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             // STRATA_PF_WMMA=1 prompt path; every other format, direction, device or alignment keeps the first
             // tile.  STRATA_PF_WMMA2=0 keeps the first tile only.
             {"STRATA_PF_WMMA2", "1"},
+            // Upstream PR #3411 (koshikawa-masato), measured as a combined stack on dual V100 PCIe
+            // 32 GB IQ3_S/MTP4: the six-switch stack +5.8/+7.6% decode, the seven additions +4.7/+4.8%
+            // against that stack; ten decoded texts matched. This is combined-stack evidence, not the
+            // token-id gate above. On this fork's 2xV100 16 GB daily model an A/B/A/B/A/B with a
+            // restart before every measured request gave 83.1 vs 74.6 tok/s median (+11.4%). Explicit
+            // user settings and STRATA_SM70_PERF=0 still win.
+            {"STRATA_SIDE_MIXER", "2"},
+            {"STRATA_GR_UP75", "1"},
+            {"STRATA_B6_MMVQ_ROWS", "1"},
+            {"STRATA_GU_SWIGLU", "1"},
+            {"STRATA_QSA_ROWS", "1"},
+            {"STRATA_ATTN_DAILY", "1"},
+            {"STRATA_GR_NORM_FAST", "1"},
+            {"STRATA_ARGMAX_ROWS_SM70", "1"},
+            {"STRATA_QIL", "1"},
+            {"STRATA_EXPDEC", "1"},
+            {"STRATA_GR_DOWN_TG", "1"},
         };
     } else if (mj == 6 && mn == 0) {
         if (off("STRATA_SM60_PERF")) return t;

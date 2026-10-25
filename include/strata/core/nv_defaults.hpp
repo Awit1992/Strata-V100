@@ -12,6 +12,11 @@
 //   * STRATA_PF_WMMA2=1 selects the second prompt-expert tile inside the opt-in STRATA_PF_WMMA=1 path. It keeps
 //     FP16 operands and FP32 sums; a run without WMMA is unchanged.
 //
+// The other eleven sm_70 entries are a combined stack ported from upstream PR #3411 (koshikawa-masato):
+// dual V100 PCIe 32 GB IQ3_S/MTP4 measured +5.8/+7.6 % decode for the first six and +4.7/+4.8 % for the
+// seven additions, with ten decoded texts matching. That is combined-stack evidence, not the token-id gate
+// above. This fork's 2xV100 16 GB A/B/A/B/A/B measured 83.1 vs 74.6 tok/s median (+11.4 %).
+//
 //   STRATA_SM86_PERF=0   turns the sm_86 table off (cards of compute capability 8.6: RTX 3050-3090, RTX A2000-A6000)
 //   STRATA_SM70_PERF=0   turns the sm_70 table off (Volta: Tesla V100, Titan V)
 //   STRATA_SM60_PERF=0   turns the sm_60 table off (Pascal GP100: Tesla P100)
