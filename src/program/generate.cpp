@@ -63,6 +63,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tq.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
@@ -17391,7 +17392,12 @@ int main(int argc, char** argv) {
                 auto kv_arrays = [&](const strata::core::QsaState& st) {
                     const bool h = st.kv_mode != 0;
                     std::vector<std::pair<const void*, int64_t>> a;
-                    if (st.kv_q4) {
+                    if (st.kv_tq) {
+                        // TurboQuant is resident-only with no host copy (layer.cpp), so the VRAM arrays are the
+                        // authoritative ones at every mode.  Per-head bytes, like the other quantized arms.
+                        const int64_t tqb = (int64_t) strata::kernels::kv_tq_bytes_per_head(st.kv_tq_bits, (int) qs.head_dim);
+                        a = {{st.k_tq, tqb}, {st.v_tq, tqb}};
+                    } else if (st.kv_q4) {
                         const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q4 : st.k_q4, q4b}, {h ? st.host.v_q4 : st.v_q4, q4b}};
                     } else if (st.kv_hybrid) {

@@ -624,11 +624,23 @@ CUDA0 的长 prompt attention 阶段从 8,238–8,246 ms 降到 4,308/4,325 ms�
 等待也从 12,768–12,821 ms 降到 9,640/9,712 ms。tq6 各 arm 之间总 GPU 内存不变（15,618/15,608 MiB）。
 这些是有限测量，不是通用速度保证。报告里有 tq8 reader 测量和 qsa-attention 总计。
 
-GPU 对等检查对四种位宽都通过，包括因果尾部和打乱的页，Compute Sanitizer 零内存错误。两次实时 opt-in
-运行都通过四个 OpenAI 场景；Hermes 一次在 `list_jobs` 上失败、一次通过。因此质量对等未确立，这仍是
-opt-in。daily 服务保持 int8。CUDA 完整构建和 `kv_tq_parity` 通过。三个 HIP 内核翻译单元用 hipcc 7.2.4
-为 gfx1100 编译，但完整 HIP CMake 构建停在现有的 `CUDA::cudart` 引用（`CMakeLists.txt` 第 749 行），
-所以没有测量 HIP 运行。这里未安装 SYCL 编译器，SYCL 没有 TurboQuant 实现。其他 GPU 架构未测试。
+GPU 对等检查对四种位宽都通过，包括因果尾部和打乱的页，Compute Sanitizer 零内存错误。
+`conversation_snapshot_test` 通过 6,709 项检查，同样在 Compute Sanitizer 下零错误：每种位宽（3、4、6
+和 8 位）的真实状态分配、一次快照 A/B/A 往返、一次来自其他位宽的状态按载荷大小被拒绝，以及混合 INT8
+草稿层。两次实时 opt-in 运行都通过四个 OpenAI 场景；Hermes 一次在 `list_jobs` 上失败、一次通过。因此
+质量对等未确立，这仍是 opt-in。daily 服务保持 int8。CUDA 完整构建通过；仅 CPU 的完整构建通过：CTest
+55 个通过、4 个跳过（共 59 个）。完整 HIP 构建用 hipcc 7.2.4 为 gfx1100 构建通过，这仅是编译和
+链接检查：这里没有 AMD 设备，所以 `kv_tq_parity` 跳过、host 侧的 conversation validation 通过，
+也没有测量 HIP 运行。`kv_tq_parity` 在 CUDA 构建上通过；没有设备时它以退出码 77 结束，两个构建
+都记为跳过。HIP 构建需要四处构建修正：CMake 里用后端中立的 runtime 目标取代 `CUDA::cudart`、GEMM
+对等测试里用可移植的 `std::bit_cast` 读半精度位、测试参考臂陈旧的 warp 启动换成生产 scorer 的网格，
+以及按设备的 VMM 记录（设备 id 和分配粒度随 range 捕获；HIP 用 `hipMemCreate`/`hipMemMap`，
+`STRATA_HIP_VMM=0` 关闭）。
+十八个 CUDA 目标回归测试在在线 int8 服务占用显卡时运行：12 个通过，6 个因内存不足结束
+（`qsa_slots_parity`、`qsa_slots_parity_lanecell`、`qsa_merge_daily_parity_default`、
+`qsa_merge_daily_parity_daily`、`kv_stream_parity`、`kv_window_parity`）。这六个在分配内存时失败，
+无法据此判断是否存在回归，也不计为通过。这里未安装 SYCL 编译器，SYCL 没有 TurboQuant 实现（其独立的 SYCL 移植未改动），
+也没有 AMD 硬件可用于验证运行。其他 GPU 架构未测试。
 
 **可复现的贪心输出（0.1.30，需显式开启，`STRATA_IQ_MT_MIN=1`）：** 带 IQ 模型时，CPU 对单个
 token 用 ggml 的点积计算 expert、对多个 token 用 Strata 的多 token 内核，后者舍入略有不同。多

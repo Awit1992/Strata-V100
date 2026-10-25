@@ -2,6 +2,7 @@
 // invalid restores must return before the first CUDA call or destination write.
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tq.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -49,17 +50,20 @@ void check(bool ok, const char* label) {
 struct Pools {
     QsaState st;
     std::array<std::vector<uint8_t>, 8> data;
-    Pools(const ModelGeometry& g, int format) {
+    Pools(const ModelGeometry& g, int format, int bits = 0) {
         st.max_cells = 96; st.n_pages = st.n_slots = 24; st.idx_pooled_rows = 26;
         st.kv_int8 = format == 1; st.kv_q4 = format == 2;
-        const size_t per = format == 2 ? strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
-                                      : g.head_dim * (format == 1 ? 1 : 2);
+        st.kv_tq = format == 3; st.kv_tq_bits = st.kv_tq ? bits : 0; st.kv_rot = st.kv_tq;
+        const size_t per = format == 3 ? strata::kernels::kv_tq_bytes_per_head(bits, (int) g.head_dim)
+                          : format == 2 ? strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
+                                        : g.head_dim * (format == 1 ? 1 : 2);
         data[0].resize(96 * g.n_head_kv * per, 0xa5); data[1] = data[0];
         data[2].resize(format == 1 ? 96 * g.n_head_kv * (g.head_dim / 64) * 2 : 0, 0xa5); data[3] = data[2];
         data[4].resize(26 * g.idx_key_dim * 4, 0xa5);
         data[5].resize(3 * g.idx_key_dim * 4, 0xa5);
         data[6].resize(g.idx_key_dim * 4, 0xa5); data[7].resize(4, 0xa5);
-        if (format == 2) { st.k_q4 = data[0].data(); st.v_q4 = data[1].data(); }
+        if (format == 3) { st.k_tq = data[0].data(); st.v_tq = data[1].data(); }
+        else if (format == 2) { st.k_q4 = data[0].data(); st.v_q4 = data[1].data(); }
         else if (format == 1) {
             st.k_q = (int8_t*) data[0].data(); st.v_q = (int8_t*) data[1].data();
             st.k_scale = (uint16_t*) data[2].data(); st.v_scale = (uint16_t*) data[3].data();
@@ -69,7 +73,9 @@ struct Pools {
     }
     ConversationKv image(const ModelGeometry& g, bool index) const {
         ConversationKv k;
-        k.format = qsa_kv_format(st); k.cells = 12; k.page_size = 4;
+        // TurboQuant always rotates: its format tag is kKvTq (4) plus the +16 rotation marker = 20.
+        k.format = st.kv_tq ? 20 : qsa_kv_format(st);
+        k.cells = 12; k.page_size = 4;
         k.heads = g.n_head_kv; k.head_dim = g.head_dim; k.idx_dim = g.idx_key_dim;
         k.pooled_rows = index ? 3 : 0;
         k.k.resize(data[0].size() / 8, 13); k.v = k.k;
@@ -79,15 +85,15 @@ struct Pools {
     }
 };
 
-void fixture(int format, int experts, bool zero_qsa, bool ple) {
+void fixture(int format, int experts, bool zero_qsa, bool ple, int head_dim = 64, int bits = 0) {
     ModelGeometry g;
     g.n_layers = zero_qsa ? 3 : 8; g.n_expert = experts;
     g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
-    g.n_head_kv = 1; g.head_dim = 64; g.idx_key_dim = 8;
+    g.n_head_kv = 1; g.head_dim = head_dim; g.idx_key_dim = 8;
     std::string error;
     ConversationStateSizes z;
     check(conversation_state_sizes(g, z, error), "checked canonical/pruned/zero-QSA sizing");
-    Pools first(g, format), last(g, format), draft(g, format);
+    Pools first(g, format, bits), last(g, format, bits), draft(g, format, bits);
     std::array<QsaState, 2> layers{first.st, last.st};
     std::vector<uint8_t> gdn(z.gdn, 0xa5), history(ple ? z.ple : 0, 0xa5);
     SessionState ss;
@@ -116,6 +122,25 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     if (!zero_qsa) { image.kv.push_back(first.image(g, true)); image.kv.push_back(last.image(g, true)); }
     image.kv.push_back(draft.image(g, false));
     check(conversation_snapshot_validate(image, ss, g, draft.st, error), "complete image validates without CUDA");
+    if (format == 3) {
+        // TurboQuant is resident-only, and the width is deliberately not in the format tag: a target of another
+        // width has to refuse the image on its payload size rather than decode it into the wrong codebook.
+        for (int mode : {1,2}) {
+            layers[0].kv_mode = mode;
+            check(!conversation_snapshot_validate(image,ss,g,draft.st,error),
+                  "TurboQuant streaming/ring target refused before any write");
+        }
+        layers[0].kv_mode = 0;
+        check(conversation_snapshot_validate(image,ss,g,draft.st,error),
+              "the TurboQuant resident target validates again");
+        const int other = bits == 3 ? 4 : bits == 4 ? 6 : bits == 6 ? 8 : 3;
+        Pools foreign(g, format, other);
+        ConversationKv wrong = foreign.image(g, false);
+        check(!conversation_kv_validate(wrong, draft.st, g, 9, false, error),
+              "TurboQuant image of another width is refused by its payload size");
+        check(!conversation_kv_validate(image.kv.back(), foreign.st, g, 9, false, error),
+              "a TurboQuant state of another width refuses the image");
+    }
     size_t estimate = 0;
     check(conversation_snapshot_bytes({image.live.ids,image.live.imgs,image.checkpoints,true},ss,g,draft.st,estimate,error),
           "capture estimate works without CUDA");
@@ -274,5 +299,8 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
 int main() {
     for (int format : {0,1,2}) for (int experts : {256,512})
         for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
+    // TurboQuant is 256-wide only (layout() requires QK_TQ): every width, in the resident mode a real state has.
+    for (int bits : {3,4,6,8}) for (int experts : {256,512}) for (bool ple : {false,true})
+        fixture(3,experts,false,ple,strata::kernels::QK_TQ,bits);
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);
 }

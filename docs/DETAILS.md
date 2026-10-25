@@ -572,12 +572,25 @@ between the tq6 arms (15,618/15,608 MiB). These are limited measurements, not a 
 has the tq8 reader measurements and the qsa-attention totals.
 
 The GPU parity checks pass for all four widths, including causal tails and shuffled pages, with zero Compute
-Sanitizer memory errors. Both live opt-in runs pass the four OpenAI scenarios; Hermes fails once on `list_jobs`
-and passes once. Quality parity is therefore not established, and this remains opt-in. The daily service stays
-on int8. The CUDA full build and `kv_tq_parity` pass. Three HIP kernel translation units compile with hipcc 7.2.4
-for gfx1100, but the full HIP CMake build stops at an existing `CUDA::cudart` reference (`CMakeLists.txt` line
-749), so no HIP run was measured. The SYCL compiler is not installed here, and SYCL has no TurboQuant
-implementation. Other GPU architectures were not tested.
+Sanitizer memory errors. `conversation_snapshot_test` passes 6,709 checks and also has zero Compute Sanitizer
+errors: real state allocation at every width (3, 4, 6 and 8 bits), a snapshot A/B/A round trip, a restore from
+another width rejected on payload size, and the mixed INT8 draft layer. Both live opt-in runs pass the four
+OpenAI scenarios; Hermes fails once on `list_jobs` and passes once. Quality parity is therefore not established,
+and this remains opt-in. The daily service stays on int8. The CUDA full build passes; the CPU-only build passes
+with 55 CTest targets passing and 4 skipping (59 in total). The full HIP build passes with hipcc 7.2.4 for
+gfx1100, as a compile and link check: there is no AMD device here, so `kv_tq_parity` skips, the host-side
+conversation validation passes, and no HIP TQ run was measured. `kv_tq_parity` passes on the CUDA build, and
+its no-device exit code 77 is recorded as a skip in both builds. The HIP build needed four build fixes: a
+backend-neutral runtime target instead of `CUDA::cudart` in CMake, a portable `std::bit_cast` half bit read in
+the GEMM parity test, the test reference arm's stale warp launch replaced with the production scorer's grid,
+and a per-device VMM record (the device id and allocation granularity are captured with the range; HIP uses
+`hipMemCreate`/`hipMemMap`, and `STRATA_HIP_VMM=0` turns it off). Eighteen CUDA target regression tests ran
+while the live int8 service held the cards: 12 passed and 6 ended on out-of-memory errors
+(`qsa_slots_parity`, `qsa_slots_parity_lanecell`, `qsa_merge_daily_parity_default`,
+`qsa_merge_daily_parity_daily`, `kv_stream_parity`, `kv_window_parity`). Those six failed at allocation and
+do not establish a regression verdict; they are not claimed as passes. The SYCL compiler is not installed here, SYCL has no TurboQuant
+implementation (its separate port is unchanged), and no AMD hardware was available for a validation run. Other
+GPU architectures were not tested.
 
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round

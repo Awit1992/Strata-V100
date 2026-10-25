@@ -1,6 +1,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tq.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
@@ -46,12 +47,15 @@ struct Fixture {
             cuda_check(cudaMalloc(&raw, n)); device.push_back(raw); p = static_cast<T*>(raw);
         }
     }
-    Fixture(int fmt, int mode) {
+    Fixture(int fmt, int mode, int bits = 0) {
         auto& st = state;
         st.kv_mode = mode; st.kv_int8 = fmt==kKvInt8; st.kv_q4 = fmt==kKvQ4; st.kv_hybrid = fmt==3;
+        st.kv_tq = fmt==kKvTq; st.kv_tq_bits = st.kv_tq ? bits : 0; st.kv_rot = st.kv_tq;
         st.n_pages = 24; st.n_slots = mode ? 4 : st.n_pages;
         st.max_cells = st.n_pages * 4; st.idx_pooled_rows = mode==2 ? 2 : st.max_cells/4+2;
-        const size_t per = fmt==kKvQ4 ? kv_q4_bytes_per_head((int)g.head_dim) : g.head_dim*((st.kv_int8 || st.kv_hybrid) ? 1:2);
+        const size_t per = st.kv_tq ? kv_tq_bytes_per_head(bits, (int) g.head_dim)
+                          : fmt==kKvQ4 ? kv_q4_bytes_per_head((int)g.head_dim)
+                                       : g.head_dim*((st.kv_int8 || st.kv_hybrid) ? 1:2);
         const size_t rows = st.max_cells*g.n_head_kv, slot_rows = st.n_slots*4*g.n_head_kv;
         sizes = {rows*per, rows*per, fmt==kKvInt8 ? rows*(g.head_dim/64)*2:0,
                  fmt==kKvInt8 ? rows*(g.head_dim/64)*2:0, (size_t)st.idx_pooled_rows*g.idx_key_dim*4};
@@ -60,6 +64,10 @@ struct Fixture {
                      (size_t)st.idx_pooled_rows*g.idx_key_dim*4};
             alloc(st.k_q,sizes[0]); alloc(st.v_q4,sizes[1]); alloc(st.k_scale,sizes[2]);
             sources[0]=st.k_q; sources[1]=st.v_q4; sources[2]=st.k_scale;
+        } else if (fmt==kKvTq) {
+            // TurboQuant is resident-only (mode 0) and has no host copy: the VRAM arrays are authoritative.
+            alloc(st.k_tq,slot_rows*per); alloc(st.v_tq,slot_rows*per);
+            sources[0]=st.k_tq; sources[1]=st.v_tq;
         } else if (fmt==kKvQ4) {
             alloc(st.k_q4,slot_rows*per); alloc(st.v_q4,slot_rows*per);
             if (mode) {alloc(st.host.k_q4,sizes[0],true); alloc(st.host.v_q4,sizes[1],true);}
@@ -110,8 +118,8 @@ bool equal(const ConversationKv& a,const ConversationKv& b) {
     return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
 }
 
-void full_session(int fmt, int mode, int experts) {
-    Fixture main(fmt,mode), draft(fmt==3?kKvInt8:fmt,2);
+void full_session(int fmt, int mode, int experts, int bits = 0) {
+    Fixture main(fmt,mode,bits), draft((fmt==3 || fmt==kKvTq)?kKvInt8:fmt,2);
     auto& g=main.g;
     g.n_layers=4; g.n_expert=experts;
     g.ssm_state_size=2; g.ssm_v_heads=2; g.ssm_conv_channels=8;
@@ -341,19 +349,77 @@ void full_session(int fmt, int mode, int experts) {
 }
 }
 
+// The real TurboQuant state path, not the snapshot fixture: qsa_state_bytes sizes the arena, qsa_state_init
+// carves the two arrays out of it and qsa_attn_pools exposes them.  At every width the carved K/V extents must
+// stay inside the bytes init reports (so kv_pool_bytes' TQ arm and init agree) and each array must cover exactly
+// rows * kv_tq_bytes_per_head, touching nothing else in the arena.
+void tq_state_sizing() {
+    ModelGeometry g;   // head_dim 256 == kernels::QK_TQ, the only width layout() accepts
+    const int64_t cells = 96;
+    uint64_t last_arena = 0;
+    for (int bits : {3,4,6,8}) {
+        qsa_set_kv_tq(bits);
+        const uint64_t arena = qsa_state_bytes(g, cells);
+        check(arena > last_arena, "a wider TurboQuant block needs more state bytes");
+        last_arena = arena;
+        const QsaShapes s = qsa_shapes(g);
+        const uint64_t row = kv_tq_bytes_per_head(bits, (int) s.head_dim);
+        const uint64_t pages = (uint64_t) ((cells + s.page_size - 1) / s.page_size);
+        // Guard slack: if qsa_state_bytes' pools undersized what qsa_state_init carves, init must land in
+        // mapped memory so the used<=arena assertion reports it instead of faulting first.
+        uint8_t* base = nullptr;
+        cuda_check(cudaMalloc(&base, arena + 2 * pages * s.n_head_kv * s.page_size * row));
+        QsaState st;
+        const uint64_t used = qsa_state_init(g, cells, base, st);
+        check(used > 0 && used <= arena, "TQ state fits the arena qsa_state_bytes sized");
+        check(st.kv_tq && st.kv_tq_bits == bits && st.kv_mode == 0, "TQ state initializes resident at its width");
+        const uint64_t rows = (uint64_t) st.n_slots * s.n_head_kv * s.page_size;
+        check(st.k_tq != nullptr && st.v_tq != nullptr, "TQ state carves both K/V arrays");
+        const size_t ko = (size_t) ((const uint8_t*) st.k_tq - base);
+        const size_t vo = (size_t) ((const uint8_t*) st.v_tq - base);
+        check(ko + rows*row <= used && vo + rows*row <= used,
+              "both TQ arrays fit the state bytes qsa_state_init reports");
+        check(ko + rows*row <= vo || vo + rows*row <= ko, "TQ K and V arrays do not overlap");
+        const auto pools = qsa_attn_pools(st);
+        check(pools.k_tq == st.k_tq && pools.v_tq == st.v_tq && pools.tq_bits == bits,
+              "qsa_attn_pools exposes the TQ arrays and width");
+        // Canary the whole arena, write each array's full extent, and read it back: only the two carved
+        // ranges may change, so a short carve or an over-wide row cannot pass unnoticed.
+        std::vector<uint8_t> canary((size_t) arena, 0xa5), got((size_t) arena);
+        cuda_check(cudaMemcpy(base, canary.data(), canary.size(), cudaMemcpyHostToDevice));
+        cuda_check(cudaMemset(st.k_tq, 0x5a, rows*row));
+        cuda_check(cudaMemset(st.v_tq, 0x3c, rows*row));
+        cuda_check(cudaMemcpy(got.data(), base, got.size(), cudaMemcpyDeviceToHost));
+        bool exact = true;
+        for (size_t i = 0; i < got.size() && exact; ++i)
+            exact = got[i] == (i >= ko && i < ko + rows*row ? 0x5a
+                              : i >= vo && i < vo + rows*row ? 0x3c : 0xa5);
+        check(exact, "the two TQ arrays cover exactly their carved extents");
+        cuda_check(cudaFree(base));
+    }
+    qsa_set_kv_tq(0);
+}
+
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
-    for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
-        if (fmt==3 && mode!=0) continue;
-        Fixture f(fmt,mode);
-        if (fmt==3) {
+    tq_state_sizing();
+    for (int fmt : std::array<int,5>{kKvF16,kKvInt8,kKvQ4,3,kKvTq})
+     for (int bits : fmt==kKvTq ? std::vector<int>{3,4,6,8} : std::vector<int>{0})
+      for (int mode : {0,1,2}) {
+        if ((fmt==3 || fmt==kKvTq) && mode!=0) continue;
+        Fixture f(fmt,mode,bits);
+        if (fmt==3 || fmt==kKvTq) {
             std::string err;
             ConversationKv invalid;
             for (int unsupported : {1,2}) {
                 f.state.kv_mode=unsupported;
-                check(conversation_kv_bytes(f.state,f.g,9,true)==0,"hybrid streaming/ring rejected without block-mover abort");
-                check(!conversation_kv_save(invalid,f.state,f.g,9,true,err),"hybrid streaming/ring capture fails closed");
+                check(conversation_kv_bytes(f.state,f.g,9,true)==0,
+                      fmt==3 ? "hybrid streaming/ring rejected without block-mover abort"
+                             : "TurboQuant streaming/ring rejected without block-mover abort");
+                check(!conversation_kv_save(invalid,f.state,f.g,9,true,err),
+                      fmt==3 ? "hybrid streaming/ring capture fails closed"
+                             : "TurboQuant streaming/ring capture fails closed");
             }
             f.state.kv_mode=0;
         }
@@ -506,10 +572,22 @@ int main() {
                 bad=a; bad.k.pop_back();
                 check(!conversation_kv_restore(bad,f.state,f.g,upto,index,err),"reject malformed payload");
             }
+            if (fmt==kKvTq && upto>0) {
+                // The width is deliberately NOT in the format tag: a tq3 image restored into a tq6 state has to
+                // fail the payload-size check instead of decoding into the wrong codebook.
+                const int other = bits==3 ? 4 : bits==4 ? 6 : bits==6 ? 8 : 3;
+                f.state.kv_tq_bits = other;
+                check(!conversation_kv_restore(a,f.state,f.g,upto,index,err),
+                      "TurboQuant image of another width is refused by its payload size");
+                f.state.kv_tq_bits = bits;
+                check(conversation_kv_restore(a,f.state,f.g,upto,index,err),
+                      "the same-width TurboQuant image still restores");
+            }
         }
     }
     for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
         full_session(fmt,mode,experts);
     for (int experts : {256,512}) full_session(3,0,experts);
+    for (int bits : {3,4,6,8}) for (int experts : {256,512}) full_session(kKvTq,0,experts,bits);
     std::printf("conversation_snapshot_test: %d checks passed\n",checks);
 }
