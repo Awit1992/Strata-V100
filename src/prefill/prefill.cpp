@@ -1406,6 +1406,17 @@ bool wmma_buffers() {
     return volta;
 #endif
 }
+// STRATA_PF_WMMA_LEAN=1: on the direct WMMA plan (wmma_buffers) the experts read `mixed_h` by `src_dev` and H is the
+// `xn16` alias, so `Xs`, `Hh` and the DQ dequant ring - read only by the wmma_l tiles and the FP16 fallback - are
+// never touched: not sized, and the per-layer gather into `Xs` skipped (64,000*T + 19,662,336 B a chunk).  OPT-IN;
+// every other device, pack and layout allocates as before, and the layer loop errors if a reader ever appears.
+bool wmma_lean() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_PF_WMMA_LEAN");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on && wmma_buffers();
+}
 // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
 // default): MMQ's, for T tokens - or the compact tensor-core capacity when `compact` is on (`fused` and `compact`
 // are mutually exclusive: fp16tc_compact excludes fused_layout, so GU/H are never sized for one layout and used for
@@ -1435,12 +1446,14 @@ MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused, bool compact) {
 uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused, bool compact) {
     const MmqPlan& mp = mmq_plan();
     const MoeBufs mb = moe_bufs(T, n_expert, fused, compact);
+    // STRATA_PF_WMMA_LEAN: Xs/Hh are not sized on the direct plan (the same predicate `carve` takes them with)
+    const bool xs_hh = fp16_bufs(mp) && !wmma_lean();
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
-    if (fp16_bufs(mp)) a.take<uint16_t>(T * K * N, ok);
+    if (xs_hh) a.take<uint16_t>(T * K * N, ok);
     a.take<float>(mb.gu, ok);
-    if (fp16_bufs(mp)) a.take<uint16_t>(T * K * 640, ok);
+    if (xs_hh) a.take<uint16_t>(T * K * 640, ok);
     a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
     if (mp.any) {
@@ -1717,6 +1730,8 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.grs = o.take<float>(T * HC, ok);
     m.xn16 = o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
     const bool gated_alias = wmma_buffers();
+    // STRATA_PF_WMMA_LEAN: Xs/Hh and the dq ring are not taken (moe_set_bytes / bytes_needed_impl agree)
+    const bool lean = wmma_lean();
     m.gated = gated_alias ? nullptr : o.take<float>(T * D, ok);
     m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
@@ -1765,9 +1780,9 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.logits = c.take<float>(T * m.g->n_expert, ok); m.w = c.take<float>(T * K, ok); m.ids = c.take<int32_t>(T * K, ok);
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
         const MmqPlan& mp = mmq_plan();
-        m.Xs = fp16_bufs(mp) ? c.take<uint16_t>(T * K * N, ok) : nullptr;
+        m.Xs = fp16_bufs(mp) && !lean ? c.take<uint16_t>(T * K * N, ok) : nullptr;
         m.GU = c.take<float>(mb.gu, ok);
-        m.Hh = fp16_bufs(mp) ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
+        m.Hh = fp16_bufs(mp) && !lean ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
@@ -1785,7 +1800,9 @@ bool Prefill::carve(size_t T, void* alloc) {
         }
         if (base == nullptr) ok = false;
     }
-    for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+    // STRATA_PF_WMMA_LEAN: the dq ring serves the FP16 fallback (`!use_mmq`), which this plan never takes
+    if (!lean)
+        for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         const int G = GROUPS;
@@ -2554,7 +2571,9 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src), fp16tc_compact(T, src))}), ok);
-    for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+    // STRATA_PF_WMMA_LEAN: the dq ring is not taken in `carve` either (one predicate decides both)
+    if (!wmma_lean())
+        for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
@@ -4367,6 +4386,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = "prefill: an IQ1_M layer in the MMQ grouping needs the WMMA tiles, which this chunk cannot take";
                             return false;
                         }
+                        // STRATA_PF_WMMA_LEAN leaves Xs/Hh out when the direct tiles cover every layer.  The only
+                        // readers are wmma_l's tiles (when use_wmma did not take the group) and the FP16 fallback:
+                        // needing them unsized is predicate drift - error, never a null buffer.  (Xs and Hh are taken
+                        // together, so Xs answers for both.)
+                        if (m.Xs == nullptr && (!use_mmq || (wmma_l && !use_wmma))) {
+                            err = "prefill: layer " + std::to_string(l) + " needs the FP16 expert rows, which the direct "
+                                  "WMMA plan (STRATA_PF_WMMA_LEAN) does not size";
+                            return false;
+                        }
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         pt.mark(kPfGather, cs);
@@ -4379,8 +4407,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // (slot_dev, the inverse of src_dev).
                             // NVFP4 w4a4 activations carry a per-row scale (Xscale): that mode keeps the gather.
                             if (wmma_l) {   // FP16 rows (pf_wmma); APR: Hadamard-folded gate/up take H, rotated in fp16 storage as the FP16 path does
-                                gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
-                                if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, T * K, N, had_block, had_sx, m.cs);
+                                // STRATA_PF_WMMA_LEAN: the direct tiles read `mixed_h` by `src_dev`, so no gathered copy
+                                if (m.Xs != nullptr) {
+                                    gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
+                                    if (had_gu) strata::kernels::hadamard_rows_f16(m.Xs, T * K, N, had_block, had_sx, m.cs);
+                                }
                             } else {
                                 if (had_gu) {
                                     strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);

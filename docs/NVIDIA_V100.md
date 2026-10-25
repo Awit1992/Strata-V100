@@ -539,6 +539,79 @@ expert weights, model quantization, KV format, or KV capacity.
 See the [cache admission and dequantization report](../benchmarks/v100-prefill-cache-admission-2026-10-21.md)
 for the measured read counts, four-arm TTFT results, and full-request costs.
 
+## Smaller prompt buffers and batched draft K/V
+
+`STRATA_PF_WMMA_LEAN=1` removes unused gathered FP16 input rows,
+FP16 expert intermediates, and the fallback dequantization ring on the
+direct Volta WMMA path. The expert products already read the original
+input through row indices. The option also skips the unused gather.
+It leaves the executed expert kernels and their arithmetic unchanged.
+
+This is opt-in. It requires `STRATA_PF_WMMA=1`, compute capability 7.0,
+and a native pack whose every layer has a supported direct WMMA format.
+Other devices and packs keep the existing allocation. The input and
+intermediate buffers needed by other expert paths remain unchanged.
+
+Measured on 2026-10-25: two Tesla V100-PCIE-16GB at 175 W, PCIe Gen3
+x4/x16, Ryzen 5 3600, IQ3_S, INT8 KV, 524288-token capacity, split 16,
+spec 4, pipeline windows 2, and 8192-token prompt chunks. With lean
+buffers, each stage's prompt loan fell from 3.24 to 2.73 GiB.
+CUDA0 borrowed 1561 rather than 1845 cache slots; CUDA1 borrowed
+1381 rather than 1640. The cache capacity itself did not change.
+
+Two cold prompts per size, in off/on/off restart order, gave these
+median prompt times. Both arms used batched draft K/V:
+
+| Prompt tokens | Lean off | Lean on | Lean off again |
+| ---: | ---: | ---: | ---: |
+| 2048 | 1933.0 ms | 1914.0 ms | 1934.9 ms |
+| 8192 | 5258.6 ms | 5082.9 ms | 5270.1 ms |
+| 32768 | 14340.9 ms | 14066.4 ms | 14363.8 ms |
+
+The prompt throughput gain was about 3.5% at 8K and 2.0% at 32K.
+The 2K difference was small. This is not a decode-speed claim:
+256-token decode medians at 8K were 107.5/97.4/103.4 tok/s.
+Answers and draft acceptance varied, including between control restarts.
+There is no bitwise-output or quality-equivalence claim. Smaller loans
+change expert placement, and the service uses residency-biased routing.
+
+A second lean-on restart with a 512-token output cap reproduced the
+prompt times (5086.1 ms at 8K, 14058.8 ms at 32K). Its matched
+lean-off control read those prompts in 5279.2 and 14363.2 ms.
+Decode at 8K was 121.7 tok/s on versus 119.7 off, but the two
+2K samples were slower with lean buffers (80.0/118.6 versus
+101.5/122.8 tok/s). One 32K control ended at EOS after 440 tokens.
+Keep this option off for the daily service until its short-prompt
+decode tradeoff is acceptable for the workload. It is a measured
+long-prefill option, not a general speed default.
+
+The existing `STRATA_SPLIT_MTP_BATCH=1` option separately improved
+prompt time on the installed engine. Its off/on/off medians were
+5524.5/5265.4/5538.0 ms at 8K and
+15383.4/14348.5/15423.7 ms at 32K. It changes draft K/V arithmetic
+and requires a restart. See [the split-draft requirements](MULTI_GPU.md).
+Do not interpret either prefill improvement as an equal decode gain.
+
+The [measurement rows](../benchmarks/v100-prefill-2026-10-25.json)
+include binary and prompt hashes, decode lengths, and acceptance counts.
+The harness kept the daily spec-4 and 750-MiB reserve rather than its
+strict spec-8/700-MiB profile. Prompt reuse was disabled.
+A threaded short-chunk copy issuer was also built and measured; it
+gave no gain and was removed. CUDA sm_70 built and ran; HIP was not
+built because its compiler was unavailable. SYCL's separate source
+was not changed.
+`prefill_plan_test`, `draft_kv_plan_test`, `pf_wmma_parity`, and
+`pf_wmma2_parity` passed. The aggregate CTest command reached its
+600-second deadline during `pf_wmma2_n64_parity`; that case did not
+finish, so it is not counted as passed.
+
+To repeat the allocation experiment, export the service's environment
+into a private harness config, then run `bench/run_v100_prefill.py`
+with `--targets 2048,8192,32768 --repeats 2 --max-new 256
+--no-settings-strict --env STRATA_SPLIT_MTP_BATCH=1` and the same
+`--exe` in both arms. Set `--env STRATA_PF_WMMA_LEAN=0` or `=1`
+and use a separate `--out` and `--arm-label` for each restart.
+
 ## Decode mixer overlap
 
 Set `STRATA_SIDE_MIXER=2` to test input-only mixer work on graph branches.
