@@ -82,7 +82,7 @@ public:
         for (const auto& piece : pieces_) {
             const size_t end = begin + piece.len;
             if (begin >= stop) break;
-            if (end > offset && !piece.seg.unique()) total += std::min(end, stop) - std::max(begin, offset);
+            if (end > offset && (piece.seg.use_count() != 1)) total += std::min(end, stop) - std::max(begin, offset);
             begin = end;
         }
         return total;
@@ -94,13 +94,13 @@ public:
         size_t total = bytes(), count = pieces_.size();
         if (n > size_) {
             size_t spare = 0;
-            if (!pieces_.empty() && pieces_.back().seg.unique())
+            if (!pieces_.empty() && (pieces_.back().seg.use_count() == 1))
                 spare = pieces_.back().seg->capacity() - pieces_.back().start - pieces_.back().len;
             const size_t extra = n - size_ - std::min(n - size_, spare);
             const size_t full = extra / segment_bytes, tail = extra % segment_bytes;
             if (!add(total, full * segment_bytes)) return SIZE_MAX;
             if (tail && !add(total, segment_capacity(tail, full ? segment_bytes :
-                    pieces_.empty() || !pieces_.back().seg.unique() ? 0 : pieces_.back().seg->capacity(),
+                    pieces_.empty() || (pieces_.back().seg.use_count() != 1) ? 0 : pieces_.back().seg->capacity(),
                     size_ != 0, size_))) return SIZE_MAX;
             if (!add(count, full + (tail != 0))) return SIZE_MAX;
             if (count > pieces_.capacity() &&
@@ -120,7 +120,7 @@ public:
         for (const auto& piece : pieces_) {
             const size_t end = std::min(begin + piece.len, n);
             if (begin >= end) break;
-            if (end > rewrite_from && !piece.seg.unique()) {
+            if (end > rewrite_from && (piece.seg.use_count() != 1)) {
                 if (!add(total, end - std::max(begin, rewrite_from))) return SIZE_MAX;
                 split = split || (begin < rewrite_from && rewrite_from < end);
             }
@@ -234,7 +234,7 @@ private:
     // the prefix, the spare capacity and the other owner's tail are not copied.
     void unshare_piece(size_t index) {
         Piece& piece = pieces_[index];
-        if (piece.seg.unique()) return;
+        if ((piece.seg.use_count() == 1)) return;
         auto copy = std::make_shared<Segment>();
         copy->reserve(piece.len);
         copy->assign(piece.seg->begin() + piece.start, piece.seg->begin() + piece.start + piece.len);
@@ -247,7 +247,7 @@ private:
         size_t begin = 0, splits = 0;
         for (const auto& piece : pieces_) {
             const size_t end = begin + piece.len;
-            if (!piece.seg.unique()) {
+            if ((piece.seg.use_count() != 1)) {
                 splits += begin < offset && offset < end;
                 splits += begin < stop && stop < end;
             }
@@ -258,7 +258,7 @@ private:
         begin = 0;
         for (size_t i = 0; i < pieces_.size() && begin < stop;) {
             const size_t len = pieces_[i].len;
-            if (begin + len <= offset || pieces_[i].seg.unique()) { begin += len; ++i; continue; }
+            if (begin + len <= offset || (pieces_[i].seg.use_count() == 1)) { begin += len; ++i; continue; }
             if (offset > begin) { split_piece(i, offset - begin); continue; }
             if (len > stop - begin) { split_piece(i, stop - begin); continue; }
             unshare_piece(i);
@@ -270,7 +270,7 @@ private:
         const bool growing = size_ != 0;
         const size_t held = size_;
         size_t extend = 0;
-        if (!pieces_.empty() && pieces_.back().seg.unique()) {
+        if (!pieces_.empty() && (pieces_.back().seg.use_count() == 1)) {
             Piece& last = pieces_.back();
             // Bytes past this buffer's end are not its own: dropping them keeps a
             // rewind + regrow filling the suffix, as an unshared buffer does.
@@ -286,7 +286,7 @@ private:
         }
         while (size_ < n) {
             const size_t count = std::min(segment_bytes, n - size_);
-            const size_t previous = pieces_.empty() || !pieces_.back().seg.unique() ?
+            const size_t previous = pieces_.empty() || (pieces_.back().seg.use_count() != 1) ?
                 0 : pieces_.back().seg->capacity();
             auto segment = std::make_shared<Segment>();
             segment->reserve(segment_capacity(count, previous, growing, held));
@@ -356,12 +356,12 @@ public:
     // copy-on-write of the whole running state.
     uint8_t* writable_all() {
         if (!block_) return nullptr;
-        if (!block_.unique()) block_ = std::make_shared<std::vector<uint8_t>>(block_->size());
+        if ((block_.use_count() != 1)) block_ = std::make_shared<std::vector<uint8_t>>(block_->size());
         return block_->data();
     }
     // The writable form detaches this payload from every other holder first.
     std::vector<uint8_t>& vec() {
-        if (block_ && !block_.unique()) block_ = std::make_shared<std::vector<uint8_t>>(*block_);
+        if (block_ && (block_.use_count() != 1)) block_ = std::make_shared<std::vector<uint8_t>>(*block_);
         if (!block_) block_ = std::make_shared<std::vector<uint8_t>>();
         return *block_;
     }
