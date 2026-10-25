@@ -507,6 +507,78 @@ VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the
 slower. It streams its KV cache like the other formats (`--kv-resident N`): on an RTX 2060 SUPER 8 GB at 128K with
 20,480 resident cells, +780 expert slots over resident K8V4, and it scores better than 4-bit KV on long documents.
 
+**TurboQuant KV cache (opt-in, `--kv tq3|tq4|tq6|tq8`):** each 256-value head is rotated with a Hadamard
+transform and quantized against a Lloyd-Max codebook fitted to the rotated coordinates, with one FP16 norm per head;
+the width is 3, 4, 6 or 8 bits per value; the fit is minimum squared error only (this cut has no QJL residual).
+It is a resident format: the K/V stays in VRAM (mode 0, no host copy), so it does not stream, and `--kv-resident` is
+refused. The main layers use it; the MTP draft layer keeps its plain INT8 windowed ring, as it does under
+K8V4 (its attention and verify paths handle whole formats only), so `--mtp`/`--spec` keep an INT8 draft cache.
+Setup does not offer these values yet.
+
+| `--kv` | Bytes/cell | 524,288-token KV, 12 layers |
+|---|---:|---:|
+| int8 | 1,056 | 6.1875 GiB |
+| tq8 | 1,032 | 6.046875 GiB |
+| tq6 | 776 | 4.546875 GiB |
+| tq4 | 520 | 3.046875 GiB |
+| tq3 | 392 | 2.296875 GiB |
+
+Those are calculated capacities (524,288 cells x 12 layers), not measured savings; a smaller cache only becomes more
+expert slots with the elastic K/V (`--kv-grow`), which gives the free VRAM to the expert cache. The context capacity
+and the CPU memory defaults do not change; only the bytes per KV cell change.
+
+Measured (before the opt-in tensor reader below, 2026-10-25): two Tesla V100 16 GB cards at 175 W, Ryzen 5 3600, IQ3_S, `--mtp --spec 4`,
+`--layer-split 16`, `--pipeline-windows 2`, one run per format, prompts of 2,071 and 51,746 tokens (the "2K"/"49K"
+labels were nominal). Wall seconds for the prompt request: int8 2.926 / 24.289, tq4 3.297 / 35.190, tq8 3.401 /
+41.085, tq6 3.431 / 39.272, tq3 3.173 / 33.643. Every arm ran without a crash. These runs show a prompt slowdown,
+not a speed win. Static analysis attributes the long-prompt cost to the prompt path using the decode-attention
+fallback (the batched reader below is off by default). Total GPU memory stayed near 15,656/15,684 MiB:
+the expert cache fills the freed space, so total GPU usage is not a measurement of KV savings. This exploratory
+five-format run is not part of the published evidence file.
+
+All five formats pass the four OpenAI-style recall and native-tool scenarios. The old fifth check required the
+literal word "tool" in a plain answer; it was removed because that tests wording, not tool behavior. Hermes passes
+for int8, tq4, tq8 and tq6; tq3 still calls the nonexistent `list_jobs` instead of `list_scheduled_jobs`.
+An earlier int8 run also made that error, so these small checks do not establish quality parity or a TQ-specific
+regression. Perplexity was not measured. A needle test (`tools/needle_bench.py`, unmodified) found 15 of 15 cells for
+both int8 and tq6 at 3 lengths and 5 depths, up to an actual 122,289 prompt tokens (the "128K" labels are nominal).
+The daily configuration hash was identical before and after. This is one synthetic retrieval test, not a general
+quality result. The final tq6 log confirms conversation parking at 2,071 and 51,746 tokens and checkpoint-archive
+parking, without the earlier draft-ring snapshot refusal. The GPU layout/append/gather/attention regression
+(`kv_tq_parity`) passes, including under CUDA Compute Sanitizer with zero memory errors. The
+[full report](../benchmarks/v100-turboquant-2026-10-25.md) and its
+[sanitized evidence](../bench/results/2026-10-25-turboquant-published/v100-turboquant-2026-10-25.json) hold the
+measured rows and settings.
+
+**Volta TQ prompt attention (experimental, off by default):** `STRATA_PROMPT_ATTN_TQ=1` enables a tensor-core
+prompt reader for `tq3`, `tq4`, `tq6` and `tq8` on sm_70. Unset or `0` keeps the existing decode fallback;
+other GPU architectures are unchanged. It decodes selected compressed tiles into shared memory, not a persistent
+FP16 cache. The per-head norm is applied once in FP32. KV allocation and stored bytes do not change.
+
+Same-day measurements on the two V100s above, with `STRATA_PREFILL_TIMING=1`, fresh service per arm:
+
+| Arm | 2,071-token request | 51,746-token request |
+|---|---:|---:|
+| tq6, reader off (baseline) | 3.400 s | 40.357 s |
+| tq6, reader on | 3.194 s | 31.721 s |
+| tq6, reader off (control) | 3.549 s | 40.253 s |
+| tq6, reader on again | 3.105 s | 31.852 s |
+| int8 control | 3.025 s | 25.827 s |
+
+The new reader cuts tq6's long-request wall time by 20.9–21.4% (about 1.27x throughput), but remains 22.8–23.3%
+slower than int8. CUDA0's long-prompt attention phase falls from 8,238–8,246 ms to 4,308/4,325 ms; the inter-stage
+wait reported under `embed+steps` also falls from 12,768–12,821 ms to 9,640/9,712 ms. Total GPU memory is unchanged
+between the tq6 arms (15,618/15,608 MiB). These are limited measurements, not a general speed guarantee. The report
+has the tq8 reader measurements and the qsa-attention totals.
+
+The GPU parity checks pass for all four widths, including causal tails and shuffled pages, with zero Compute
+Sanitizer memory errors. Both live opt-in runs pass the four OpenAI scenarios; Hermes fails once on `list_jobs`
+and passes once. Quality parity is therefore not established, and this remains opt-in. The daily service stays
+on int8. The CUDA full build and `kv_tq_parity` pass. Three HIP kernel translation units compile with hipcc 7.2.4
+for gfx1100, but the full HIP CMake build stops at an existing `CUDA::cudart` reference (`CMakeLists.txt` line
+749), so no HIP run was measured. The SYCL compiler is not installed here, and SYCL has no TurboQuant
+implementation. Other GPU architectures were not tested.
+
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
 slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt

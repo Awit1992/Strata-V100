@@ -41,11 +41,16 @@ struct KvHostPools {
     bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
 };
 
-/// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0, and
-/// K8V4 (`--kv k8v4`: K as int8 codes + scales, V as rotated q4_0 - three runs, `k_q`, `k_scale`, `v_q4`).
+/// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0,
+/// K8V4 (`--kv k8v4`: K as int8 codes + scales, V as rotated q4_0 - three runs, `k_q`, `k_scale`, `v_q4`), and
+/// TurboQuant (`--kv tq*`, kv_tq.hpp).
 /// (A bool `int8` argument still reads as kKvF16 / kKvInt8.)  kKvHybrid is 3, the number conversation snapshots
 /// already give K8V4.
-enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3 };
+/// kKvTq has NO host copy: a TurboQuant state is resident only (mode 0; --kv-resident is refused for it, and its
+/// drafter is created as INT8 - mtp.cpp), so `runs_of` moves zero runs for it and it must never be read as another
+/// format's pointers.  `kv_block_bytes` has no TurboQuant arm either: its bytes per cell depend on the bit width,
+/// which the format does not carry (kv_tq_bytes_per_head does).
+enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3, kKvTq = 4 };
 
 /// K8V4's halves as the single-format append kernels see them, so a hybrid layer's host copy (and the prompt path's
 /// staging pool) is written by the same calls that write its VRAM pools: K is "int8 whose V is K", V is "q4_0 whose

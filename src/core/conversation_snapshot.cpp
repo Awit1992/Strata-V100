@@ -1,5 +1,6 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tq.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
 #include <cuda_runtime.h>
@@ -32,16 +33,26 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
         error = "conversation snapshot: hybrid K8V4 cannot be a ring and needs distinct format flags";
         return false;
     }
+    // TurboQuant (kv_tq.hpp) keeps no host copy, so only a RESIDENT (mode 0) state can be captured: a ring holds
+    // just its last n_slots blocks, and there is no host journal of the cells the ring has overwritten.  The engine
+    // never builds one - the MTP drafter is created as INT8 under --kv tq* (mtp.cpp) - so this arm guards a shape
+    // that a future caller could still ask for, and refuses it instead of reading a null pool.
+    if (st.kv_tq && st.kv_mode != 0) {
+        error = "conversation snapshot: TurboQuant K/V can only be captured resident (mode 0)";
+        return false;
+    }
     const auto s = strata::kernels::qsa_real_shapes();
     const bool int8_keys = st.kv_int8 || st.kv_hybrid;
     if (g.n_head_kv <= 0 || g.head_dim <= 0 || g.head_dim > INT32_MAX || g.idx_key_dim <= 0 ||
-        (st.kv_q4 && g.head_dim % 32) || (int8_keys && !st.kv_q4 && g.head_dim % 64)) {
+        (st.kv_q4 && g.head_dim % 32) || (int8_keys && !st.kv_q4 && g.head_dim % 64) ||
+        (st.kv_tq && g.head_dim != strata::kernels::QK_TQ)) {
         error = "conversation snapshot: invalid K/V geometry";
         return false;
     }
     const int64_t cells = ((upto + s.page_size - 1) / s.page_size) * s.page_size;
-    const size_t per = st.kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
-                              : (size_t) g.head_dim * (int8_keys ? 1 : 2);
+    const size_t per = st.kv_tq ? (size_t) strata::kernels::kv_tq_bytes_per_head(st.kv_tq_bits, (int) g.head_dim)
+                     : st.kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
+                                : (size_t) g.head_dim * (int8_keys ? 1 : 2);
     // Include the moving spare row, not only completed blocks. The checkpoint
     // restore reconstructs that row when rewinding to an earlier prefix.
     const int64_t pooled = index && upto > 0 ? upto / s.idx_block + 1 : 0;
@@ -49,6 +60,9 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     // STRATA_KV_ROT=1) is another format too (+16): its bytes mean nothing to a state that does not rotate, so a
     // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
     // (Q4_0 is always rotated: nothing to tell apart; without the rotation the format is the one it always was.)
+    // TurboQuant is qsa_kv_format's own kKvTq (4, +16 for the rotation it always applies), so a TurboQuant image
+    // never reads back as another format.  Its BIT WIDTH is not in the tag: a tq3 image restored into a tq6 state
+    // fails the payload-size check instead (conversation_kv_validate).
     const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_hybrid ? 16 : 0;
     l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
     using conversation_detail::product;
@@ -74,6 +88,8 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
 
 std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
     const bool host = st.kv_mode != 0 && !resident;
+    if (st.kv_tq)   // TurboQuant: no host copy, so the VRAM pool is authoritative (mode 0, see layout())
+        return {st.k_tq, st.v_tq, nullptr, nullptr, st.idx_pooled};
     if (st.kv_hybrid)
         return {host ? st.host.k_q : st.k_q, host ? st.host.v_q4 : st.v_q4, host ? st.host.k_scale : st.k_scale,
                 nullptr, st.idx_pooled};
@@ -102,8 +118,9 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
         }
     }
     if (st.kv_mode == 2 && (!st.page_table ||
-        (st.kv_q4 ? !st.k_q4 || !st.v_q4 : st.kv_int8 ? !st.k_q || !st.v_q || !st.k_scale || !st.v_scale
-                                                    : !st.k_pool || !st.v_pool))) {
+        (st.kv_tq ? !st.k_tq || !st.v_tq
+                  : st.kv_q4 ? !st.k_q4 || !st.v_q4 : st.kv_int8 ? !st.k_q || !st.v_q || !st.k_scale || !st.v_scale
+                                                               : !st.k_pool || !st.v_pool))) {
         error = "conversation snapshot: invalid draft ring";
         return false;
     }

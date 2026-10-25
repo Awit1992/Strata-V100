@@ -346,11 +346,22 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // the K/V stays whole in VRAM.
     int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
     // K8V4 never applies to the drafter: its own attention paths (below, and verify.cpp) handle whole formats
-    // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).
+    // only, whatever ring shape it takes (0, a window, or the -1 fully-resident fallback).  TURBOQUANT DOES NOT
+    // APPLY EITHER, for the same reason plus one more: a TurboQuant state is resident-only (it refuses
+    // --kv-resident and pins no host copy - layer.cpp), while the drafter's ring IS a host copy (its snapshot, its
+    // resume refill and its checkpoint all move through it).  So the drafter is a plain INT8 ring under --kv tq*:
+    // the MIXED SESSION is the main layers in TurboQuant and the draft layer in INT8, which is what this branch
+    // has always done for K8V4.  Nothing else changes: the draft's append/gather/attention call sites read the
+    // format from st_ (INT8), and the cache parks, resumes and restores like any INT8 ring.
     const bool kv_hybrid_was = qsa_kv_hybrid();
     const bool kv_int8_was = qsa_kv_int8();
+    const int kv_tq_was = qsa_kv_tq_bits();
     qsa_set_kv_hybrid(false);
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
+    if (kv_tq_was > 0) {                        // the drafter under --kv tq*: plain INT8
+        qsa_set_kv_tq(0);
+        qsa_set_kv_int8(true);
+    }
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
@@ -366,6 +377,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
+    qsa_set_kv_tq(kv_tq_was);
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;
@@ -962,7 +974,9 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
             fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
             fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
         }
-        // stored in the state's own format (#293 appended rotated INT8 K/V as Q4_0, into pools INT8 never has)
+        // stored in the state's own format (#293 appended rotated INT8 K/V as Q4_0, into pools INT8 never has).
+        // Never TurboQuant: init() creates this state as INT8 under --kv tq* (see the policy there), so the state
+        // and its host copy are INT8 whatever the main layers hold.
         if (!no_batch_kv && st_.kv_q4)
             kv_append_q4_steps(st_.k_q4, st_.v_q4, st_.page_table, step, 4, T, kcur_, vcur_, s, cs, &st_.host);
         else if (!no_batch_kv && st_.kv_int8)

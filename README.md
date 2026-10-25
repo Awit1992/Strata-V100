@@ -127,6 +127,43 @@ for exact timings, build provenance, rejected trials, and reproduction
 commands. See the [service profile guide](docs/NVIDIA_V100.md#dual-pcie-pipeline-service-profile)
 before enabling the option on another installation.
 
+## TurboQuant KV cache — 25 October 2026
+
+TurboQuant is an opt-in KV cache format. It rotates each 256-value head with a Hadamard transform, then
+quantizes the rotated values against a Lloyd-Max codebook. Each head keeps one FP16 norm. The widths are
+3, 4, 6 and 8 bits per value. The fit is minimum squared error only; this cut has no QJL residual.
+
+Use `--kv tq6` (or `tq3`, `tq4`, `tq8`). The cache is resident only: it stays in VRAM, there is no host
+copy, and `--kv-resident` is refused. The MTP draft layer keeps its INT8 cache. Setup does not offer these
+values. Nothing is a default, and the daily service stays on int8.
+
+At the configured 524,288-token capacity, with the model's 12 attention layers, the KV cache is:
+
+| `--kv` | Bytes per cell, one layer | Full-capacity KV, 12 layers | Change from int8 |
+| --- | ---: | ---: | ---: |
+| int8 | 1,056 | 6.1875 GiB | — |
+| tq8 | 1,032 | 6.046875 GiB | −0.14 GiB |
+| tq6 | 776 | 4.546875 GiB | −1.64 GiB |
+| tq4 | 520 | 3.046875 GiB | −3.14 GiB |
+| tq3 | 392 | 2.296875 GiB | −3.89 GiB |
+
+The tq6 main saving is 1.64 GiB at full capacity. These are calculated capacities, not measured
+`nvidia-smi` reductions: the expert cache fills the freed VRAM, so total GPU memory stays near 15,600 MiB.
+
+The V100 prompt reader is a second opt-in: `STRATA_PROMPT_ATTN_TQ=1` on sm_70. It decodes compressed tiles
+for the prompt path; unset or `0` keeps the decode-attention fallback. It does not change the KV bytes.
+
+Measured on two Tesla V100 16 GB cards at 175 W with IQ3_S, `--spec 4`, `--layer-split 16`,
+`--pipeline-windows 2`, a cold 2,048-token output cap, and one run per size per arm. The tq6 arm had
+the prompt reader on. At 32,768 prompt tokens, tq6 prefilled at 1,687 tokens/s against int8's 2,117,
+and decoded at 120.2 tokens/s against 125.5. With the reader on, tq6's 51,746-token request wall time
+fell from 40.3–40.4 s to 31.7–31.9 s, still slower than int8's 25.8 s. These measurements do not show a
+speed gain. A needle test found 15 of 15 cells in both arms through 122,289 prompt tokens; that is not a
+general quality result.
+
+See the [full report](benchmarks/v100-turboquant-2026-10-25.md) and
+[details](docs/DETAILS.md#tesla-v100-fork-benchmark).
+
 ## V100 benchmark
 
 The table below records a single-card run on one Tesla V100-PCIE-16GB using PCIe Gen3 x16. The test machine also has a second V100 on PCIe Gen3 x4; it was not used for this run. Results from a two-card setup or from a machine with two full-width links may differ and could be better. It is a reproducible measurement, not a promise of speed on other systems.
