@@ -9,6 +9,10 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tq.hpp"
+#if !defined(__HIPCC__)
+#include "kv_tq_codebook.inc"   // only the Volta-only mode-5 kernel below reads it
+#endif
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -33,6 +37,18 @@ static_assert(HD == strata::core::kCompiledGeometry.head_dim && G == strata::cor
 constexpr int CH = D1_CH;         // cells per chunk
 constexpr int THREADS = 128;      // 4 warps: scores by cell (8 each), p.v by dimension (64 each = one int8 scale group)
 constexpr int QS = HD + 8;        // q row stride in halves (bank-conflict-free fragment loads)
+
+// TurboQuant's codebook accessors (kv_tq_codebook.inc: the same arrays qsa_decode_attn.cu and kv_tq.cu use).
+// A TU-local copy is the tree's existing rule for this .inc (no external linkage, one definition per TU).
+// Only the sm_70 mode-5 kernel below uses them, so HIP builds (which compile that kernel out) do not get them.
+#if !defined(__HIPCC__)
+template <int B>
+__device__ __forceinline__ const float* cent();
+template <> __device__ __forceinline__ const float* cent<3>() { return TQ_CENT_3; }
+template <> __device__ __forceinline__ const float* cent<4>() { return TQ_CENT_4; }
+template <> __device__ __forceinline__ const float* cent<6>() { return TQ_CENT_6; }
+template <> __device__ __forceinline__ const float* cent<8>() { return TQ_CENT_8; }
+#endif
 
 // The MMA below needs sm_75 or newer (Turing runs it as two k=8 steps); cp.async needs sm_80. Builds for pre-sm_75
 // cards compile the MMA to a trap; qsa_prompt_attn_batch refuses such a device at run time, so the old kernel runs
@@ -1490,11 +1506,42 @@ __device__ __forceinline__ void mma884(float* c, uint32_t a0, uint32_t a1, uint3
 #endif
 }
 
+// Mode 5's per-(cell, group) decode: one TqBlock group - the `B` bytes holding dimensions [8j, 8j + 8) - turned
+// into eight FP16 normalized centroids, exactly the row slice the m8n8k4 fragments read.  The block's norm is NOT
+// applied here: kv_tq_decode8 would apply it, and the prompt kernel multiplies the FP32 partials by the cell's
+// ks/vs instead, so applying it here too would square it.  A non-resident row (r < 0) is zeroes, like the other arms.
+template <int B>
+__device__ __forceinline__ void tq_row_group_f16(const QsaAttnPools& p, bool value, long long r, int j,
+                                                 const float* cent, __half* dst) {
+    if (r >= 0) {
+        const uint8_t* base = (value ? p.v_tq : p.k_tq) + r * (long long) sizeof(TqBlock<B>);
+        float f8[8];
+        kv_tq_decode8_raw<B>(*reinterpret_cast<const TqBlock<B>*>(base), j, cent, f8);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) dst[i] = __float2half_rn(f8[i]);
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) dst[i] = __ushort_as_half(0);
+    }
+}
+
+// Mode 5 stages the 2^bits-code centroid table in shared memory: its gather reads one centroid per lane out of 32
+// different slots at once, and a divergent __constant__ read serializes per unique address.  An empty base for every
+// other mode keeps their Smem70 byte-for-byte what it was (the mode-0/1 kernels' occupancy is smem-driven).
 template <int KV_MODE>
-struct Smem70 {
-    using KElem = typename std::conditional<KV_MODE == 0, __half, int8_t>::type;
+struct Smem70TqCent {};
+template <>
+struct Smem70TqCent<5> {
+    float cent[256];
+};
+
+template <int KV_MODE>
+struct Smem70 : Smem70TqCent<KV_MODE> {
+    // mode 5 stores NORMALIZED centroids as FP16 and the per-head norm in ks/vs (the norm multiplies the FP32
+    // partials through those slots, exactly where modes 0/1/3 apply their scales); K and V are both __half rows.
+    using KElem = typename std::conditional<KV_MODE == 0 || KV_MODE == 5, __half, int8_t>::type;
     using VElem = typename std::conditional<KV_MODE == 1, int8_t, __half>::type;
-    static constexpr int KROW = KV_MODE == 0 ? HD + 8 : HD + 16;
+    static constexpr int KROW = (KV_MODE == 0 || KV_MODE == 5) ? HD + 8 : HD + 16;
     static constexpr int VROW = KV_MODE == 1 ? HD + 16 : HD + 8;
     __half qh[16][QS];
     __half ql[16][QS];
@@ -1529,6 +1576,15 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
     const int qp = (lane >> 2) & 3, jj = (lane & 3) + 4 * (lane >> 4);   // quad-pair, thread within it
     const int crow = (lane & 1) + 4 * (lane >> 4);                        // C row of register 0 (+2 per register pair)
     const int ccol = lane & 2;                                           // C column of register 0 (+4 per half, +1 per reg)
+
+    if constexpr (KV_MODE == 5) {   // the codebook: once per block, from the TU's __constant__ copy
+        switch (p.tq_bits) {
+            case 3: for (int i = t; i < 8; i += THREADS) S.cent[i] = cent<3>()[i]; break;
+            case 4: for (int i = t; i < 16; i += THREADS) S.cent[i] = cent<4>()[i]; break;
+            case 6: for (int i = t; i < 64; i += THREADS) S.cent[i] = cent<6>()[i]; break;
+            default: for (int i = t; i < 256; i += THREADS) S.cent[i] = cent<8>()[i]; break;
+        }
+    }
 
     // q: 12 heads + 4 zero rows, scaled by a power of two that puts its largest value near 2^14 (exact, and the
     // lo halves stay out of FP16's subnormal range), then split into hi + lo halves
@@ -1578,6 +1634,29 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
         // gather the chunk's K and V rows (16-byte pieces; K8V4's V as q4_0 blocks dequantized to fp16)
         // and their scales
         {
+            if constexpr (KV_MODE == 5) {
+                // TurboQuant: one work item per (side, cell, group) - 2 * CH * 32 = 2048 items over 128 threads.
+                // Each item decodes its group ONCE into the eight FP16 row slots the m8n8k4 fragments read (the
+                // scalar prefill fallback decoded eight values per thread and kept one).  p.tq_bits belongs to the
+                // state, not the template, so the width switch is here; all four widths take this same arm.
+                constexpr int GROUPS = HD / 8, ITEMS = 2 * CH * GROUPS, IPT = ITEMS / THREADS;
+                static_assert(ITEMS % THREADS == 0, "the TQ gather items divide evenly");
+                const int bits = p.tq_bits;
+#pragma unroll
+                for (int s = 0; s < IPT; ++s) {
+                    const int i = t + s * THREADS;
+                    const int side = i / (CH * GROUPS), rem = i % (CH * GROUPS);
+                    const int c = rem / GROUPS, j = rem % GROUPS;
+                    const long long r = S.row[rbuf][c];
+                    __half* dst = side ? &S.v[c][j * 8] : &S.k[c][j * 8];
+                    switch (bits) {
+                        case 3: tq_row_group_f16<3>(p, side != 0, r, j, S.cent, dst); break;
+                        case 4: tq_row_group_f16<4>(p, side != 0, r, j, S.cent, dst); break;
+                        case 6: tq_row_group_f16<6>(p, side != 0, r, j, S.cent, dst); break;
+                        default: tq_row_group_f16<8>(p, side != 0, r, j, S.cent, dst); break;
+                    }
+                }
+            } else {
             constexpr int KPIECES = HD * (int) sizeof(typename Smem<KV_MODE>::KElem) / 16;   // per K row
             constexpr int KPT = (CH * KPIECES + THREADS - 1) / THREADS;
             static_assert((CH * KPIECES) % THREADS == 0, "the staging pieces divide evenly");
@@ -1643,6 +1722,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
                 for (int s = 0; s < VPT; ++s)
                     *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(&S.v[vc[s]][0]) + vp[s] * 16) = vx[s];
             }
+            }   // KV_MODE 5: the TQ gather above replaces this whole staging
             for (int i = t; i < CH * 4; i += THREADS) {
                 const int c = i / 4, g = i % 4;
                 const long long r = S.row[rbuf][c];
@@ -1654,6 +1734,14 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
                     } else if constexpr (KV_MODE == 3) {   // K as int8, V dequantized to fp16 (scale 1)
                         a = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
                         b = 1.0f;
+                    } else if constexpr (KV_MODE == 5) {
+                        // The TQ rows hold NORMALIZED centroids: the block's FP16 norm is the cell's scale on both
+                        // sides (one norm per head, so all four group slots carry it - the fixed-order four-group
+                        // sum is unchanged in form).  kv_tq_decode8 already multiplies by it; the TQ gather uses
+                        // kv_tq_decode8_raw so it is applied exactly once, here, in FP32.
+                        const long long stride = (long long) kv_tq_bytes_per_head(p.tq_bits, HD);
+                        a = f32_from_f16(*reinterpret_cast<const uint16_t*>(p.k_tq + r * stride));
+                        b = f32_from_f16(*reinterpret_cast<const uint16_t*>(p.v_tq + r * stride));
                     } else {
                         a = b = 1.0f;
                     }
@@ -1678,7 +1766,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_v70_kernel(const float* _
             for (int ks = 0; ks < 16; ++ks) {
                 const int d0 = warp * 64 + ks * 4;
                 uint32_t b0, b1;
-                if constexpr (KV_MODE != 0) {   // modes 1 and 3: the K side is INT8 codes, exact in FP16
+                if constexpr (KV_MODE == 1 || KV_MODE == 3) {   // the K side is INT8 codes, exact in FP16
                     const uint32_t raw = *reinterpret_cast<const uint32_t*>(&S.k[cell_b][d0]);
                     b0 = i8x2_to_h2(raw & 0xffffu);
                     b1 = i8x2_to_h2(raw >> 16);
@@ -2426,6 +2514,18 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         }
         if (g_pa_imma == 1 && !turing) return launch_i8v3(q, pools, ids, steps, cap, s, attn, n_q, st);
         return launch_i8(q, pools, ids, steps, cap, s, attn, n_q, st);
+    }
+    if (pools.k_tq != nullptr) {
+        // TurboQuant prompt attention (mode 5): the m8n8k4 kernel with the compressed pool read in-place, opt-in
+        // via STRATA_PROMPT_ATTN_TQ=1 and sm_70 only (the kernel's body is sm_70; newer cards keep the scalar
+        // decode fallback).  The flag's VALUE counts - '0' is off, the way the baseline harness sets it - and it
+        // is read per call so one process can A/B it.  Off, a missing V pool or an unknown width returns false:
+        // the caller falls back to qsa_decode_attn_batch, i.e. exactly the behavior without this arm.
+        const char* tq_env = std::getenv("STRATA_PROMPT_ATTN_TQ");
+        if (tq_env == nullptr || std::atoi(tq_env) == 0 || !volta || pools.v_tq == nullptr) return false;
+        const int bits = pools.tq_bits;
+        if (bits != 3 && bits != 4 && bits != 6 && bits != 8) return false;
+        return launch70<5>(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (!pools.k_pool || !pools.v_pool) return false;
     if (volta) return launch70<0>(q, pools, ids, steps, cap, s, attn, n_q, st);

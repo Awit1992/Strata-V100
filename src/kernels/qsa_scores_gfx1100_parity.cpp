@@ -14,7 +14,8 @@
 #include <vector>
 
 namespace strata::kernels {
-// Test-only host wrapper copied from the unchanged baseline; both arms receive the SAME active bound.
+// Test-only host wrapper: the warp-dispatch arm of qsa_block_scores (qsa_scores_gfx1100_test.cu); both arms
+// receive the SAME active bound.
 void qsa_block_scores_reference(const float*, const float*, const float*, const int32_t*, int64_t,
                                 int64_t, const QsaShapes&, float*, void*, int64_t);
 }

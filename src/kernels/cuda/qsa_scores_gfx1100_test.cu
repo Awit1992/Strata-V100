@@ -1,4 +1,5 @@
-// Test-only translation unit: production scorer plus the unchanged warp dispatch.
+// Test-only translation unit: the production scorer's kernels plus the reference warp-dispatch arm (mirrors
+// qsa_block_scores' launch, kept in step with block_scores_kernel's contract).
 // The production library does not compile this reference wrapper.
 #include "qsa_select.cu"
 
@@ -22,9 +23,13 @@ void qsa_block_scores_reference(const float* pooled, const float* dead, const fl
         return;
     }
     const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
-    const dim3 grid((unsigned) ((reach + SCORE_WARPS - 1) / SCORE_WARPS), (unsigned) nq);
+    // The current warp kernel scores QUERY_TILE queries per CTA against KEY_GROUPS * SCORE_WARPS key rows, and
+    // needs nq to bound its query loop: this launch is the production dispatcher's (qsa_select.cu, qsa_block_scores)
+    // and must stay in step with block_scores_kernel's signature.
+    const dim3 grid((unsigned) ((reach + KEY_GROUPS * SCORE_WARPS - 1) / (KEY_GROUPS * SCORE_WARPS)),
+                    (unsigned) ((nq + QUERY_TILE - 1) / QUERY_TILE));
     block_scores_kernel<<<grid, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(pooled, dead, q_idx, steps, max_blocks,
-                                                                              scores);
+                                                                              nq, scores);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }

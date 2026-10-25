@@ -219,6 +219,11 @@ struct QsaState {
     bool kv_q4 = false;
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
+    /// TurboQuant KV (kv_tq.hpp): 256-value blocks, Lloyd-Max centroids + an FP16 norm; bits 3/4/6/8.
+    bool kv_tq = false;
+    int kv_tq_bits = 0;
+    uint8_t* k_tq = nullptr;
+    uint8_t* v_tq = nullptr;
     /// Hybrid K8V4: K in INT8 (unrotated - the scores stay exact), V in rotated Q4_0 (kv_q4.hpp): 816 B per cell.
     /// Uses k_q/k_scale + v_q4. Mode 0 only (no KV streaming, no ring); under this setting the MTP drafter's
     /// ring state stays plain INT8, so the block movers never see the hybrid layout.
@@ -325,12 +330,19 @@ bool qsa_kv_int8();
 /// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
 bool qsa_kv_q4();
+/// TurboQuant KV (`--kv tq3|tq4|tq6|tq8`): 256-value rotated blocks, Lloyd-Max codebook + an FP16 norm.
+void qsa_set_kv_tq(int bits);
+int qsa_kv_tq_bits();
 /// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell; streams with --kv-resident too.
 void qsa_set_kv_hybrid(bool enabled);
 bool qsa_kv_hybrid();
-/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid).
+/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid /
+/// kKvTq).  TurboQuant gets its OWN value: it has no host copy (mode 0 only, --kv-resident is refused), so a
+/// block mover must move nothing for it - reporting kKvQ4 made every mover read k_q4/v_q4, which a
+/// TurboQuant state never sets.
 inline int qsa_kv_format(const QsaState& st) {
     if (st.kv_hybrid) return strata::kernels::kKvHybrid;   // K8V4: its own three runs (kv_stream.cu)
+    if (st.kv_tq) return strata::kernels::kKvTq;
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,

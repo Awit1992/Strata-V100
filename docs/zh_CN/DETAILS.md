@@ -564,6 +564,84 @@ prompt 慢 2-5%。它像其他格式一样流式它的 KV 缓存（`--kv-residen
 
 <a id="hybrid-k8v4-kv-cache-engine-0125"></a>
 
+**TurboQuant KV 缓存（需显式开启，`--kv tq3|tq4|tq6|tq8`）：** 每个 256 值的头先用 Hadamard 变换旋转，
+再按旋转后的坐标用拟合的 Lloyd-Max 码本量化，每个头带一个 FP16 范数；位宽为每个值 3、4、6 或 8 位；
+拟合只做最小平方误差（这个版本没有 QJL 残差）。它是常驻格式：K/V 留在 VRAM（mode 0，没有 host 副本），
+所以不流式，且拒绝 `--kv-resident`。主层使用它；MTP 草稿层保留它自己的普通 INT8 环形窗口，和 K8V4
+下一样（它的 attention 和 verify 路径只处理整格式），所以 `--mtp`/`--spec` 保留 INT8 草稿缓存。
+setup 目前不提供这些值。
+
+| `--kv` | 字节/cell | 524,288-token KV，12 层 |
+|---|---:|---:|
+| int8 | 1,056 | 6.1875 GiB |
+| tq8 | 1,032 | 6.046875 GiB |
+| tq6 | 776 | 4.546875 GiB |
+| tq4 | 520 | 3.046875 GiB |
+| tq3 | 392 | 2.296875 GiB |
+
+这些是计算出的容量（524,288 个 cell x 12 层），不是实测节省；更小的缓存只有配合弹性 K/V
+（`--kv-grow`）才会变成更多 expert 槽，它把空出的 VRAM 给 expert 缓存。上下文容量和 CPU 内存默认值
+不变；只有每个 KV cell 的字节数改变。
+
+实测（在下面的可选 tensor reader 之前，2026-10-25）：两块 Tesla V100 16 GB 卡、175 W、Ryzen 5 3600、
+IQ3_S、`--mtp --spec 4`、`--layer-split 16`、`--pipeline-windows 2`，每种格式一次运行，prompt 为
+2,071 和 51,746 个 token（"2K"/"49K" 标签只是名义值）。prompt 请求的 wall 秒数：int8 2.926 / 24.289，
+tq4 3.297 / 35.190，tq8 3.401 / 41.085，tq6 3.431 / 39.272，tq3 3.173 / 33.643。每个 arm 都无崩溃运行。
+这些运行显示 prompt 变慢，不是速度收益。静态分析把长 prompt 的开销归于 prompt 路径使用
+decode-attention 回退（下面的批量 reader 默认关闭）。总 GPU 内存保持在 15,656/15,684 MiB 附近：
+expert 缓存填满空出的空间，所以总 GPU 用量不是 KV 节省的度量。这次探索性的五格式运行不在已发布证据
+文件中。
+
+五种格式都通过四个 OpenAI 风格的回忆和原生工具场景。旧的第五项检查要求纯文本回答里出现字面词
+"tool"；它被移除，因为那测试的是措辞，不是工具行为。Hermes 对 int8、tq4、tq8 和 tq6 通过；tq3 仍调用
+不存在的 `list_jobs`，而不是 `list_scheduled_jobs`。早先的 int8 运行也犯过该错误，所以这些小检查不能
+确立质量对等，也不能确立 TQ 特有的回归。困惑度未测量。大海捞针测试（`tools/needle_bench.py`，未修改）
+在 3 个长度和 5 个深度上，int8 和 tq6 都找到 15/15 个 cell，实际最长 122,289 个 prompt token
+（"128K" 标签是名义值）。daily 配置哈希在前后相同。这是一次合成检索测试，不是一般质量结果。最后的
+tq6 日志确认 2,071 和 51,746 token 的对话停放和 checkpoint 归档停放，没有早先的草稿环快照拒绝。
+GPU 布局/append/gather/attention 回归（`kv_tq_parity`）通过，包括在 CUDA Compute Sanitizer 下零内存错误。
+[完整报告](../../benchmarks/v100-turboquant-2026-10-25.md)及其
+[已净化证据](../../bench/results/2026-10-25-turboquant-published/v100-turboquant-2026-10-25.json)
+保存实测行和设置。
+
+**Volta TQ prompt attention（实验性，默认关闭）：** `STRATA_PROMPT_ATTN_TQ=1` 在 sm_70 上为
+`tq3`、`tq4`、`tq6` 和 `tq8` 启用 tensor-core prompt reader。未设置或 `0` 保持现有的 decode 回退；
+其他 GPU 架构不变。它把选中的压缩 tile 解码到共享内存，不是持久的 FP16 缓存。每个头的范数在 FP32 中
+应用一次。KV 分配和存储字节不变。
+
+同日在上述两块 V100 上测量，带 `STRATA_PREFILL_TIMING=1`，每个 arm 全新服务：
+
+| Arm | 2,071-token 请求 | 51,746-token 请求 |
+|---|---:|---:|
+| tq6，reader 关闭（baseline） | 3.400 s | 40.357 s |
+| tq6，reader 开启 | 3.194 s | 31.721 s |
+| tq6，reader 关闭（control） | 3.549 s | 40.253 s |
+| tq6，reader 再次开启 | 3.105 s | 31.852 s |
+| int8 对照 | 3.025 s | 25.827 s |
+
+新 reader 把 tq6 的长请求 wall 时间降低 20.9–21.4%（约 1.27x 吞吐），但仍比 int8 慢 22.8–23.3%。
+CUDA0 的长 prompt attention 阶段从 8,238–8,246 ms 降到 4,308/4,325 ms；`embed+steps` 下报告的阶段间
+等待也从 12,768–12,821 ms 降到 9,640/9,712 ms。tq6 各 arm 之间总 GPU 内存不变（15,618/15,608 MiB）。
+这些是有限测量，不是通用速度保证。报告里有 tq8 reader 测量和 qsa-attention 总计。
+
+GPU 对等检查对四种位宽都通过，包括因果尾部和打乱的页，Compute Sanitizer 零内存错误。
+`conversation_snapshot_test` 通过 6,709 项检查，同样在 Compute Sanitizer 下零错误：每种位宽（3、4、6
+和 8 位）的真实状态分配、一次快照 A/B/A 往返、一次来自其他位宽的状态按载荷大小被拒绝，以及混合 INT8
+草稿层。两次实时 opt-in 运行都通过四个 OpenAI 场景；Hermes 一次在 `list_jobs` 上失败、一次通过。因此
+质量对等未确立，这仍是 opt-in。daily 服务保持 int8。CUDA 完整构建通过；仅 CPU 的完整构建通过：CTest
+55 个通过、4 个跳过（共 59 个）。完整 HIP 构建用 hipcc 7.2.4 为 gfx1100 构建通过，这仅是编译和
+链接检查：这里没有 AMD 设备，所以 `kv_tq_parity` 跳过、host 侧的 conversation validation 通过，
+也没有测量 HIP 运行。`kv_tq_parity` 在 CUDA 构建上通过；没有设备时它以退出码 77 结束，两个构建
+都记为跳过。HIP 构建需要四处构建修正：CMake 里用后端中立的 runtime 目标取代 `CUDA::cudart`、GEMM
+对等测试里用可移植的 `std::bit_cast` 读半精度位、测试参考臂陈旧的 warp 启动换成生产 scorer 的网格，
+以及按设备的 VMM 记录（设备 id 和分配粒度随 range 捕获；HIP 用 `hipMemCreate`/`hipMemMap`，
+`STRATA_HIP_VMM=0` 关闭）。
+十八个 CUDA 目标回归测试在在线 int8 服务占用显卡时运行：12 个通过，6 个因内存不足结束
+（`qsa_slots_parity`、`qsa_slots_parity_lanecell`、`qsa_merge_daily_parity_default`、
+`qsa_merge_daily_parity_daily`、`kv_stream_parity`、`kv_window_parity`）。这六个在分配内存时失败，
+无法据此判断是否存在回归，也不计为通过。这里未安装 SYCL 编译器，SYCL 没有 TurboQuant 实现（其独立的 SYCL 移植未改动），
+也没有 AMD 硬件可用于验证运行。其他 GPU 架构未测试。
+
 **可复现的贪心输出（0.1.30，需显式开启，`STRATA_IQ_MT_MIN=1`）：** 带 IQ 模型时，CPU 对单个
 token 用 ggml 的点积计算 expert、对多个 token 用 Strata 的多 token 内核，后者舍入略有不同。多
 少 token 共享一个 expert 取决于 verify 窗口里的草稿，所以同一 prompt 在温度 0 下，当草稿、

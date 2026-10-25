@@ -52,6 +52,10 @@ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const 
         r.src[2] = (const uint8_t*) host.k_scale; r.dst[2] = (uint8_t*) slots.k_scale; r.len[2] = scales;
         r.src[3] = (const uint8_t*) host.v_scale; r.dst[3] = (uint8_t*) slots.v_scale; r.len[3] = scales;
         r.n = 4;
+    } else if (fmt == kKvTq) {
+        // TurboQuant (kv_tq.hpp) keeps no host copy in this cut: moving nothing is the only correct answer, and
+        // falling into the fp16 arm below would read k_pool/v_pool, which such a state never sets.
+        r.n = 0;
     } else {
         const int bytes = rows * (int) s.head_dim * 2;
         r.src[0] = (const uint8_t*) host.k_pool; r.dst[0] = (uint8_t*) slots.k_pool; r.len[0] = bytes;

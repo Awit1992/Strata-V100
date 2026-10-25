@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -40,9 +41,15 @@ bool native_bf16() {
     return cudaGetDevice(&ordinal) == cudaSuccess &&
            cudaGetDeviceProperties(&properties, ordinal) == cudaSuccess && properties.major >= 8;
 }
-uint16_t encode_x(float value, bool native) { return native ? bf16(value) : __half_as_ushort(__float2half_rn(value)); }
+// FP16 bits without the CUDA-only `__half_as_ushort` / `__ushort_as_half`: the HIP host build compiles this
+// host file with the system compiler, whose half_fp16.h provides __float2half/__half2float but not the bit-cast
+// intrinsics (they are clang-only there).  __half is trivially copyable on both toolchains, so bit_cast is the
+// same bytes without memcpy's -Wclass-memaccess warning on a non-trivial class type.
+uint16_t half_bits(__half value) { return std::bit_cast<uint16_t>(value); }
+__half half_from_bits(uint16_t bits) { return std::bit_cast<__half>(bits); }
+uint16_t encode_x(float value, bool native) { return native ? bf16(value) : half_bits(__float2half_rn(value)); }
 float decode_x(uint16_t bits, bool native) {
-    return native ? fp32(bits) : __half2float(__ushort_as_half(bits));
+    return native ? fp32(bits) : __half2float(half_from_bits(bits));
 }
 
 }  // namespace

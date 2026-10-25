@@ -36,6 +36,7 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tq.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
@@ -1674,7 +1675,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, mirror ? &hk : nullptr);
                             kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
                                               vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
-                        } else if (st.kv_q4)
+                        } else if (st.kv_tq)
+                            kv_append_tq_step(st.kv_tq_bits, st.k_tq, st.v_tq, st.page_table, step_t,
+                                              kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, nullptr);
+                        else if (st.kv_q4)
                             kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
                                               vcur_ + t * NKV * HD, s, cs, &st.host);
                         else if (st.kv_int8)
@@ -1698,7 +1702,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                            n, s, cs, mirror ? &hk : nullptr);
                         kv_append_q4_batch(st.v_q4, st.v_q4, st.page_table, steps, vcb, vcb, n, s, cs,
                                            mirror ? &hv : nullptr);
-                    } else if (st.kv_q4)
+                    } else if (st.kv_tq)
+                        kv_append_tq_batch(st.kv_tq_bits, st.k_tq, st.v_tq, st.page_table, steps, kcb, vcb, n, s, cs, nullptr);
+                    else if (st.kv_q4)
                         kv_append_q4_batch(st.k_q4, st.v_q4, st.page_table, steps, kcb, vcb, n, s, cs, &st.host);
                     else if (st.kv_int8)
                         kv_append_q8_batch(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, steps, kcb, vcb,

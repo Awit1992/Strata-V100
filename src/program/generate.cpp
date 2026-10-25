@@ -63,6 +63,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_tq.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
@@ -870,6 +871,10 @@ void usage() {
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); streams with --kv-resident too\n"
+                 "  --kv tq3|tq4|tq6|tq8 TurboQuant K/V: 256-value rotated blocks, Lloyd-Max codebook + FP16\n"
+                 "                       norm per head; 3/4/6/8-bit; mode 0 only (no --kv-resident). With --mtp\n"
+                 "                       the draft layer's ring is INT8 (a TurboQuant one has no host copy to\n"
+                 "                       snapshot or refill), so that layer does not carry the tq cost\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
@@ -3318,12 +3323,22 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+    int tq_bits = 0;
+    if (o.kv == "tq3") tq_bits = 3;
+    else if (o.kv == "tq4") tq_bits = 4;
+    else if (o.kv == "tq6") tq_bits = 6;
+    else if (o.kv == "tq8") tq_bits = 8;
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && tq_bits == 0) {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4, tq3, tq4, tq6 or tq8\n");
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+    strata::core::qsa_set_kv_tq(tq_bits);
+    if (tq_bits > 0 && o.kv_resident > 0) {
+        std::fprintf(stderr, "strata generate: --kv-resident is not supported with --kv tq3|tq4|tq6|tq8\n");
+        return 2;
+    }
     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
     // fp16 K/V improved on an NVFP4 pack (0.0066 -> 0.0051) but not on IQ2_XS (0.0022 -> 0.0054)
     const char* kv_rot = std::getenv("STRATA_KV_ROT");
@@ -17377,7 +17392,12 @@ int main(int argc, char** argv) {
                 auto kv_arrays = [&](const strata::core::QsaState& st) {
                     const bool h = st.kv_mode != 0;
                     std::vector<std::pair<const void*, int64_t>> a;
-                    if (st.kv_q4) {
+                    if (st.kv_tq) {
+                        // TurboQuant is resident-only with no host copy (layer.cpp), so the VRAM arrays are the
+                        // authoritative ones at every mode.  Per-head bytes, like the other quantized arms.
+                        const int64_t tqb = (int64_t) strata::kernels::kv_tq_bytes_per_head(st.kv_tq_bits, (int) qs.head_dim);
+                        a = {{st.k_tq, tqb}, {st.v_tq, tqb}};
+                    } else if (st.kv_q4) {
                         const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q4 : st.k_q4, q4b}, {h ? st.host.v_q4 : st.v_q4, q4b}};
                     } else if (st.kv_hybrid) {

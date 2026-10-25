@@ -405,6 +405,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kv_q8.cu
                           src/kernels/cuda/kv_stream.cu
                           src/kernels/cuda/kv_q4.cu
+                          src/kernels/cuda/kv_tq.cu
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
@@ -743,9 +744,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(strata_prefill PRIVATE roc::rocblas)
   endif()
 
+  # Built for every GPU backend (it is the only prefill parity target outside the test gate), so it takes the
+  # backend-neutral runtime/include variables: naming CUDA::cudart here made a HIP configure fail outright (CMP0028)
+  # before any object was built, even with the tests off.
   add_executable(prefill_gemm_parity tests/prefill_gemm_parity.cpp)
-  target_include_directories(prefill_gemm_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-  target_link_libraries(prefill_gemm_parity PRIVATE strata_prefill CUDA::cudart)
+  target_include_directories(prefill_gemm_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(prefill_gemm_parity PRIVATE strata_prefill ${_strata_gpu_runtime_target})
   add_test(NAME prefill_gemm_parity COMMAND prefill_gemm_parity)
 
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
@@ -1100,7 +1104,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # STRATA_ROUTE_RESIDENT's swap, serial vs warp: the bench holds the pre-port serial kernel (so it is compiled as
   # CUDA, the one device-code file among the .cpp benches) and times the two forms on the same input in one run.
   # The chain modes above call the plain top-10 on a fully resident table, so they never reach the swap; this does.
-  if(STRATA_ENABLE_CUDA)
+  # Not in the gfx906 HIP build: it turns STRATA_ENABLE_CUDA on to take the CUDA-shaped branch but enables the HIP
+  # language only, and a source forced to LANGUAGE CUDA fails generation there ("CUDA_ARCHITECTURES is empty").
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     add_executable(router_chain_bench src/kernels/router_chain_bench.cpp)
     set_source_files_properties(src/kernels/router_chain_bench.cpp PROPERTIES LANGUAGE CUDA)
     target_include_directories(router_chain_bench PRIVATE ${_strata_gpu_include_directories})
@@ -1316,6 +1322,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kv_q4_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kv_q4_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+  # TurboQuant KV (--kv tq3|tq4|tq6|tq8): the block layout (dimension-ordered 8-value index groups) against a host
+  # Lloyd-Max oracle, the paged append/gather roundtrip, the prompt append against the per-cell appends, and the
+  # attention readers on TurboQuant pools against FP16 pools of the same values (GPU, synthetic, no model).
+  add_executable(kv_tq_parity src/kernels/kv_tq_parity.cpp)
+  target_include_directories(kv_tq_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(kv_tq_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME kv_tq_parity COMMAND kv_tq_parity)
+  # main() exits 77 when there is no device: ctest must report a skip, not a failure (the tree's GPU-test rule)
+  set_tests_properties(kv_tq_parity PROPERTIES SKIP_RETURN_CODE 77)
   # the verify window's one-launch forms (hyper-connection write, PLE post-ops with the commit's
   # history snapshots) vs the per-token launches they replace, bitwise (GPU, synthetic, no model)
   add_executable(verify_batch_parity src/kernels/verify_batch_parity.cpp)

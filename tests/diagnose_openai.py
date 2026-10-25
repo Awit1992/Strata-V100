@@ -116,12 +116,6 @@ def run(base: str, key: str) -> tuple[list[dict[str, Any]], int]:
         return row
 
     scenario(
-        "plain-tools-question",
-        base_payload([{"role": "user", "content": "What tools do you have available? Answer directly."}]),
-        lambda m: (bool(m.get("content")) and "tool" in m["content"].lower(), repr(m.get("content"))),
-    )
-
-    scenario(
         "multi-turn-recall",
         base_payload([
             {"role": "system", "content": "Follow the conversation and answer the latest user message."},

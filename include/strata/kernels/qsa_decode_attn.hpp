@@ -29,6 +29,9 @@ struct QsaAttnPools {
     const uint16_t* v_scale = nullptr;
     const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
     const uint8_t* v_q4 = nullptr;
+    const uint8_t* k_tq = nullptr;      ///< TurboQuant block [page][kv_head][page_size][2 + head_dim*bits/8]
+    const uint8_t* v_tq = nullptr;
+    int tq_bits = 0;
     const int32_t* page_table = nullptr;
 };
 
