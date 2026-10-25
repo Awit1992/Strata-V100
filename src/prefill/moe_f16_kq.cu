@@ -192,8 +192,8 @@ __global__ void __launch_bounds__(THREADS) gate_up_kernel(const Batch b, const N
                 codes_to_halves(nib, magic, scale2, bias2, h[2 * i], h[2 * i + 1]);
             }
             v16h a_lo, a_hi;
-            __builtin_memcpy(&a_lo, &h[0], 32);
-            __builtin_memcpy(&a_hi, &h[8], 32);
+            memcpy(&a_lo, &h[0], 32);
+            memcpy(&a_hi, &h[8], 32);
             mma_tiles<BN>(acc, a_lo, a_hi, s_act, kb, sub_lane, live_tiles);
         }
     };
@@ -283,8 +283,8 @@ __global__ void __launch_bounds__(THREADS) down_kernel(const Batch b, const Nati
                 codes_to_halves(hi, magic, scale2, bias2, hh[8 + 2 * i], hh[8 + 2 * i + 1]);
             }
             v16h a_lo, a_hi;
-            __builtin_memcpy(&a_lo, &hh[0], 32);
-            __builtin_memcpy(&a_hi, &hh[8], 32);
+            memcpy(&a_lo, &hh[0], 32);
+            memcpy(&a_hi, &hh[8], 32);
             mma_tiles<BN>(acc, a_lo, a_hi, s_act, kb, sub_lane, live_tiles);
         }
     };

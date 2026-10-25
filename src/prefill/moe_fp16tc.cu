@@ -44,7 +44,7 @@ constexpr int Q2 = 42;             // GGML_TYPE_Q2_0
 // Bit pattern -> half2 without going through the float pipe (the bits are 1024 + q in each half).
 __device__ __forceinline__ __half2 h2_from_u32(uint32_t u) {
     __half2 h;
-    __builtin_memcpy(&h, &u, 4);
+    memcpy(&h, &u, 4);
     return h;
 }
 

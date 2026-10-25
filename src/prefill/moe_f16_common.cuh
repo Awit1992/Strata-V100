@@ -165,8 +165,8 @@ __device__ __forceinline__ void mma_tiles(v8f (&acc)[BN / 16], v16h a_lo, v16h a
 #pragma unroll
         for (int q = 0; q < 4; ++q) bq[q] = frag[q * STRIDE];
         v16h b_lo, b_hi;
-        __builtin_memcpy(&b_lo, &bq[0], 32);
-        __builtin_memcpy(&b_hi, &bq[2], 32);
+        memcpy(&b_lo, &bq[0], 32);
+        memcpy(&b_hi, &bq[2], 32);
         acc[j] = wmma_f16(a_lo, b_lo, acc[j]);
         acc[j] = wmma_f16(a_hi, b_hi, acc[j]);
     }

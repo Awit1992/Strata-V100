@@ -1159,8 +1159,8 @@ native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                 hw[2 * i + 1] = __builtin_bit_cast(uint32_t, __hfma2(__hadd2(__builtin_bit_cast(__half2, p1), magic), s2, zero2));
             }
             v16h a_lo, a_hi;
-            __builtin_memcpy(&a_lo, &hw[0], 32);
-            __builtin_memcpy(&a_hi, &hw[8], 32);
+            memcpy(&a_lo, &hw[0], 32);
+            memcpy(&a_hi, &hw[8], 32);
             mma_tiles<BN>(acc, a_lo, a_hi, s_act, kb, sub_lane, live_tiles);
         }
     };
