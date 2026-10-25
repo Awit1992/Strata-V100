@@ -1,8 +1,10 @@
 #pragma once
 // CUDA virtual memory (the elastic K/V, --kv-grow): an address range reserved once, whose physical memory is mapped and
 // unmapped in chunks of the device's granularity (2 MiB).  The K/V pools grow with the context by taking chunks the
-// expert cache gives up, and neither moves: every captured graph and stored pointer stays valid.  The driver calls
-// are reached through the runtime's entry-point query, so nothing links the driver library.  Not under HIP.
+// expert cache gives up, and neither moves: every captured graph and stored pointer stays valid.  The CUDA branch
+// reaches the driver calls through the runtime's entry-point query, so nothing links the driver library; HIP (ROCm 6+,
+// not gfx906) implements the same range with hipMemAddressReserve / hipMemCreate / hipMemMap / hipMemSetAccess, and
+// STRATA_HIP_VMM=0 turns it off there.  Every other backend reports no VMM and the elastic K/V stays off.
 
 #include <cstdint>
 #include <vector>

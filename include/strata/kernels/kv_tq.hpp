@@ -8,10 +8,15 @@
 // centroids; the paper's 1-bit QJL residual for the unbiased inner product is a later addition.
 #pragma once
 
+#include <cstdint>
+#if defined(STRATA_HIP_GFX906)
+// gfx906: the compat layer, before f16_bits.hpp's device conversions - it supplies __forceinline__ and the
+// device-side memcpy those use.  dp4a.hpp includes it for the same reason.
+#include <cuda_runtime.h>
+#endif
+
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/f16_bits.hpp"
-
-#include <cstdint>
 
 namespace strata::kernels {
 
