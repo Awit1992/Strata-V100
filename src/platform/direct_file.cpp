@@ -23,9 +23,11 @@
 #endif
 #include <atomic>
 #include <cerrno>
+#if !defined(_WIN32)   // the io_uring path below is POSIX-only; the Windows path is above
 #include <linux/io_uring.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#endif
 
 namespace strata::platform {
 
